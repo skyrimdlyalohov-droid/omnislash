@@ -1,0 +1,4 @@
+/bin/
+proxies.txt
+config.local.json
+*.test

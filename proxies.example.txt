@@ -1,0 +1,11 @@
+# По одному прокси на строку. Пустые строки и строки с # игнорируются.
+# Без схемы используется default_scheme из конфига (socks5).
+#
+# SOCKS5 без авторизации:
+127.0.0.1:1080
+# SOCKS5 с авторизацией (домен резолвит прокси, DNS не утекает):
+socks5://user:password@proxy.example.com:1080
+# HTTP CONNECT-прокси:
+http://user:password@proxy.example.com:8080
+# HTTPS CONNECT-прокси (TLS до прокси):
+https://proxy.example.com:8443

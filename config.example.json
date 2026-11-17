@@ -1,0 +1,115 @@
+{
+  "default_scheme": "socks5",
+  "strategy": "round_robin",
+  "allow_direct": false,
+  "sticky_ttl": "5m",
+  "dial_timeout": "10s",
+  "handshake_timeout": "15s",
+  "max_dial_attempts": 3,
+  "proxy_tls_skip_verify": false,
+  "cooldown": {
+    "initial": "15s",
+    "max": "10m",
+    "multiplier": 2,
+    "failures_before_cooldown": 1
+  },
+  "health": {
+    "enabled": true,
+    "interval": "60s",
+    "timeout": "10s",
+    "concurrency": 50,
+    "probe_url": "https://www.gstatic.com/generate_204",
+    "startup_check": true,
+    "startup_wait": "30s",
+    "tls_skip_verify": false
+  },
+  "http": {
+    "timeout": "30s",
+    "max_retries": 2,
+    "ban_statuses": [403, 407, 429, 503],
+    "ban_cooldown": "5m",
+    "max_idle_conns": 100,
+    "max_idle_conns_per_host": 10,
+    "idle_conn_timeout": "90s",
+    "tls_handshake_timeout": "10s",
+    "max_body_buffer": 4194304,
+    "tls_skip_verify": false
+  },
+  "stats": {
+    "listen": "127.0.0.1:9090"
+  },
+  "gateway": {
+    "listen": "127.0.0.1:3128",
+    "token": ""
+  },
+  "rate_limit": {
+    "per_proxy_rps": 0,
+    "burst": 0
+  },
+  "scope": {
+    "enabled": true,
+    "allow_hosts": ["*.example.com", "93.184.216.34", "api.ipify.org"],
+    "allow_cidrs": [],
+    "allow_ports": [80, 443],
+    "allow_private": false,
+    "deny_cidrs": [],
+    "resolve_locally": true,
+    "dns_cache_ttl": "5m",
+    "dns_timeout": "3s"
+  },
+  "scraper": {
+    "enabled": true,
+    "refresh_interval": "15m",
+    "startup_refresh": true,
+    "startup_wait": "90s",
+    "fetch_timeout": "20s",
+    "concurrency": 50,
+    "max_candidates": 1500,
+    "min_pool_size": 1,
+    "max_body_bytes": 4194304,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "sources": [
+      {
+        "name": "speedx-http",
+        "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "type": "text",
+        "scheme": "http"
+      },
+      {
+        "name": "monosans-http",
+        "url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "type": "text",
+        "scheme": "http"
+      },
+      {
+        "name": "clarketm-http",
+        "url": "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+        "type": "text",
+        "scheme": "http"
+      }
+    ],
+    "validation": {
+      "enabled": true,
+      "canary_urls": [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com"
+      ],
+      "real_ip_url": "https://api.ipify.org",
+      "real_ip": "",
+      "timeout": "12s",
+      "concurrency": 50,
+      "attempts": 2,
+      "min_canaries": 2,
+      "require_same_egress_ip": true,
+      "require_distinct_from_real_ip": true,
+      "max_latency": "5s",
+      "tls_skip_verify": false,
+      "allow_private_egress": false,
+      "profile": "safari_ios_26_0",
+      "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
+      "max_body_bytes": 65536
+    }
+  },
+  "log_level": "info"
+}
