@@ -113,6 +113,7 @@ func TestNewPoolRequiresProxies(t *testing.T) {
 		t.Fatal("expected ErrNoProxies")
 	}
 	cfg.AllowDirect = true
+	cfg.TrustTier = TrustTierTrusted
 	if _, err := NewPool(&cfg, nil, testLogger()); err != nil {
 		t.Fatal(err)
 	}

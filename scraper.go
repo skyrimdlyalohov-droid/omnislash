@@ -78,7 +78,7 @@ func NewScraper(pool *Pool, cfg ScraperConfig, logger *slog.Logger) (*Scraper, e
 		},
 	}
 	if cfg.Validation.Enabled {
-		v, err := NewValidator(cfg.Validation, logger)
+		v, err := NewValidatorForTier(cfg.Validation, pool.cfg.TrustTier, logger)
 		if err != nil {
 			return nil, err
 		}

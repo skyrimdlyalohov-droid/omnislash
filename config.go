@@ -60,6 +60,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 type Config struct {
 	DefaultScheme      string          `json:"default_scheme"`
 	Strategy           string          `json:"strategy"`
+	TrustTier          string          `json:"trust_tier"`
 	AllowDirect        bool            `json:"allow_direct"`
 	StickyTTL          Duration        `json:"sticky_ttl"`
 	DialTimeout        Duration        `json:"dial_timeout"`
@@ -166,20 +167,28 @@ type SourceConfig struct {
 // accepted only if it can reach enough HTTPS canaries, return the same public
 // egress IP, and (optionally) that IP differs from the scanner's real IP.
 // TLS certificates are verified unless TLSSkipVerify is explicitly enabled.
+//
+// Mode selects the admission suite. "connect" verifies an opaque CONNECT
+// tunnel, the target certificate and a paused long-lived connection.
+// "http_parsing" additionally/proactively verifies exact HTTP framing bytes
+// through the tunnel, which is what an HTTP-parsing consumer needs. Both modes
+// use raw sockets; net/http never sees target bytes.
 type ValidationConfig struct {
-	Enabled                   bool     `json:"enabled"`
-	CanaryURLs                []string `json:"canary_urls"`
-	RealIPURL                 string   `json:"real_ip_url"`
-	RealIP                    string   `json:"real_ip,omitempty"`
-	Timeout                   Duration `json:"timeout"`
-	Concurrency               int      `json:"concurrency"`
-	Attempts                  int      `json:"attempts"`
-	MinCanaries               int      `json:"min_canaries"`
-	RequireSameEgressIP       bool     `json:"require_same_egress_ip"`
-	RequireDistinctFromRealIP bool     `json:"require_distinct_from_real_ip"`
-	MaxLatency                Duration `json:"max_latency"`
-	TLSSkipVerify             bool     `json:"tls_skip_verify"`
-	AllowPrivateEgress        bool     `json:"allow_private_egress"`
+	Enabled                   bool            `json:"enabled"`
+	Mode                      string          `json:"mode"`
+	Admission                 AdmissionConfig `json:"admission"`
+	CanaryURLs                []string        `json:"canary_urls"`
+	RealIPURL                 string          `json:"real_ip_url"`
+	RealIP                    string          `json:"real_ip,omitempty"`
+	Timeout                   Duration        `json:"timeout"`
+	Concurrency               int             `json:"concurrency"`
+	Attempts                  int             `json:"attempts"`
+	MinCanaries               int             `json:"min_canaries"`
+	RequireSameEgressIP       bool            `json:"require_same_egress_ip"`
+	RequireDistinctFromRealIP bool            `json:"require_distinct_from_real_ip"`
+	MaxLatency                Duration        `json:"max_latency"`
+	TLSSkipVerify             bool            `json:"tls_skip_verify"`
+	AllowPrivateEgress        bool            `json:"allow_private_egress"`
 	// Profile is a bogdanfinn/tls-client fingerprint name such as
 	// "safari_ios_26_0", "okhttp4_android_13" or "chrome_133". Validating with a
 	// mobile profile distinguishes proxies that only work for a desktop stack.
@@ -188,6 +197,24 @@ type ValidationConfig struct {
 	UserAgent string `json:"user_agent,omitempty"`
 	// MaxBodyBytes bounds the canary response body read for an egress IP.
 	MaxBodyBytes int64 `json:"max_body_bytes"`
+}
+
+// AdmissionConfig controls the raw, mode-specific admission probes. They run
+// in addition to egress-IP canaries for the strict trust tier.
+//
+// TLSCanaryURL is an HTTPS endpoint used to prove CONNECT, certificate
+// verification and a paused keep-alive connection. EchoAddr is a raw TCP echo
+// endpoint used for the N-bytes-out/N-bytes-back test. Empty values skip the
+// corresponding probe; the test suite supplies both with local fakes.
+type AdmissionConfig struct {
+	Enabled      bool     `json:"enabled"`
+	TLSCanaryURL string   `json:"tls_canary_url"`
+	EchoAddr     string   `json:"echo_addr"`
+	Hold         Duration `json:"hold"`
+	EchoBytes    int      `json:"echo_bytes"`
+	Timeout      Duration `json:"timeout"`
+	// TLSSkipVerify is only for trusted labs. Strict connect mode rejects it.
+	TLSSkipVerify bool `json:"tls_skip_verify"`
 }
 
 // ScraperConfig repeatedly fetches free proxy lists, validates candidates and
@@ -216,6 +243,20 @@ const (
 	StrategySticky     = "sticky"
 )
 
+// Trust tiers select the admission policy. Strict is the default for public
+// proxies; trusted is for a proxy pool the operator owns (for example LTE
+// modems) and only applies health plus egress checks.
+const (
+	TrustTierStrict  = "strict"
+	TrustTierTrusted = "trusted"
+)
+
+// Admission modes.
+const (
+	AdmissionModeConnect     = "connect"
+	AdmissionModeHTTPParsing = "http_parsing"
+)
+
 // defaultMobileUserAgent pairs with the default mobile TLS profile. A mobile
 // ClientHello with a desktop or Go User-Agent is an obvious fingerprint
 // mismatch, so validation uses a matching UA unless one is configured.
@@ -226,6 +267,7 @@ func DefaultConfig() Config {
 	return Config{
 		DefaultScheme:      "socks5",
 		Strategy:           StrategyRoundRobin,
+		TrustTier:          TrustTierStrict,
 		AllowDirect:        false,
 		StickyTTL:          Duration(5 * time.Minute),
 		DialTimeout:        Duration(10 * time.Second),
@@ -277,6 +319,14 @@ func DefaultConfig() Config {
 			UserAgent:       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 			Validation: ValidationConfig{
 				Enabled: true,
+				Mode:    AdmissionModeConnect,
+				Admission: AdmissionConfig{
+					Enabled:      true,
+					TLSCanaryURL: "https://api.ipify.org",
+					Hold:         Duration(2 * time.Second),
+					EchoBytes:    256,
+					Timeout:      Duration(10 * time.Second),
+				},
 				CanaryURLs: []string{
 					"https://api.ipify.org",
 					"https://ifconfig.me/ip",
@@ -328,6 +378,9 @@ func (c *Config) normalize() {
 	}
 	if c.Strategy == "" {
 		c.Strategy = d.Strategy
+	}
+	if c.TrustTier == "" {
+		c.TrustTier = d.TrustTier
 	}
 	if c.StickyTTL == 0 {
 		c.StickyTTL = d.StickyTTL
@@ -431,6 +484,21 @@ func (c *Config) normalize() {
 	if len(c.Scraper.Validation.CanaryURLs) == 0 {
 		c.Scraper.Validation.CanaryURLs = append([]string(nil), d.Scraper.Validation.CanaryURLs...)
 	}
+	if c.Scraper.Validation.Mode == "" {
+		c.Scraper.Validation.Mode = d.Scraper.Validation.Mode
+	}
+	if c.Scraper.Validation.Admission.Hold == 0 {
+		c.Scraper.Validation.Admission.Hold = d.Scraper.Validation.Admission.Hold
+	}
+	if c.Scraper.Validation.Admission.EchoBytes == 0 {
+		c.Scraper.Validation.Admission.EchoBytes = d.Scraper.Validation.Admission.EchoBytes
+	}
+	if c.Scraper.Validation.Admission.Timeout == 0 {
+		c.Scraper.Validation.Admission.Timeout = d.Scraper.Validation.Admission.Timeout
+	}
+	if c.Scraper.Validation.Admission.TLSCanaryURL == "" {
+		c.Scraper.Validation.Admission.TLSCanaryURL = d.Scraper.Validation.Admission.TLSCanaryURL
+	}
 	if c.Scraper.Validation.RealIPURL == "" {
 		c.Scraper.Validation.RealIPURL = d.Scraper.Validation.RealIPURL
 	}
@@ -480,6 +548,15 @@ func (c *Config) Validate() error {
 	case StrategyRoundRobin, StrategyRandom, StrategyLeastUsed, StrategySticky:
 	default:
 		add("strategy: unsupported %q", c.Strategy)
+	}
+	switch c.TrustTier {
+	case TrustTierStrict:
+		if c.AllowDirect {
+			add("allow_direct is forbidden in the strict trust tier; use trust_tier=trusted for an owned pool")
+		}
+	case TrustTierTrusted:
+	default:
+		add("trust_tier must be strict or trusted")
 	}
 	if c.DialTimeout <= 0 {
 		add("dial_timeout must be > 0")
@@ -686,6 +763,46 @@ func validateScraperConfig(c *Config) error {
 	v := s.Validation
 	if v.Timeout <= 0 {
 		add("validation.timeout must be > 0")
+	}
+	switch v.Mode {
+	case AdmissionModeConnect, AdmissionModeHTTPParsing:
+	default:
+		add("validation.mode must be connect or http_parsing")
+	}
+	if v.Admission.Enabled {
+		if v.Admission.Timeout <= 0 {
+			add("validation.admission.timeout must be > 0")
+		}
+		if v.Admission.Hold < 0 {
+			add("validation.admission.hold must be >= 0")
+		}
+		if v.Admission.EchoBytes < 1 || v.Admission.EchoBytes > 1<<20 {
+			add("validation.admission.echo_bytes must be between 1 and 1048576")
+		}
+		if v.Admission.TLSCanaryURL != "" {
+			u, err := url.Parse(strings.TrimSpace(v.Admission.TLSCanaryURL))
+			if err != nil || u.Scheme != "https" || u.Host == "" {
+				add("validation.admission.tls_canary_url must be an absolute https URL")
+			}
+		}
+		if v.Admission.EchoAddr != "" {
+			host, port, err := net.SplitHostPort(v.Admission.EchoAddr)
+			if err != nil || host == "" || port == "" {
+				add("validation.admission.echo_addr must be host:port")
+			}
+		}
+		if v.Admission.TLSCanaryURL == "" && v.Admission.EchoAddr == "" {
+			add("validation.admission needs tls_canary_url or echo_addr")
+		}
+		if v.Mode == AdmissionModeHTTPParsing && v.Admission.EchoAddr == "" {
+			add("validation.mode=http_parsing requires admission.echo_addr")
+		}
+		if v.Mode == AdmissionModeConnect && v.Admission.TLSCanaryURL == "" {
+			add("validation.mode=connect requires admission.tls_canary_url")
+		}
+		if c.TrustTier == TrustTierStrict && v.Mode == AdmissionModeConnect && v.Admission.TLSSkipVerify {
+			add("validation.admission.tls_skip_verify is forbidden in strict connect mode")
+		}
 	}
 	if v.Concurrency < 1 {
 		add("validation.concurrency must be >= 1")

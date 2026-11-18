@@ -8,7 +8,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/veter/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
 func cmdCheck(args []string) error {

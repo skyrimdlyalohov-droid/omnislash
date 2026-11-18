@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/veter/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
 func main() {

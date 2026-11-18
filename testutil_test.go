@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func testLogger() *slog.Logger {
@@ -252,16 +251,4 @@ func startEchoServer(t *testing.T) string {
 		}
 	}()
 	return ln.Addr().String()
-}
-
-func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("condition was not met before timeout")
 }

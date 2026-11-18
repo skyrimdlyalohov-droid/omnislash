@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/veter/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
 func cmdServe(args []string) error {

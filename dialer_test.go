@@ -144,6 +144,32 @@ func TestDialerNoDirectFallback(t *testing.T) {
 	}
 }
 
+func TestDialerProxyFailureMidRequestIsAnError(t *testing.T) {
+	// The proxy completes CONNECT and then disappears. The echo target would
+	// answer a direct connection, so a successful read here would prove a
+	// silent direct fallback.
+	dead := startEchoTunnelProxy(t, nil, false, true)
+	echo := startEchoServer(t)
+	cfg := testConfig()
+	cfg.MaxDialAttempts = 1
+	pool := newTestPool(t, cfg, mustProxy(t, dead.URL()))
+	d := NewDialer(pool, testLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(ctx, "tcp", echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: canary\r\n\r\n")
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("request succeeded after the proxy died mid-request")
+	}
+}
+
 func TestDialTLS(t *testing.T) {
 	proxyAddr := startSocks5Proxy(t, "", "")
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

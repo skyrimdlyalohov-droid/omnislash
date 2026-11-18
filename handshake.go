@@ -60,7 +60,7 @@ func dialThroughProxy(
 		_ = conn.SetDeadline(time.Now())
 	})
 
-	var out net.Conn = conn
+	out := conn
 	switch p.Scheme {
 	case "socks5", "socks5h":
 		err = socks5Connect(conn, p, target)

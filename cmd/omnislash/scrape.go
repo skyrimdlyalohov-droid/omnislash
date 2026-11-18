@@ -8,7 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/veter/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
 type stringList []string

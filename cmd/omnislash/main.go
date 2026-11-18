@@ -12,7 +12,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/veter/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
 var version = "1.0.0"

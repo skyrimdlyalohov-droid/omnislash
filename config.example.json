@@ -1,6 +1,7 @@
 {
   "default_scheme": "socks5",
   "strategy": "round_robin",
+  "trust_tier": "strict",
   "allow_direct": false,
   "sticky_ttl": "5m",
   "dial_timeout": "10s",
@@ -90,6 +91,16 @@
     ],
     "validation": {
       "enabled": true,
+      "mode": "connect",
+      "admission": {
+        "enabled": true,
+        "tls_canary_url": "https://api.ipify.org",
+        "echo_addr": "",
+        "hold": "2s",
+        "echo_bytes": 256,
+        "timeout": "10s",
+        "tls_skip_verify": false
+      },
       "canary_urls": [
         "https://api.ipify.org",
         "https://ifconfig.me/ip",

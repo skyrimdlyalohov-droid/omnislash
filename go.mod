@@ -1,4 +1,4 @@
-module github.com/veter/omnislash
+module github.com/skyrimdlyalohov-droid/omnislash
 
 go 1.27
 

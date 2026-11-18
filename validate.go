@@ -2,6 +2,7 @@ package omnislash
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,9 +33,12 @@ type ValidationResult struct {
 // report a stable public egress IP and, unless disabled, that IP must differ
 // from the scanner's real address.
 type Validator struct {
-	cfg     ValidationConfig
-	log     *slog.Logger
-	profile profiles.ClientProfile
+	cfg       ValidationConfig
+	tier      string
+	log       *slog.Logger
+	profile   profiles.ClientProfile
+	rootCAs   *x509.CertPool
+	admitRoot *x509.CertPool
 
 	realMu     sync.Mutex
 	realIP     net.IP
@@ -43,11 +47,33 @@ type Validator struct {
 	now func() time.Time
 }
 
-// NewValidator compiles a validator. Unknown TLS profiles are rejected by
-// Config.Validate; here they fall back to the library default defensively.
+// NewValidator compiles a strict-tier validator. Use NewValidatorForTier to
+// select the trusted policy for an owned mobile/private pool.
 func NewValidator(cfg ValidationConfig, logger *slog.Logger) (*Validator, error) {
+	return NewValidatorForTier(cfg, TrustTierStrict, logger)
+}
+
+// NewValidatorForTier compiles a validator for an explicit trust tier. Strict
+// runs the full admission suite; trusted relies on health and egress checks.
+func NewValidatorForTier(cfg ValidationConfig, tier string, logger *slog.Logger) (*Validator, error) {
 	if cfg.Timeout <= 0 {
 		return nil, fmt.Errorf("validation timeout must be > 0")
+	}
+	if tier == "" {
+		tier = TrustTierStrict
+	}
+	if tier != TrustTierStrict && tier != TrustTierTrusted {
+		return nil, fmt.Errorf("validation: unknown trust tier %q", tier)
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = AdmissionModeConnect
+	}
+	if cfg.Admission.Enabled {
+		switch cfg.Mode {
+		case AdmissionModeConnect, AdmissionModeHTTPParsing:
+		default:
+			return nil, fmt.Errorf("validation: unknown admission mode %q", cfg.Mode)
+		}
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 64 << 10
@@ -62,7 +88,7 @@ func NewValidator(cfg ValidationConfig, logger *slog.Logger) (*Validator, error)
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Validator{cfg: cfg, log: logger, profile: profile, now: time.Now}, nil
+	return &Validator{cfg: cfg, tier: tier, log: logger, profile: profile, now: time.Now}, nil
 }
 
 // RealIP returns the scanner's real public address, either from the config or
@@ -183,6 +209,9 @@ func (v *Validator) attempt(ctx context.Context, pr *Proxy, realIP net.IP) (Vali
 			return res, fmt.Errorf("egress %s equals the scanner's real IP", egress)
 		}
 	}
+	if err := v.admit(ctx, pr); err != nil {
+		return res, err
+	}
 	res.EgressIP = egress.String()
 	res.Canaries = successes
 	res.Latency = v.now().Sub(attemptStarted)
@@ -199,6 +228,9 @@ func (v *Validator) newClient(pr *Proxy) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(v.profile),
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithDisableHttp3(),
+	}
+	if v.rootCAs != nil {
+		opts = append(opts, tlsclient.WithTransportOptions(&tlsclient.TransportOptions{RootCAs: v.rootCAs}))
 	}
 	if v.cfg.TLSSkipVerify {
 		opts = append(opts, tlsclient.WithInsecureSkipVerify())

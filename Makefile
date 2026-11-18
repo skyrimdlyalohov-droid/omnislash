@@ -5,7 +5,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run test race vet fmt check docker up down logs ps scrape clean
+.PHONY: all build run test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -26,6 +26,9 @@ vet:
 
 fmt:
 	gofmt -w .
+
+lint:
+	golangci-lint run
 
 check: fmt vet test
 

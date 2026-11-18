@@ -1,4 +1,5 @@
 /bin/
 proxies.txt
+config.json
 config.local.json
 *.test

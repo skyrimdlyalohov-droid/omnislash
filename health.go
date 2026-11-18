@@ -166,7 +166,7 @@ func (h *HealthChecker) checkOne(ctx context.Context, pr *Proxy) error {
 	}
 	defer conn.Close()
 
-	var rw net.Conn = conn
+	rw := conn
 	if h.probe.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName:         h.probe.Hostname(),
