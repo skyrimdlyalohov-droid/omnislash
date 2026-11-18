@@ -14,6 +14,9 @@ apply to protocol differential testing, custom TLS clients and raw fuzzers.
    `ErrSessionExpired`. Code: `session.go`. Test:
    `TestSessionPinsOneProxyForExperiment`,
    `TestSessionFailsClosedAfterExpiry`.
+   The guarantee is per proxied endpoint: a backconnect proxy that rotates
+   its exit per connection defeats it, so the pool must map one endpoint to
+   one exit (owned modems, provider session-id endpoints).
 
 2. **Fail-closed on proxy failure.**
    `allow_direct` defaults to `false` and is rejected in `trust_tier: strict`.
