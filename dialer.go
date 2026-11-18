@@ -215,5 +215,13 @@ func ProxyOf(conn net.Conn) (*Proxy, bool) {
 	if pc, ok := conn.(proxied); ok {
 		return pc.Proxy(), true
 	}
+	// A TLS wrapper hides the tracked connection. Unwrap it so a probe running
+	// over Session.DialTLSContext still knows which proxy carried the bytes.
+	if tc, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		return ProxyOf(tc.NetConn())
+	}
+	if bc, ok := conn.(*bufferedConn); ok {
+		return ProxyOf(bc.Conn)
+	}
 	return nil, false
 }

@@ -64,6 +64,35 @@ apply to protocol differential testing, custom TLS clients and raw fuzzers.
    when scope is enabled; metadata addresses are always denied. Code:
    `scope.go`. Tests: `scope_test.go`.
 
+## Probe layer
+
+Attack modules live in `probe/` and follow one rule: **omnislash owns the socket,
+the probes own the logic.**
+
+- A `Probe` receives an already dialed `net.Conn` and returns a `Result`. It
+  never calls `net.Dial`, `net/http` or `http.Client`, so it cannot leak the
+  host IP, cannot open a second connection, and cannot move half of an
+  experiment to another exit IP.
+- Requests are emitted with `conn.Write`; responses are parsed by the probe's
+  own reader. That is what keeps the bytes on the wire identical to the bytes
+  the probe built - a desync needs a front-end and a back-end to disagree, so
+  nothing in the path may normalize framing first.
+- Libraries still do the hard parts: projectdiscovery/rawhttp renders request
+  lines and duplicate/obfuscated headers into a `bytes.Buffer`, and
+  `x/net/http2` + `hpack` encode H2 frames. Neither gets the socket.
+- `Result` carries `Attribution` (proxy label and validated egress IP resolved
+  from the conn), every write, every parsed response with its raw bytes, and
+  heuristic `Findings` with explicit confidence. The evidence is the raw
+  exchange; the verdict is only a hint.
+- `Runner` opens exactly one pinned session per execution. `Run` = one probe on
+  one IP, `Rotate` = one probe per fresh session (gadget lists), `Fanout` =
+  the same probe on independent sessions in parallel (rate-limit bypass).
+
+Modules: `SmugglingProbe` (CL.TE, TE.CL, TE.TE, H2 downgrade), `RaceProbe` (H1
+single-packet), `H2RaceProbe` (last-frame sync), `GadgetProbe` (WAF bypass),
+`CachePoisonProbe` (poisoner then victim on one conn), `WebSocketProbe`
+(documentedly unimplemented). See `probe/README.md`.
+
 ## Known boundaries
 
 - Admission runs at scrape time. A hand-written `proxies.txt` loaded by
@@ -87,6 +116,7 @@ proxy sources -> Colly -> dedupe/shuffle -> egress canaries
                                    atomic Pool.Replace (hot swap)
                                              |
 scanner -> Dialer / Session / CONNECT gateway -> opaque proxy tunnel -> target
+probe   -> Runner -> pinned Session -------------------^  (conn.Write only)
 ```
 
 The proxy never receives target bytes through `net/http`; HTTP proxies always

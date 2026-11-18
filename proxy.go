@@ -163,6 +163,18 @@ func LoadProxyFile(path, defaultScheme string) ([]*Proxy, error) {
 	return proxies, nil
 }
 
+// EgressIP returns the egress address recorded by the last successful
+// validation, or an empty string when the proxy was never validated. It is the
+// only way to attribute a probe result to an exit IP without an extra request.
+func (p *Proxy) EgressIP() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.egressIP
+}
+
 func (p *Proxy) available(now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
