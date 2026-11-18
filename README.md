@@ -135,10 +135,10 @@ make build
 ./bin/omnislash serve -config config.json
 ```
 
-Только шлюз, без сборки бинаря:
+Только шлюз, без сборки бинаря и без scrape-петли:
 
 ```bash
-go run ./cmd/omnislash serve -config config.json -listen 127.0.0.1:3128 -stats 127.0.0.1:9090
+go run ./cmd/gateway -config config.json -proxies proxies.txt -listen 127.0.0.1:3128 -stats 127.0.0.1:9090
 ```
 
 `config.example.json` уже содержит несколько бесплатных HTTP-списков и

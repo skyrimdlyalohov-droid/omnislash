@@ -5,7 +5,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -14,6 +14,9 @@ build:
 
 run: build
 	$(BINARY) serve -config $(CONFIG)
+
+gateway:
+	go run ./cmd/gateway -config $(CONFIG)
 
 test:
 	go test ./...
