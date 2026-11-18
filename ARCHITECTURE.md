@@ -61,6 +61,19 @@ apply to protocol differential testing, custom TLS clients and raw fuzzers.
    when scope is enabled; metadata addresses are always denied. Code:
    `scope.go`. Tests: `scope_test.go`.
 
+## Known boundaries
+
+- Admission runs at scrape time. A hand-written `proxies.txt` loaded by
+  `serve` or `cmd/gateway` is trusted input; only the per-connection TLS
+  verification done by the client protects that path.
+- `check` runs health and egress probes, not admission.
+- The CONNECT gateway attributes an exit IP to a TCP connection, not to an
+  individual HTTP request. Tools that need per-request attribution must use
+  `Dialer`/`Session`.
+- Free public proxies are intermittent: the same proxy can pass a canary and
+  later serve a wrong certificate. Verification is therefore per connection,
+  not a one-time property of the pool entry.
+
 ## Data flow
 
 ```

@@ -181,3 +181,59 @@ func TestGatewayToken(t *testing.T) {
 		t.Fatalf("expected 407 without token, got %q", line)
 	}
 }
+
+func startTestGateway(t *testing.T, cfg Config, proxies ...*Proxy) *Gateway {
+	t.Helper()
+	pool := newTestPool(t, cfg, proxies...)
+	gw, err := NewGateway("127.0.0.1:0", NewDialer(pool, testLogger()), "", testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gw.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = gw.Serve(ctx) }()
+	return gw
+}
+
+func connectStatus(t *testing.T, gw *Gateway, target string) string {
+	t.Helper()
+	conn, err := net.Dial("tcp", gw.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(conn, "CONNECT "+target+" HTTP/1.1\r\nHost: "+target+"\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	return line
+}
+
+func TestGatewayScopeRejectionIs403(t *testing.T) {
+	cfg := testConfig()
+	cfg.Scope = ScopeConfig{Enabled: true, AllowHosts: []string{"allowed.example"}, AllowPorts: []int{443}}
+	proxy := startConnectProxy(t, "")
+	gw := startTestGateway(t, cfg, mustProxy(t, proxy.URL()))
+
+	if line := connectStatus(t, gw, "blocked.example:443"); !strings.Contains(line, " 403 ") {
+		t.Fatalf("out-of-scope CONNECT = %q, want 403", line)
+	}
+}
+
+func TestGatewayUpstreamFailureIs502(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxDialAttempts = 1
+	cfg.DialTimeout = Duration(200 * time.Millisecond)
+	cfg.Scope = ScopeConfig{Enabled: true, AllowHosts: []string{"93.184.216.34"}, AllowPorts: []int{443}}
+	dead := mustProxy(t, "http://127.0.0.1:1")
+	gw := startTestGateway(t, cfg, dead)
+
+	if line := connectStatus(t, gw, "93.184.216.34:443"); !strings.Contains(line, " 502 ") {
+		t.Fatalf("dead upstream CONNECT = %q, want 502", line)
+	}
+}

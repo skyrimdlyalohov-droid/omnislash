@@ -149,6 +149,16 @@ func (g *Gateway) handle(ctx context.Context, conn net.Conn) {
 		target = net.JoinHostPort(strings.Trim(target, "[]"), "443")
 	}
 
+	// Reject out-of-scope targets with a distinct status. Otherwise a policy
+	// violation and a dead proxy both surface as 502 and are impossible to tell
+	// apart from the client side. The dialer checks again; this is not a
+	// substitute for that check.
+	if _, err := g.dialer.pool.scope.CheckTarget(ctx, target); err != nil {
+		g.log.Debug("gateway target rejected by scope", "target", target, "error", err)
+		writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target is outside the configured scope")
+		return
+	}
+
 	upstream, err := g.dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
 		g.log.Debug("gateway dial failed", "target", target, "error", err)
