@@ -295,6 +295,18 @@ func jobSucceeded(j *JobConfig, res *probe.Result, err error) bool {
 	if err != nil || res == nil {
 		return false
 	}
+	if j.SuccessFinding != "" {
+		found := false
+		for _, f := range res.Findings {
+			if f.Kind == j.SuccessFinding {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
 	marker := strings.ToLower(strings.TrimSpace(j.SuccessContains))
 	if marker == "" {
 		return true
@@ -398,6 +410,15 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 			Timeout:   timeout,
 			Idle:      idle,
 			SingleUse: j.SingleUse,
+		}, nil
+	case "h2-tunnel":
+		return &probe.H2TunnelProbe{
+			PoisonPath:   j.PoisonPath,
+			GadgetPath:   j.GadgetPath,
+			PaddingPaths: j.PaddingPaths,
+			Marker:       j.SuccessContains,
+			Timeout:      timeout,
+			Idle:         idle,
 		}, nil
 	default:
 		return nil, fmt.Errorf("daemon: unsupported probe %q", j.Probe)

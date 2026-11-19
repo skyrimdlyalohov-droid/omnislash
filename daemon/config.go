@@ -62,10 +62,16 @@ type JobConfig struct {
 	VictimMethod    string `json:"victim_method"`
 	VictimPath      string `json:"victim_path"`
 	SuccessContains string `json:"success_contains"`
-	Count           int    `json:"count"`
-	Method          string `json:"method"`
-	Path            string `json:"path"`
-	SingleUse       bool   `json:"single_use"`
+	// SuccessFinding requires a finding of this kind. It is how a job states
+	// "cache_poisoned", not merely "the probe completed".
+	SuccessFinding string   `json:"success_finding"`
+	PoisonPath     string   `json:"poison_path"`
+	GadgetPath     string   `json:"gadget_path"`
+	PaddingPaths   []string `json:"padding_paths"`
+	Count          int      `json:"count"`
+	Method         string   `json:"method"`
+	Path           string   `json:"path"`
+	SingleUse      bool     `json:"single_use"`
 
 	// Attempts is the number of probe runs inside one scheduled execution.
 	Attempts int `json:"attempts"`
@@ -136,7 +142,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("daemon: job %q: tls must be h1, h2 or none", j.Name)
 		}
 		switch j.Probe {
-		case "smuggle-chain", "smuggle", "race", "h2race":
+		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel":
 		default:
 			return fmt.Errorf("daemon: job %q: unsupported probe %q", j.Name, j.Probe)
 		}
@@ -145,6 +151,9 @@ func (c *Config) Validate() error {
 		}
 		if j.Probe == "h2race" && j.tlsMode() != "h2" {
 			return fmt.Errorf("daemon: job %q: h2race requires tls=h2", j.Name)
+		}
+		if j.Probe == "h2-tunnel" && j.tlsMode() != "h2" {
+			return fmt.Errorf("daemon: job %q: h2-tunnel requires tls=h2", j.Name)
 		}
 		if j.Probe == "smuggle" && j.Variant == string(probe.VariantH2Downgrade) && j.tlsMode() != "h2" {
 			return fmt.Errorf("daemon: job %q: h2.downgrade requires tls=h2", j.Name)

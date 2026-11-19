@@ -35,6 +35,7 @@ type Probe interface {
 | Smuggling confirmation | `SmuggleChainProbe` | plants a CL.TE prefix on one socket, sends the victim on the next (front-end closes clients, back-end connection stays poisoned) |
 | Race H1 | `RaceProbe` | single-packet attack: `single_write`, `writev`, `last_byte` |
 | Race H2 | `H2RaceProbe` | last-frame synchronization: all HEADERS first, all END_STREAM DATA in one write |
+| H2 request tunnelling | `H2TunnelProbe` | CRLF in `:path`; front-end over-reads the tunnelled HTTP/1.1 response; cache poisoning verified with a normal GET |
 | WAF bypass / fuzzing | `GadgetProbe` + `Gadgets()` | duplicate and obfuscated framing headers, one gadget per rotated session |
 | Cache poisoning | `CachePoisonProbe` | poisoner then victim on one connection (cache stickiness) |
 | Rate-limit bypass | `RaceProbe` + `Runner.Fanout` | synchronized bursts in parallel across pool IPs |
@@ -104,6 +105,35 @@ type ConnSource interface {
 experiment share one proxy and one exit IP. The probe closes what it opens;
 `Runner` closes anything left behind. `Execute` on a `MultiConnProbe` returns
 `ErrMultiConn` instead of silently falling back to one socket.
+
+## HTTP/2 request tunnelling and cache poisoning
+
+`H2TunnelProbe` targets a front-end that accepts HTTP/2 but downgrades to
+HTTP/1.1 without sanitizing the `:path` pseudo-header. A CRLF inside `:path`
+ends the outer request early and makes the back-end parse a second request the
+front-end never saw:
+
+```
+:path = / HTTP/1.1\r\nHost: lab\r\n\r\nGET /resources?<script>... HTTP/1.1\r\nHost: lab\r\nX: x
+```
+
+The probe sends it as a `HEAD` request. The main response carries the home
+page's `Content-Length`, but the front-end forwards that many bytes from the
+back-end stream, so the tunnelled HTTP/1.1 response lands in the first
+response body. The tunnel includes the reflected `/resources` gadget plus
+large static responses for padding, which keeps `:path` short enough for the
+front-end while still exceeding the main `Content-Length`.
+
+The last step is a normal `GET` of the poisoned path. The probe requires the
+marker in that cached body and reports `cache_poisoned`; `h2_tunnel_confirmed`
+is reported when the raw tunnelled response is visible in the HEAD body. All
+frames are written with `x/net/http2` and parsed directly, so a HEAD response
+with an unexpected DATA frame is preserved instead of rejected by a client
+library's Content-Length validation.
+
+The daemon job is in `examples/daemon/daemon-cache-tunnel.json`; the same
+marker plus `success_finding: "cache_poisoned"` means the job only succeeds
+after the cache verification, not merely after sending the payload.
 
 The daemon (`cmd/omnislashd`) schedules these probes from JSON and is
 demonstrated on the PortSwigger CL.TE lab in `examples/daemon/`.

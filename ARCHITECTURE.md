@@ -89,9 +89,10 @@ the probes own the logic.**
   the same probe on independent sessions in parallel (rate-limit bypass).
 
 Modules: `SmugglingProbe` (CL.TE, TE.CL, TE.TE, H2 downgrade), `RaceProbe` (H1
-single-packet), `H2RaceProbe` (last-frame sync), `GadgetProbe` (WAF bypass),
-`CachePoisonProbe` (poisoner then victim on one conn), `WebSocketProbe`
-(documentedly unimplemented). See `probe/README.md`.
+single-packet), `H2RaceProbe` (last-frame sync), `H2TunnelProbe` (CRLF in
+`:path`, tunnelled response over-read, cache poisoning verified with a normal
+GET), `GadgetProbe` (WAF bypass), `CachePoisonProbe` (poisoner then victim on
+one conn), `WebSocketProbe` (documentedly unimplemented). See `probe/README.md`.
 
 Some techniques need more than one socket: a front-end can close every client
 connection while reusing its back-end connection, so a desync planted on one

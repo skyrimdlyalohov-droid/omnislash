@@ -177,6 +177,13 @@ func TestValidate(t *testing.T) {
 			}}},
 			want: "requires tls=h2",
 		},
+		{
+			name: "h2-tunnel without h2",
+			cfg: Config{OmnislashConfig: "transport.json", Jobs: []JobConfig{{
+				Name: "x", Target: TargetConfig{Addr: "a:1"}, Probe: "h2-tunnel",
+			}}},
+			want: "requires tls=h2",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -197,6 +204,7 @@ func TestBuildProbeTypes(t *testing.T) {
 		{"smuggle", "smuggling/cl.te"},
 		{"race", "race/single-packet"},
 		{"h2race", "race/h2-last-frame"},
+		{"h2-tunnel", "cache/h2-request-tunnel"},
 	}
 	for _, tc := range cases {
 		j := JobConfig{Name: "x", Target: TargetConfig{Addr: "a:1"}, Probe: tc.probe}
@@ -207,6 +215,26 @@ func TestBuildProbeTypes(t *testing.T) {
 		if p.Name() != tc.want {
 			t.Fatalf("%s probe name = %q, want %q", tc.probe, p.Name(), tc.want)
 		}
+	}
+}
+
+func TestJobSucceededRequiresFinding(t *testing.T) {
+	j := &JobConfig{SuccessFinding: "cache_poisoned"}
+	nothing := &probe.Result{}
+	if jobSucceeded(j, nothing, nil) {
+		t.Fatal("a result without the required finding counted as success")
+	}
+	hit := &probe.Result{Findings: []probe.Finding{{Kind: "cache_poisoned"}}}
+	if !jobSucceeded(j, hit, nil) {
+		t.Fatal("the required finding did not count as success")
+	}
+	j.SuccessContains = "GPOST"
+	if jobSucceeded(j, hit, nil) {
+		t.Fatal("the marker was ignored when a finding was also required")
+	}
+	hit.Responses = []probe.Response{{Status: 403, Body: `"Unrecognized method GPOST"`}}
+	if !jobSucceeded(j, hit, nil) {
+		t.Fatal("finding plus marker should be required together")
 	}
 }
 

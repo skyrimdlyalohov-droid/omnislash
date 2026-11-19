@@ -2,6 +2,7 @@ package probe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	rawhttp "github.com/projectdiscovery/rawhttp/client"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
 )
@@ -470,6 +473,102 @@ func (s *countingSource) Dial(ctx context.Context) (net.Conn, error) {
 	s.dials.Add(1)
 	d := net.Dialer{Timeout: 2 * time.Second}
 	return d.DialContext(ctx, "tcp", s.addr)
+}
+
+func TestBuildTunnelPath(t *testing.T) {
+	got := buildTunnelPath(
+		"/",
+		"lab.test",
+		"/resources?<script>alert(1)</script>",
+		[]string{"/a.svg", "/b.jpg"},
+		"NONCE",
+	)
+	want := "/ HTTP/1.1\r\nHost: lab.test\r\n\r\n" +
+		"GET /resources?<script>alert(1)</script> HTTP/1.1\r\nHost: lab.test\r\n\r\n" +
+		"GET /a.svg HTTP/1.1\r\nHost: lab.test\r\n\r\n" +
+		"GET /b.jpg HTTP/1.1\r\nHost: lab.test\r\n" +
+		"X-Omnislash-Tunnel: NONCE"
+	if got != want {
+		t.Fatalf("tunnel path =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestH2TunnelProbeRejectsNonTLS(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	if _, err := (&H2TunnelProbe{}).Execute(context.Background(), Target{Addr: "lab.test:443"}, client); err == nil {
+		t.Fatal("plain connection was accepted by the h2 tunnel probe")
+	}
+}
+
+func TestH2TunnelReadsHeadResponseWithData(t *testing.T) {
+	// The whole point of the tunnel is a HEAD response that carries DATA
+	// anyway, so the frame reader must not enforce HTTP/2 Content-Length.
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	e := newExec(context.Background(), "test", Target{Addr: "lab.test:443"}, client, time.Second, 0, 0)
+	fr := http2.NewFramer(client, client)
+	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	tunnel := &h2Tunnel{e: e, fr: fr, nextID: 1, maxBody: defaultMaxBody, host: "lab.test"}
+
+	done := make(chan error, 1)
+	go func() {
+		// net.Pipe writes block until the peer reads: drain the client's
+		// SETTINGS ACK and WINDOW_UPDATE frames concurrently.
+		go func() { _, _ = io.Copy(io.Discard, server) }()
+
+		w := http2.NewFramer(server, nil)
+		if err := w.WriteSettings(); err != nil {
+			done <- err
+			return
+		}
+		var hb bytes.Buffer
+		enc := hpack.NewEncoder(&hb)
+		for _, field := range []hpack.HeaderField{
+			{Name: ":status", Value: "200"},
+			{Name: "content-type", Value: "text/html"},
+			{Name: "content-length", Value: "6"},
+		} {
+			if err := enc.WriteField(field); err != nil {
+				done <- err
+				return
+			}
+		}
+		if err := w.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: hb.Bytes(),
+			EndHeaders:    true,
+		}); err != nil {
+			done <- err
+			return
+		}
+		if err := w.WriteData(1, false, []byte("abc")); err != nil {
+			done <- err
+			return
+		}
+		if err := w.WriteData(1, true, []byte("def")); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	resp, err := tunnel.readStream(context.Background(), 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.status)
+	}
+	if got := string(resp.body); got != "abcdef" {
+		t.Fatalf("body = %q, want %q", got, "abcdef")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func hasFinding(res *Result, kind string) bool {
