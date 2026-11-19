@@ -102,6 +102,33 @@ func TestSessionRejectsZeroTTL(t *testing.T) {
 	}
 }
 
+func TestSessionPinsDirectEgressWhenAllowed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.TrustTier = TrustTierTrusted
+	cfg.AllowDirect = true
+	cfg.Health.Enabled = false
+	cfg.Scope.Enabled = false
+	pool := newTestPool(t, cfg)
+	dialer := NewDialer(pool, testLogger())
+	echo := startEchoServer(t)
+
+	s, err := dialer.NewSession(time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Proxy() != nil {
+		t.Fatalf("direct session pinned proxy %v", s.Proxy())
+	}
+	conn, err := s.DialContext(context.Background(), "tcp", echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, ok := ProxyOf(conn); ok {
+		t.Fatal("direct connection must not claim a proxy attribution")
+	}
+}
+
 func TestSessionDialRejectsClosedPool(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Health.Enabled = false

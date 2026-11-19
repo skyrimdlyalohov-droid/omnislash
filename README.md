@@ -29,6 +29,12 @@
   cloud-metadata, локальный DNS-резолв и пиннинг IP.
 - **Ротация на каждое новое TCP-соединение**: `round_robin`, `random`,
   `least_used`, `sticky` (один прокси на target в течение TTL).
+- **Байт-точные пробы**: `probe/` — smuggling (CL.TE/TE.CL/TE.TE/H2 downgrade),
+  single-packet race H1, last-frame sync H2, гаджеты WAF, cache poisoning.
+  `Probe` получает уже открытый `net.Conn`; `http.Client` и `net.Dial` внутри
+  проб запрещены, запросы уходят только через `conn.Write`.
+- **Демон `omnislashd`**: JSON-конфиг с задачами, расписание, ретраи, JSONL-аудит
+  и `-/healthz|/status`; один запуск задачи = одна pinned-сессия.
 - **Сессия эксперимента**: `Dialer.NewSession(ttl)` жёстко пиннит один прокси
   на явный срок. Все запросы эксперимента выходят с одного IP; после TTL или
   ошибки — отказ, а не тихая ротация.
@@ -475,6 +481,77 @@ client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 per-proxy, повторяет запрос при сетевых ошибках и «банных» статусах. Тело
 запроса буферизуется до `http.max_body_buffer`, чтобы его можно было безопасно
 повторить.
+
+## Демон проб (`omnislashd`)
+
+`omnislashd` — долгоживущий планировщик проб. Транспорт берётся из обычного
+конфига omnislash, задачи — из JSON рядом:
+
+```bash
+go run ./cmd/omnislashd -config examples/daemon/daemon.json          # демон
+go run ./cmd/omnislashd -config examples/daemon/daemon.json -once    # все задачи один раз
+go run ./cmd/omnislashd -config examples/daemon/daemon.json -job lab-clte-gpost
+```
+
+Задача описывает цель, пробу и критерий успеха:
+
+```json
+{
+  "name": "lab-clte-gpost",
+  "target": {"addr": "host:443", "host": "host", "path": "/"},
+  "tls": "h1",
+  "probe": "smuggle-chain",
+  "victim_method": "POST",
+  "victim_path": "/",
+  "success_contains": "Unrecognized method GPOST",
+  "attempts": 3,
+  "until_success": true,
+  "interval": "10s"
+}
+```
+
+- `probe`: `smuggle-chain`, `smuggle`, `race`, `h2race`.
+- `tls`: `h1` (по умолчанию), `h2`, `none`.
+- `attempts` — сколько прогонов внутри одного запуска; `until_success` снимает
+  задачу с расписания после первого успеха, а `exit_on_success` в корне
+  конфига завершает процесс (CI/lab-режим).
+- `log_file` — JSONL: каждый attempt с атрибуцией, статусами, findings и полным
+  `Result` (сырые записи и ответы).
+- `control_addr` поднимает `GET /healthz` и `GET /status` только на localhost.
+
+Один запуск задачи создаёт одну pinned-сессию: все соединения пробы (включая
+`smuggle-chain`, которой нужны два сокета) выходят через один прокси и один
+exit IP. Для изолированной лабы без прокси используется `trust_tier: trusted`,
+`allow_direct: true` и узкий `scope`; strict этот режим запрещает.
+
+### Проверка на лабе PortSwigger
+
+Готовая пара конфигов лежит в `examples/daemon/`. Лаба — «HTTP request
+smuggling, basic CL.TE»: front-end считает `Content-Length`, back-end —
+`Transfer-Encoding`. Проба отправляет `POST` с `CL=6` и телом `0\r\n\r\nG`,
+затем на **новом** соединении — обычный `POST`; back-end видит `GPOST` и
+отвечает `403 "Unrecognized method GPOST"`.
+
+```bash
+go run ./cmd/omnislashd -config examples/daemon/daemon.json -once
+```
+
+Вывод (сокращён):
+
+```json
+[{
+  "job": "lab-clte-gpost",
+  "success": true,
+  "statuses": [200, 403],
+  "findings": [{"kind": "smuggle_confirmed", "confidence": "high"}]
+}]
+```
+
+Лаба в этой сессии была доведена до состояния `Solved`; финальный прогон
+`omnislashd` повторил атаку и получил маркер `Unrecognized method GPOST`.
+Инстанс лабы одноразовый: если URL истёк, замените хост в
+`examples/daemon/daemon.json` и `config.lab.json`. Применяйте только к своим
+лабам и авторизованным целям.
 
 ## Ротация, здоровье и кулдауны
 

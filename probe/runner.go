@@ -36,10 +36,21 @@ type Outcome struct {
 	Err    error   `json:"-"`
 }
 
-// Run executes one probe on one pinned session and closes both the session and
-// the connection afterwards. The connection is never reused for another probe:
-// a desync or a half-consumed response would poison the next run.
+// Run executes one probe on one pinned session and closes the session and every
+// connection afterwards. Connections are never reused for another probe: a
+// desync or a half-consumed response would poison the next run.
 func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, error) {
+	if mp, ok := p.(MultiConnProbe); ok {
+		session, err := r.newSession(target)
+		if err != nil {
+			return nil, err
+		}
+		defer session.Close()
+		src := &sessionSource{session: session, tls: r.TLS, addr: target.Addr}
+		res, err := mp.ExecuteMulti(ctx, target, src)
+		src.closeAll()
+		return res, err
+	}
 	session, conn, err := r.dial(ctx, target)
 	if err != nil {
 		return nil, err
@@ -92,12 +103,12 @@ func (r *Runner) Fanout(ctx context.Context, target Target, p Probe, n, concurre
 	return out
 }
 
-func (r *Runner) dial(ctx context.Context, target Target) (*omnislash.Session, net.Conn, error) {
+func (r *Runner) newSession(target Target) (*omnislash.Session, error) {
 	if r == nil || r.Dialer == nil {
-		return nil, nil, errors.New("probe: runner has no dialer")
+		return nil, errors.New("probe: runner has no dialer")
 	}
 	if target.Addr == "" {
-		return nil, nil, errors.New("probe: target address is required")
+		return nil, errors.New("probe: target address is required")
 	}
 	ttl := r.TTL
 	if ttl <= 0 {
@@ -105,17 +116,73 @@ func (r *Runner) dial(ctx context.Context, target Target) (*omnislash.Session, n
 	}
 	session, err := r.Dialer.NewSession(ttl)
 	if err != nil {
-		return nil, nil, fmt.Errorf("probe: create session: %w", err)
+		return nil, fmt.Errorf("probe: create session: %w", err)
 	}
+	return session, nil
+}
+
+func (r *Runner) dial(ctx context.Context, target Target) (*omnislash.Session, net.Conn, error) {
+	session, err := r.newSession(target)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn, err := r.dialSession(ctx, session, target)
+	if err != nil {
+		session.Close()
+		return nil, nil, err
+	}
+	return session, conn, nil
+}
+
+func (r *Runner) dialSession(ctx context.Context, session *omnislash.Session, target Target) (net.Conn, error) {
 	var conn net.Conn
+	var err error
 	if r.TLS != nil {
 		conn, err = session.DialTLSContext(ctx, "tcp", target.Addr, r.TLS)
 	} else {
 		conn, err = session.DialContext(ctx, "tcp", target.Addr)
 	}
 	if err != nil {
-		session.Close()
-		return nil, nil, fmt.Errorf("probe: dial %s: %w", target.Addr, err)
+		return nil, fmt.Errorf("probe: dial %s: %w", target.Addr, err)
 	}
-	return session, conn, nil
+	return conn, nil
+}
+
+// sessionSource hands out connections from one pinned session and remembers
+// them so Runner can close anything a probe forgot. All sockets therefore share
+// the same proxy and exit IP.
+type sessionSource struct {
+	session *omnislash.Session
+	tls     *tls.Config
+	addr    string
+
+	mu   sync.Mutex
+	conn []net.Conn
+}
+
+func (s *sessionSource) Dial(ctx context.Context) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+	if s.tls != nil {
+		conn, err = s.session.DialTLSContext(ctx, "tcp", s.addr, s.tls)
+	} else {
+		conn, err = s.session.DialContext(ctx, "tcp", s.addr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("probe: dial %s: %w", s.addr, err)
+	}
+	s.mu.Lock()
+	s.conn = append(s.conn, conn)
+	s.mu.Unlock()
+	return conn, nil
+}
+
+func (s *sessionSource) closeAll() {
+	s.mu.Lock()
+	conns := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }

@@ -93,6 +93,36 @@ single-packet), `H2RaceProbe` (last-frame sync), `GadgetProbe` (WAF bypass),
 `CachePoisonProbe` (poisoner then victim on one conn), `WebSocketProbe`
 (documentedly unimplemented). See `probe/README.md`.
 
+Some techniques need more than one socket: a front-end can close every client
+connection while reusing its back-end connection, so a desync planted on one
+socket is observed on the next. `MultiConnProbe` covers that case. It receives a
+`ConnSource` created by `Runner`, not a dialer: every connection still belongs
+to one pinned session and one exit IP, and the probe still only writes bytes.
+
+## Daemon
+
+`omnislashd` is the automation layer: jobs from a JSON file, a scheduler with
+per-job intervals, bounded concurrency, retries and a JSONL audit record per
+attempt. It chooses one `probe.Runner` per TLS mode (`none`, `h1`, `h2`) and
+calls the same `Probe` implementations the library exposes.
+
+- One scheduled execution may contain several attempts; each attempt is a fresh
+  pinned session and a fresh set of sockets.
+- Success is explicit. With `success_contains` the marker must appear in a
+  response body, header or reason. Without a marker the job counts as successful
+  when the probe completed; the evidence is still in the audit log.
+- `exit_on_success` turns the daemon into a CI/lab command: it returns 0 only
+  after a job reaches its declared goal.
+- The control endpoint is bound to `control_addr` and exposes only `/healthz`
+  and `/status`; it is not an open proxy or an arbitrary job API.
+
+For a lab without proxies the transport must be `trust_tier: trusted` with
+`allow_direct: true` and a scope pinned to that lab. In that mode
+`Dialer.NewSession` pins direct egress; it never falls back to direct after a
+proxy failure. A direct session has no proxy attribution, so
+`Result.Attribution.Verified` stays false - that is the honest answer, not a
+finding that a proxy was used.
+
 ## Known boundaries
 
 - Admission runs at scrape time. A hand-written `proxies.txt` loaded by
@@ -117,6 +147,7 @@ proxy sources -> Colly -> dedupe/shuffle -> egress canaries
                                              |
 scanner -> Dialer / Session / CONNECT gateway -> opaque proxy tunnel -> target
 probe   -> Runner -> pinned Session -------------------^  (conn.Write only)
+daemon  -> probe jobs -> Runner (one pinned Session per attempt)
 ```
 
 The proxy never receives target bytes through `net/http`; HTTP proxies always

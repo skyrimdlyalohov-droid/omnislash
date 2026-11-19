@@ -1,11 +1,14 @@
 VERSION ?= 1.0.0
 BINARY  := bin/omnislash
 PKG     := ./cmd/omnislash
+DAEMON  := bin/omnislashd
+DAEMON_PKG := ./cmd/omnislashd
+DAEMON_CONFIG ?= examples/daemon/daemon.json
 IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run gateway test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway daemon daemon-build daemon-once test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -17,6 +20,15 @@ run: build
 
 gateway:
 	go run ./cmd/gateway -config $(CONFIG)
+
+daemon-build:
+	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(DAEMON) $(DAEMON_PKG)
+
+daemon: daemon-build
+	$(DAEMON) -config $(DAEMON_CONFIG)
+
+daemon-once:
+	go run $(DAEMON_PKG) -config $(DAEMON_CONFIG) -once
 
 test:
 	go test ./...

@@ -30,6 +30,10 @@ type Session struct {
 // NewSession selects one proxy now and pins it for ttl. A non-positive ttl is
 // an error rather than an implicit default: the experiment lifetime must be
 // explicit. The pool strategy is applied once, at session creation.
+//
+// With an empty pool in a trusted config that sets allow_direct, the session
+// pins direct egress instead. That is still one egress for the whole session:
+// the direct path is never a mid-session fallback after a proxy failure.
 func (d *Dialer) NewSession(ttl time.Duration) (*Session, error) {
 	if d == nil || d.pool == nil {
 		return nil, fmt.Errorf("omnislash: nil dialer or pool")
@@ -42,7 +46,10 @@ func (d *Dialer) NewSession(ttl time.Duration) (*Session, error) {
 	}
 	pr, err := d.pool.pick(nil, "")
 	if err != nil {
-		return nil, fmt.Errorf("omnislash: create session: %w", err)
+		if !d.pool.cfg.AllowDirect {
+			return nil, fmt.Errorf("omnislash: create session: %w", err)
+		}
+		pr = nil
 	}
 	now := d.pool.now()
 	return &Session{
@@ -53,7 +60,8 @@ func (d *Dialer) NewSession(ttl time.Duration) (*Session, error) {
 	}, nil
 }
 
-// Proxy returns the pinned proxy. Its Label is safe to log.
+// Proxy returns the pinned proxy, or nil for a direct-egress session. Its
+// Label is safe to log.
 func (s *Session) Proxy() *Proxy { return s.proxy }
 
 // ExpiresAt returns the explicit session deadline.
@@ -97,6 +105,15 @@ func (s *Session) DialContext(ctx context.Context, network, addr string) (net.Co
 	target, err := s.dialer.pool.scope.CheckTarget(ctx, addr)
 	if err != nil {
 		return nil, err
+	}
+	if s.proxy == nil {
+		// Direct egress was pinned at session creation. No proxy failure can
+		// move this session to another address mid-experiment.
+		conn, err := s.dialer.base.DialContext(ctx, network, target)
+		if err != nil {
+			return nil, fmt.Errorf("omnislash: direct dial %s: %w", target, err)
+		}
+		return conn, nil
 	}
 	return s.dialer.dialProxy(ctx, s.proxy, target)
 }

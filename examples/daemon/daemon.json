@@ -1,0 +1,30 @@
+{
+  "omnislash_config": "config.lab.json",
+  "proxies": "",
+  "log_file": "lab-clte.jsonl",
+  "poll_interval": "2s",
+  "concurrency": 1,
+  "exit_on_success": true,
+  "control_addr": "127.0.0.1:7777",
+  "jobs": [
+    {
+      "name": "lab-clte-gpost",
+      "target": {
+        "addr": "0a4f00ab039230a88242cefc009800d2.web-security-academy.net:443",
+        "host": "0a4f00ab039230a88242cefc009800d2.web-security-academy.net",
+        "path": "/"
+      },
+      "tls": "h1",
+      "probe": "smuggle-chain",
+      "victim_method": "POST",
+      "victim_path": "/",
+      "success_contains": "Unrecognized method GPOST",
+      "attempts": 3,
+      "until_success": true,
+      "interval": "10s",
+      "timeout": "10s",
+      "idle": "2s",
+      "retry_delay": "1s"
+    }
+  ]
+}

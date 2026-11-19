@@ -90,6 +90,14 @@ func (e *exec) deadline() time.Time {
 	return d
 }
 
+// attach replaces the socket under a running exec. The result, sequence
+// counters and start time are kept, so a multi-connection run is recorded as
+// one experiment instead of unrelated results.
+func (e *exec) attach(conn net.Conn) {
+	e.conn = conn
+	e.br = bufio.NewReaderSize(conn, 16<<10)
+}
+
 // write sends payload in exactly one conn.Write call and records the bytes.
 func (e *exec) write(payload []byte) error {
 	if err := e.ctx.Err(); err != nil {

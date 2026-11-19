@@ -3,3 +3,6 @@ proxies.txt
 config.json
 config.local.json
 *.test
+
+# daemon runtime evidence
+/examples/daemon/*.jsonl

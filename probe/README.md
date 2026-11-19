@@ -32,6 +32,7 @@ type Probe interface {
 | Module | Type | Technique |
 | --- | --- | --- |
 | Smuggling & desync | `SmugglingProbe` | `cl.te`, `te.cl`, `te.te`, `h2.downgrade`; one variant per connection |
+| Smuggling confirmation | `SmuggleChainProbe` | plants a CL.TE prefix on one socket, sends the victim on the next (front-end closes clients, back-end connection stays poisoned) |
 | Race H1 | `RaceProbe` | single-packet attack: `single_write`, `writev`, `last_byte` |
 | Race H2 | `H2RaceProbe` | last-frame synchronization: all HEADERS first, all END_STREAM DATA in one write |
 | WAF bypass / fuzzing | `GadgetProbe` + `Gadgets()` | duplicate and obfuscated framing headers, one gadget per rotated session |
@@ -85,3 +86,24 @@ probe per fresh session (gadget rotation); `Runner.Fanout` runs the same probe
 on independent sessions in parallel (rate-limit bypass across IPs).
 
 Only use these probes against systems you are authorized to test.
+
+## Multi-connection probes
+
+`SmuggleChainProbe` needs two sockets: a front-end can close every client
+connection while keeping its back-end socket alive, so the desync planted on
+one connection is delivered to the next. It implements `MultiConnProbe` and
+receives a `ConnSource` instead of dialing:
+
+```go
+type ConnSource interface {
+	Dial(ctx context.Context) (net.Conn, error)
+}
+```
+
+`Runner` builds the source from one pinned `Session`, so all sockets in the
+experiment share one proxy and one exit IP. The probe closes what it opens;
+`Runner` closes anything left behind. `Execute` on a `MultiConnProbe` returns
+`ErrMultiConn` instead of silently falling back to one socket.
+
+The daemon (`cmd/omnislashd`) schedules these probes from JSON and is
+demonstrated on the PortSwigger CL.TE lab in `examples/daemon/`.

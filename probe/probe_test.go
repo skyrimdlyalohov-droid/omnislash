@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,12 @@ func rawServer(t *testing.T, handle func(net.Conn) error) (addr string, accepts 
 
 func writeHTTP(conn net.Conn, status int) error {
 	_, err := fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
+	return err
+}
+
+func writeHTTPBody(conn net.Conn, status int, body string) error {
+	_, err := fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		status, http.StatusText(status), len(body), body)
 	return err
 }
 
@@ -313,6 +320,156 @@ func TestH2RaceLastFrameSync(t *testing.T) {
 			t.Fatalf("status = %d, want 200", r.Status)
 		}
 	}
+}
+
+func TestSmuggleChainProbeConfirmsGPOST(t *testing.T) {
+	// The fixture models a front-end that closes each client connection but
+	// keeps the back-end socket: the payload's chunked body ends before "G",
+	// and the next connection's request line is prefixed with it.
+	var mu sync.Mutex
+	leftover := ""
+	addr, _ := rawServer(t, func(conn net.Conn) error {
+		br := bufio.NewReader(conn)
+		mu.Lock()
+		prefix := leftover
+		mu.Unlock()
+		if prefix != "" {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return err
+			}
+			if strings.HasPrefix(prefix+line, "GPOST ") {
+				return writeHTTPBody(conn, http.StatusForbidden, `"Unrecognized method GPOST"`)
+			}
+			return writeHTTP(conn, http.StatusOK)
+		}
+		req, err := readRequest(br)
+		if err != nil {
+			return err
+		}
+		_ = req
+		// http.ReadRequest with chunked encoding stops after the 0 chunk and
+		// leaves the smuggling byte in the reader.
+		b, err := br.ReadByte()
+		if err == nil {
+			mu.Lock()
+			leftover = string(b)
+			mu.Unlock()
+		}
+		return writeHTTP(conn, http.StatusOK)
+	})
+
+	src := &countingSource{addr: addr}
+	p := &SmuggleChainProbe{
+		VictimMethod:    "POST",
+		SuccessContains: "Unrecognized method GPOST",
+		Attempts:        2,
+		Timeout:         2 * time.Second,
+		Idle:            200 * time.Millisecond,
+	}
+	res, err := p.ExecuteMulti(context.Background(), Target{Addr: addr}, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(res, "smuggle_confirmed") {
+		t.Fatalf("expected smuggle_confirmed, findings=%+v", res.Findings)
+	}
+	if src.dials.Load() != 2 {
+		t.Fatalf("source dials = %d, want 2", src.dials.Load())
+	}
+	if len(res.Exchanges) < 2 || len(res.Responses) < 2 {
+		t.Fatalf("exchanges=%d responses=%d, want at least 2/2", len(res.Exchanges), len(res.Responses))
+	}
+	var statuses []int
+	for _, r := range res.Responses {
+		statuses = append(statuses, r.Status)
+	}
+	if statuses[len(statuses)-1] != http.StatusForbidden {
+		t.Fatalf("statuses = %v, want the last response to be 403", statuses)
+	}
+}
+
+func TestSmuggleChainProbeRetriesWithFreshPayloadConn(t *testing.T) {
+	// No leftover state: every response is a plain 200, so the probe must run
+	// all attempts and report unconfirmed. The fixture records the bytes each
+	// connection received, which shows whether attempt 2 planted its payload on
+	// a new socket or wrote it into the previous victim connection.
+	var mu sync.Mutex
+	var received []string
+	addr, accepts := rawServer(t, func(conn net.Conn) error {
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		var buf []byte
+		tmp := make([]byte, 4096)
+		for {
+			n, err := conn.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+			}
+			if err != nil {
+				break
+			}
+		}
+		mu.Lock()
+		received = append(received, string(buf))
+		mu.Unlock()
+		return writeHTTP(conn, http.StatusOK)
+	})
+
+	src := &countingSource{addr: addr}
+	p := &SmuggleChainProbe{
+		VictimMethod:    "POST",
+		SuccessContains: "Unrecognized method GPOST",
+		Attempts:        2,
+		Timeout:         2 * time.Second,
+		Idle:            250 * time.Millisecond,
+	}
+	res, err := p.ExecuteMulti(context.Background(), Target{Addr: addr}, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(res, "smuggle_chain_unconfirmed") {
+		t.Fatalf("findings = %+v, want smuggle_chain_unconfirmed", res.Findings)
+	}
+	if got := src.dials.Load(); got != 4 {
+		t.Fatalf("source dials = %d, want 4 (payload+victim per attempt)", got)
+	}
+	if got := accepts.Load(); got != 4 {
+		t.Fatalf("accepted connections = %d, want 4", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 4 {
+		t.Fatalf("recorded connections = %d, want 4", len(received))
+	}
+	for i, raw := range received {
+		isPayload := i%2 == 0
+		hasChunked := strings.Contains(raw, "Transfer-Encoding: chunked")
+		switch {
+		case isPayload && !hasChunked:
+			t.Fatalf("connection %d is a payload socket but received no chunked body: %q", i, raw)
+		case !isPayload && hasChunked:
+			t.Fatalf("connection %d is a victim socket but received the payload: %q", i, raw)
+		}
+	}
+}
+
+func TestSmuggleChainProbeExecuteRejectsSingleConn(t *testing.T) {
+	p := &SmuggleChainProbe{}
+	if _, err := p.Execute(context.Background(), Target{Addr: "127.0.0.1:1"}, nil); !errors.Is(err, ErrMultiConn) {
+		t.Fatalf("Execute error = %v, want ErrMultiConn", err)
+	}
+}
+
+type countingSource struct {
+	addr  string
+	dials atomic.Int64
+}
+
+func (s *countingSource) Dial(ctx context.Context) (net.Conn, error) {
+	s.dials.Add(1)
+	d := net.Dialer{Timeout: 2 * time.Second}
+	return d.DialContext(ctx, "tcp", s.addr)
 }
 
 func hasFinding(res *Result, kind string) bool {
