@@ -65,9 +65,17 @@ go run ./cmd/omnislash faq -topic rate-limit
 - Stop statuses: `[403, 429, 503]`.
 - Circuit breaker: threshold 5 / 60s, cooldown 10m.
 - Audit: JSONL, strip query/userinfo/body.
-- Никакого трафика наружу вне allowlist; evasion-уровни L2–L4 — design/deferred.
+- L2/L3/L4: runtime transport wiring включён (uTLS handshake, HTTP/2 consistency, timing) **только в рамках safety-gates**; логика обхода ханипотов/десепшенов/canary не добавляется.
 
-## 5. Tests
+## 5. New functionality (delivered)
+
+- **L2 runtime**: `utls.UClient` + `ClientHelloID` + `HandshakeContext`, SNI/ALPN `h2,http/1.1`.
+- **L3 runtime**: `HTTP2ConsistencyLayer` + `HTTP2FrameLayer` + `http.Transport.HTTP2` settings.
+- **L4 runtime**: `BehavioralTimingLayer` (jitter, warm-up, adaptive hook).
+- **OSIS deception detection (defensive)**: `is_honeypot`, `deception_risk` в `targets_verified.json`.
+- **Traffic acceleration**: pool strategy `latency_aware` (выбор по минимальной EWMA latency).
+
+## 6. Tests
 
 ```bash
 go build ./... && go vet ./... && go test ./... -count=1

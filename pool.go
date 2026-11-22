@@ -346,6 +346,8 @@ func (p *Pool) pick(exclude map[*Proxy]struct{}, key string) (*Proxy, error) {
 		chosen = p.pickRandom(proxies, now, exclude)
 	case StrategyLeastUsed:
 		chosen = p.pickLeastUsed(proxies, now, exclude)
+	case StrategyLatencyAware:
+		chosen = p.pickLatencyAware(proxies, now, exclude)
 	default:
 		chosen = p.pickRoundRobin(proxies, now, exclude)
 	}
@@ -407,6 +409,27 @@ func (p *Pool) pickLeastUsed(proxies []*Proxy, now time.Time, exclude map[*Proxy
 		if chosen == nil || u < least {
 			chosen = pr
 			least = u
+		}
+	}
+	return chosen
+}
+
+func (p *Pool) pickLatencyAware(proxies []*Proxy, now time.Time, exclude map[*Proxy]struct{}) *Proxy {
+	var chosen *Proxy
+	var best time.Duration
+	for _, pr := range proxies {
+		if inSet(exclude, pr) || !pr.available(now) {
+			continue
+		}
+		pr.mu.Lock()
+		lat := pr.latency
+		pr.mu.Unlock()
+		if lat <= 0 {
+			lat = 24 * time.Hour // unknown latency: deprioritize vs measured
+		}
+		if chosen == nil || lat < best {
+			chosen = pr
+			best = lat
 		}
 	}
 	return chosen

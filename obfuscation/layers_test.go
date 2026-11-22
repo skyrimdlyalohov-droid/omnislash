@@ -47,20 +47,23 @@ func TestTLSFingerprintLayerFallsBackToUpstreamWithoutTransport(t *testing.T) {
 }
 
 func TestNewTLSFingerprintTransportBuildsUtlTransport(t *testing.T) {
-	tr, err := NewTLSFingerprintTransport("Chrome_131", nil)
+	tr, err := NewTLSFingerprintTransport("Chrome_131", nil, nil)
 	if err != nil {
 		t.Fatalf("NewTLSFingerprintTransport: %v", err)
 	}
 	if tr == nil {
 		t.Fatal("transport is nil")
 	}
-	if tr.DialContext == nil {
-		t.Fatal("transport has no DialContext")
+	if tr.DialTLSContext == nil {
+		t.Fatal("transport has no DialTLSContext")
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 should be true")
 	}
 }
 
 func TestNewTLSFingerprintTransportRejectsUnknownClient(t *testing.T) {
-	if _, err := NewTLSFingerprintTransport("Chrome_999", nil); err == nil {
+	if _, err := NewTLSFingerprintTransport("Chrome_999", nil, nil); err == nil {
 		t.Fatal("expected error for unknown ClientHelloID, got nil")
 	}
 }

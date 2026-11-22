@@ -15,6 +15,8 @@ Output schema (targets_verified.json):
     "ip": "string",
     "confidence_score": int,
     "behind_waf": bool,
+    "is_honeypot": bool,
+    "deception_risk": "low|medium|high",
     "recommended_profile": "string",
     "known_ports": [80, 443]
   }
@@ -46,6 +48,11 @@ CANARY_DOMAINS = {
 
 CANARY_RE = re.compile(
     r"(canarytokens|oastify|interact\.sh|burpcollaborator|requestbin|webhook\.site|pipedream)\.",
+    re.IGNORECASE,
+)
+
+SUSPICIOUS_HOST_RE = re.compile(
+    r"(honeypot|canary|decoy|trap|tarpit|sinkhole|blackhole|fake|honey)",
     re.IGNORECASE,
 )
 
@@ -291,6 +298,21 @@ def is_behind_waf(ip):
     return False
 
 
+def detect_deception(domain: str, honeypot_sources, flags) -> tuple[bool, str]:
+    """Defensive detection: flag likely honeypot/deception targets for exclusion."""
+    reasons = []
+    if honeypot_sources:
+        reasons.append("honeypot_source")
+    if SUSPICIOUS_HOST_RE.search(domain or ""):
+        reasons.append("suspicious_hostname")
+    if any(f.get("honeypot") for f in flags.values() if isinstance(f, dict)):
+        reasons.append("enrichment_honeypot")
+    if reasons:
+        level = "high" if "honeypot_source" in reasons or "enrichment_honeypot" in reasons else "medium"
+        return True, level
+    return False, "low"
+
+
 def score_confidence(verified_sources, honeypot_sources, behind_waf):
     score = 0
     if honeypot_sources:
@@ -333,6 +355,9 @@ def main(argv=None):
     target_ip = sorted(all_ips)[0] if all_ips else None
     behind_waf = is_behind_waf(target_ip) if target_ip else False
     confidence = score_confidence(verified_sources, honeypot_sources, behind_waf)
+    is_honeypot, deception_risk = detect_deception(domain, honeypot_sources, flags)
+    if is_honeypot and deception_risk == "high":
+        confidence = min(confidence, -5)
     recommended_profile = "l7_web" if behind_waf else "full"
     known_ports = [80, 443]
 
@@ -341,6 +366,8 @@ def main(argv=None):
         "ip": target_ip,
         "confidence_score": confidence,
         "behind_waf": behind_waf,
+        "is_honeypot": is_honeypot,
+        "deception_risk": deception_risk,
         "recommended_profile": recommended_profile,
         "known_ports": known_ports,
     }

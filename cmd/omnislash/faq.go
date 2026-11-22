@@ -32,10 +32,11 @@ A: bash lab/verify.sh — проверяет scope, rate limit, nuclei (-rate-li
 
 Q: Что за 4 obfuscation layers?
 A: L1 — LocalGatewayLayer (safety core через шлюз).
-   L2 — TLS ClientHello/JA3 spoof (design, utls).
-   L3 — HTTP/2 / L7 header consistency (design).
-   L4 — behavioral timing / jitter / warm-up / adaptive (design).
-   Runtime functional evasion пока DEFERRED по safety boundary.
+   L2 — TLS fingerprint runtime (utls UClient + ClientHelloID).
+   L3 — HTTP/2 / L7 header consistency runtime.
+   L4 — behavioral timing / jitter / warm-up / adaptive runtime.
+   Все слои работают только с safety-gates (scope, ≤4 rps, circuit, audit).
+   Обход ханипотов/десепшенов/canary не реализуется.
 
 Q: Как проверить работоспособность?
 A: go build ./... && go vet ./... && go test ./...

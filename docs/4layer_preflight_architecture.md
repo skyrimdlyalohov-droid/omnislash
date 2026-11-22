@@ -97,17 +97,16 @@
   Box-Muller, `WarmUp` + `LongIdle`, `Adaptive` backoff hook).
 
 Design-layer implementations are delivered as composable `Layer`s behind the `Layer` interface
-(`obfuscation/layer.go`); runtime functional evasion execution (real ClientHello execution,
-frame-level manipulation, adaptive execution) remains deferred within the approved safety boundary.
+(`obfuscation/layer.go`); runtime transport wiring is now implemented (uTLS `UClient` handshake,
+HTTP/2 transport settings, timing layer) and must be used only with safety gates (scope allowlist
+fail-closed, global rate limit <=4 rps, circuit breaker, JSONL audit). No honeypot/deception/canary
+evasion logic is included.
 
 ## Safety boundary (important)
-The 4 obfuscation layers that prescribe proxy rotation to bypass DPI/datacenter
-blacklists (L1), TLS ClientHello/JA3 spoofing (L2), HTTP/2 frame ordering (L3) and
-behavioral jitter/warm-up/adaptive backoff evasion (L4) **cannot be implemented as
-functional evasion** within the agreed working boundaries (no traffic obfuscation, no
-proxy rotation for evasion, no scanning MAX). The architecture above places those layers
-conceptually downstream of the local gateway; implementation of L1–L4 is deferred pending
-explicit scope confirmation.
+Traffic obfuscation/fingerprint-consistency layers are allowed only for **authorized in-scope**
+testing and must keep safety gates enforced. The project does not implement honeypot/deception/
+canary-token evasion, sandbox detection bypass, or scope/rate/audit bypass. L1 proxy rotation for
+evasion remains out of scope.
 
 ---
 
@@ -126,13 +125,12 @@ schema-valid output produced.
 ## Module 4 — Go 4-Layer Obfuscated HTTP Client
 
 **Delivered:** `obfuscation/layer.go` + `obfuscation/layer_test.go` (Layer/Chain/local gateway
-layer, tests green); `obfuscation/tls.go` (L2), `obfuscation/http2_consistency.go` (L3),
-`obfuscation/timing.go` (L4) + `obfuscation/layers_test.go` (design-layer tests green).
+layer, tests green); `obfuscation/tls.go` (L2 runtime: `utls.UClient` + `ClientHelloID`),
+`obfuscation/http2_consistency.go` (L3: header consistency + HTTP/2 frame layer),
+`obfuscation/timing.go` (L4: jitter/warm-up/adaptive hook) + `obfuscation/layers_test.go`.
 
-**Status:** L2/L3/L4 design layers implemented (composition-ready behind the `Layer` interface);
-runtime functional evasion execution remains deferred per the safety boundary.
+**Status:** L2/L3/L4 runtime transport wiring implemented and test-covered, behind safety gates.
+No honeypot/deception/canary evasion logic is included.
 
-**Deferred:** L2/L3/L4 runtime execution details (real ClientHello execution, frame-level
-SETTINGS/WINDOW_UPDATE manipulation, adaptive execution) — design + composition only, until
-a new explicit scope confirmation.
+**Deferred:** Any detection-evasion behavior remains out of scope.
 

@@ -5,6 +5,24 @@ import (
 	"net/http"
 )
 
+// HTTP2FrameLayer implements L3 runtime: HTTP/2 frame-level alignment
+// (SETTINGS_MAX_CONCURRENT_STREAMS, flow-control windows, header-table and
+// frame-size parameters) applied through the transport configured by
+// NewTLSFingerprintTransport (L2 runtime).
+type HTTP2FrameLayer struct {
+	Transport *http.Transport
+}
+
+var _ Layer = (*HTTP2FrameLayer)(nil)
+
+// RoundTrip forwards through the aligned HTTP/2 transport when set.
+func (l *HTTP2FrameLayer) RoundTrip(ctx context.Context, rt http.RoundTripper, req *http.Request) (*http.Response, error) {
+	if l.Transport != nil {
+		return l.Transport.RoundTrip(req)
+	}
+	return rt.RoundTrip(req)
+}
+
 // HTTP2ConsistencyLayer implements L3 design: strict L7 header consistency
 // (canonical header ordering + duplicate pruning) to match the TLS profile
 // selected in L2.

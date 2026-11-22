@@ -266,10 +266,11 @@ type ScraperConfig struct {
 
 // Strategy values.
 const (
-	StrategyRoundRobin = "round_robin"
-	StrategyRandom     = "random"
-	StrategyLeastUsed  = "least_used"
-	StrategySticky     = "sticky"
+	StrategyRoundRobin   = "round_robin"
+	StrategyRandom       = "random"
+	StrategyLeastUsed    = "least_used"
+	StrategySticky       = "sticky"
+	StrategyLatencyAware = "latency_aware"
 )
 
 // Trust tiers select the admission policy. Strict is the default for public
@@ -597,7 +598,7 @@ func (c *Config) Validate() error {
 		add("default_scheme: unsupported %q", c.DefaultScheme)
 	}
 	switch c.Strategy {
-	case StrategyRoundRobin, StrategyRandom, StrategyLeastUsed, StrategySticky:
+	case StrategyRoundRobin, StrategyRandom, StrategyLeastUsed, StrategySticky, StrategyLatencyAware:
 	default:
 		add("strategy: unsupported %q", c.Strategy)
 	}

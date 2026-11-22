@@ -51,6 +51,23 @@ class TestScoring(unittest.TestCase):
         self.assertFalse(engine.is_behind_waf("not-an-ip"))
 
 
+class TestDeceptionDetection(unittest.TestCase):
+    def test_honeypot_source_flagged_high(self):
+        is_hp, risk = engine.detect_deception("example.com", ["shodan"], {})
+        self.assertTrue(is_hp)
+        self.assertEqual(risk, "high")
+
+    def test_suspicious_hostname_flagged_medium(self):
+        is_hp, risk = engine.detect_deception("honeypot.example.com", [], {})
+        self.assertTrue(is_hp)
+        self.assertEqual(risk, "medium")
+
+    def test_clean_domain_low_risk(self):
+        is_hp, risk = engine.detect_deception("example.com", [], {})
+        self.assertFalse(is_hp)
+        self.assertEqual(risk, "low")
+
+
 class TestCache(unittest.TestCase):
     def test_set_get_roundtrip_with_ttl(self):
         with tempfile.TemporaryDirectory() as td:
