@@ -188,6 +188,26 @@ Audit entries contain time, kind, method, sanitized target (query string and
 userinfo removed), status, proxy label and reason. They never contain request or
 response bodies, credentials, or headers.
 
+## Caido + Nuclei + OmniSlash (authorized recon chain)
+
+For in-scope recon collection only, keep the chain:
+
+```text
+Nuclei / crawler -> Caido (127.0.0.1:8080) -> OmniSlash Gateway (127.0.0.1:3128) -> Internet
+```
+
+- **Caido**: headless MITM collector/passive analyzer. Configure upstream HTTP proxy to OmniSlash gateway.
+- **OmniSlash gateway**: enforces scope allowlist, global 4 rps, circuit breaker, JSONL audit.
+- **Nuclei**: external template scanner, run through Caido with `-rate-limit 4 -concurrency 1`; filter output via `python3 osint/filter_nuclei.py`.
+- **probe/ (smuggling/desync/race)**: MUST bypass Caido and go direct via `Dialer`/`Session` for byte-exact framing.
+
+Helper scripts/modules:
+- `lab/run-nuclei-caido.sh` - wiring checklist
+- `osint/caido_client.py` - Caido GraphQL export (CAIDO_PAT), HTTPQL/Findings -> unified JSON
+- `osint/filter_nuclei.py` - defensive deception/soft-404 quarantine before report
+
+Gateway debug pinning for Replay same exit-IP: set `gateway.proxy_pin_header` in config (e.g. `X-Omnislash-Proxy`) and send proxy label in that header. Disabled by default.
+
 ## Boundaries and limitations
 
 - Real Juice Shop and DVWA containers are bound to `127.0.0.1` and attached to an

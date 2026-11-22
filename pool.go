@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,6 +46,7 @@ type Pool struct {
 	globalLimiter *tokenBucket
 	circuit       *CircuitBreaker
 	audit         *AuditLogger
+	deception     *DeceptionFilter
 
 	now func() time.Time
 }
@@ -93,6 +96,9 @@ func NewPool(cfg *Config, proxies []*Proxy, logger *slog.Logger) (*Pool, error) 
 	if c.Safety.Enabled {
 		p.circuit = NewCircuitBreaker(c.Safety, p.now)
 	}
+	if c.Safety.Deception.Enabled {
+		p.deception = NewDeceptionFilter(c.Safety.Deception, logger)
+	}
 	return p, nil
 }
 
@@ -105,6 +111,20 @@ func (p *Pool) Proxies() []*Proxy {
 	out := make([]*Proxy, len(proxies))
 	copy(out, proxies)
 	return out
+}
+
+// ProxyByLabel returns the proxy with the given label, if present.
+func (p *Pool) ProxyByLabel(label string) (*Proxy, bool) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return nil, false
+	}
+	for _, pr := range p.snapshot() {
+		if pr.Label() == label {
+			return pr, true
+		}
+	}
+	return nil, false
 }
 
 // Len returns the number of proxies in the pool.
@@ -246,6 +266,51 @@ func (p *Pool) Audit() *AuditLogger {
 	return p.audit
 }
 
+// Deception returns the response-side deception filter, or nil when disabled.
+func (p *Pool) Deception() *DeceptionFilter {
+	if p == nil {
+		return nil
+	}
+	return p.deception
+}
+
+// HandleDeception applies the configured defensive reaction for a flagged
+// deception/tarpit decision. It never bypasses deception; it quarantines/cools
+// down/marks depending on config.
+func (p *Pool) HandleDeception(pr *Proxy, d DeceptionDecision) {
+	if p == nil || !d.Flagged {
+		return
+	}
+	if p.audit != nil {
+		proxy := ""
+		if pr != nil {
+			proxy = pr.Label()
+		}
+		p.audit.Log(AuditEvent{Kind: "deception", Target: d.Host, Reason: string(d.Kind), Status: 200, Proxy: proxy})
+	}
+	action := strings.ToLower(strings.TrimSpace(p.cfg.Safety.Deception.Action))
+	switch action {
+	case "mark":
+		// record only
+	case "disable":
+		if pr != nil {
+			pr.markBan(p.now(), "deception:"+string(d.Kind), 24*time.Hour)
+		}
+	default: // cooldown
+		if pr != nil {
+			cd := p.cfg.HTTP.BanCooldown.Std()
+			if cd <= 0 {
+				cd = 5 * time.Minute
+			}
+			p.Ban(pr, "deception:"+string(d.Kind), cd)
+		}
+	}
+	// Anomalies/tarpit also open circuit in defensive mode to stop the scan node.
+	if p.circuit != nil && (d.Kind == DeceptionSynthetic200 || d.Kind == DeceptionTarpit || d.Kind == DeceptionRepeat) {
+		p.circuit.Trip("deception:" + string(d.Kind))
+	}
+}
+
 // SetScraperStats registers a callback that exposes scraper state in the pool
 // stats snapshot. It is optional and primarily used by ServeStats.
 func (p *Pool) SetScraperStats(fn func() ScraperStats) {
@@ -348,6 +413,8 @@ func (p *Pool) pick(exclude map[*Proxy]struct{}, key string) (*Proxy, error) {
 		chosen = p.pickLeastUsed(proxies, now, exclude)
 	case StrategyLatencyAware:
 		chosen = p.pickLatencyAware(proxies, now, exclude)
+	case StrategyThompson:
+		chosen = p.pickThompson(proxies, now, exclude)
 	default:
 		chosen = p.pickRoundRobin(proxies, now, exclude)
 	}
@@ -433,6 +500,70 @@ func (p *Pool) pickLatencyAware(proxies []*Proxy, now time.Time, exclude map[*Pr
 		}
 	}
 	return chosen
+}
+
+func (p *Pool) pickThompson(proxies []*Proxy, now time.Time, exclude map[*Proxy]struct{}) *Proxy {
+	var chosen *Proxy
+	bestScore := -1.0
+	for _, pr := range proxies {
+		if inSet(exclude, pr) || !pr.available(now) {
+			continue
+		}
+		alpha := float64(pr.successes.Load()) + 1.0
+		beta := float64(pr.failuresTotal.Load()) + 1.0
+		sample := sampleBeta(alpha, beta)
+		// Latency stability penalty: prefer lower EWMA latency.
+		pr.mu.Lock()
+		lat := pr.latency
+		pr.mu.Unlock()
+		latPenalty := 1.0
+		if lat > 0 {
+			ms := float64(lat.Milliseconds())
+			latPenalty = 1.0 / (1.0 + ms/1000.0)
+		}
+		score := sample * latPenalty
+		if chosen == nil || score > bestScore {
+			chosen = pr
+			bestScore = score
+		}
+	}
+	return chosen
+}
+
+func sampleBeta(alpha, beta float64) float64 {
+	x := sampleGamma(alpha)
+	y := sampleGamma(beta)
+	if x+y == 0 {
+		return 0
+	}
+	return x / (x + y)
+}
+
+func sampleGamma(alpha float64) float64 {
+	if alpha <= 0 {
+		return 0
+	}
+	// Marsaglia and Tsang's method for alpha >= 1, boost for alpha < 1.
+	if alpha < 1 {
+		return sampleGamma(alpha+1) * math.Pow(rand.Float64(), 1/alpha)
+	}
+	d := alpha - 1.0/3.0
+	c := 1.0 / math.Sqrt(9*d)
+	for {
+		x := rand.NormFloat64()
+		v := 1 + c*x
+		if v <= 0 {
+			continue
+		}
+		v = v * v * v
+		u := rand.Float64()
+		if u < 1-0.0331*(x*x)*(x*x) {
+			return d * v
+		}
+		if math.Log(u) < 0.5*x*x+d*(1-v+math.Log(v)) {
+			return d * v
+		}
+	}
 }
 
 func inSet(set map[*Proxy]struct{}, p *Proxy) bool {

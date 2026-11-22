@@ -134,3 +134,24 @@ No honeypot/deception/canary evasion logic is included.
 
 **Deferred:** Any detection-evasion behavior remains out of scope.
 
+---
+
+## Module 5 — Response-side Deception/Tarpit Defense
+
+**Delivered:** `deception.go` + `deception_test.go`.
+
+- **Baseline calibration**: control requests to nonexistent random paths; profile status/length/entropy/structure.
+- **Synthetic 200/tarpit detection**: flags host/prefix when nonexistent paths return sensitive 200 or response matches baseline with suspicious hints; repetition/latency anomaly detection.
+- **Secret quarantine**: extracted tokens/keys/paths stored as `unverified`; no auto-reuse/substitution, duplicates not promoted.
+- **Reaction**: configurable action `cooldown|disable|mark`, proxy cooldown/ban, circuit trip, audit event. Gateway/RotatingTransport block flagged responses when action blocks.
+
+## Module 6 — Caido & Nuclei Integration
+
+**Delivered:** `osint/caido_client.py`, `osint/filter_nuclei.py`, tests, `lab/run-nuclei-caido.sh`, lab README updates.
+
+- **Chain**: `Nuclei/crawler -> Caido(8080) -> OmniSlash Gateway(3128) -> Internet`.
+- **Caido GraphQL**: `CAIDO_PAT`, project/scope allowlist-denylist, HTTPQL/Findings export to unified JSON.
+- **Gateway Replay pinning**: debug-only `gateway.proxy_pin_header` pins request to a proxy label for same exit-IP replay.
+- **Nuclei results filter**: `osint/filter_nuclei.py` quarantines deception/soft-404/synthetic markers before report.
+- **Boundary**: `probe/` smuggling/desync/race bypass Caido via `Dialer`/`Session` for byte-exact framing.
+

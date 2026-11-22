@@ -8,7 +8,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run gateway daemon daemon-build daemon-once test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -65,6 +65,22 @@ ps:
 
 scrape: build
 	$(BINARY) scrape -config $(CONFIG) -write proxies.txt
+
+# Full pipeline: OSINT -> planner -> gateway/daemon -> caido bridge -> summary
+# Usage: make pipeline TARGET=example.com [PIPELINE_ARGS="--skip-caido --skip-nuclei"]
+PIPELINE_ARGS ?=
+pipeline:
+	bash lab/run-pipeline.sh --target "$(TARGET)" $(PIPELINE_ARGS)
+
+# Autonomous local E2E smoke test (no real internet)
+e2e:
+	bash lab/e2e_smoke_test.sh
+
+# Echelon 1 radar: diff scan -> only-diff plan -> verify -> notify
+# Usage: make radar TARGET=example.com [RADAR_ARGS="--skip-daemon --skip-notify"]
+RADAR_ARGS ?=
+radar:
+	bash lab/run-radar.sh --target "$(TARGET)" $(RADAR_ARGS)
 
 clean:
 	rm -rf bin

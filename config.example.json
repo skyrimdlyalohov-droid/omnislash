@@ -41,7 +41,8 @@
   },
   "gateway": {
     "listen": "127.0.0.1:3128",
-    "token": ""
+    "token": "",
+    "proxy_pin_header": ""
   },
   "rate_limit": {
     "per_proxy_rps": 0,
@@ -55,7 +56,18 @@
     "threshold": 5,
     "window": "60s",
     "cooldown": "10m",
-    "max_requests": 0
+    "max_requests": 0,
+    "deception": {
+      "enabled": false,
+      "baseline_samples": 2,
+      "max_body_sample": 65536,
+      "similarity_threshold": 0.92,
+      "repeat_status": 200,
+      "repeat_threshold": 8,
+      "latency_spike_factor": 4.0,
+      "quarantine_secrets": true,
+      "action": "cooldown"
+    }
   },
   "audit": {
     "enabled": true,

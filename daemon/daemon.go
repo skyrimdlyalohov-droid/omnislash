@@ -420,6 +420,32 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 			Timeout:      timeout,
 			Idle:         idle,
 		}, nil
+	case "differential-fuzz":
+		pairs := j.Pairs
+		if pairs <= 0 {
+			pairs = 5
+		}
+		jitter := j.JitterMaxIQR.Std()
+		if jitter <= 0 {
+			jitter = 25 * time.Millisecond
+		}
+		hold := j.Hold.Std()
+		if hold <= 0 {
+			hold = 50 * time.Millisecond
+		}
+		ncd := j.NeighborShiftNCD
+		if ncd <= 0 {
+			ncd = 0.6
+		}
+		return &probe.DifferentialFuzzProbe{
+			Mutations:        j.Mutations,
+			TechStack:        j.TechStack,
+			Pairs:            pairs,
+			JitterMaxIQR:     jitter,
+			Hold:             hold,
+			Timeout:          timeout,
+			NeighborShiftNCD: ncd,
+		}, nil
 	default:
 		return nil, fmt.Errorf("daemon: unsupported probe %q", j.Probe)
 	}

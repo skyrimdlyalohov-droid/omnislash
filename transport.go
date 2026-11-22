@@ -116,9 +116,21 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				if rErr != nil {
 					return nil, rErr
 				}
+				start := t.pool.now()
 				resp, rErr := t.directTransport().RoundTrip(directReq)
+				latency := t.pool.now().Sub(start)
 				if rErr == nil && resp != nil {
 					t.pool.RecordStatus(resp.StatusCode)
+					if df := t.pool.Deception(); df != nil && df.Enabled() {
+						if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
+							t.pool.HandleDeception(nil, d)
+							t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Reason: "deception_" + string(d.Kind)})
+							if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
+								drainAndClose(resp.Body)
+								return nil, fmt.Errorf("%w: %s", ErrDeceptionDetected, d.Reason)
+							}
+						}
+					}
 					t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Reason: "direct"})
 				}
 				return resp, rErr
@@ -131,7 +143,9 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if rErr != nil {
 			return nil, rErr
 		}
+		start := t.pool.now()
 		resp, rtErr := t.transportFor(pr).RoundTrip(attemptReq)
+		latency := t.pool.now().Sub(start)
 		if rtErr != nil {
 			lastErr = fmt.Errorf("%s: %w", pr.Label(), rtErr)
 			if ctx.Err() != nil {
@@ -142,6 +156,16 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			continue
 		}
 		t.pool.RecordStatus(resp.StatusCode)
+		if df := t.pool.Deception(); df != nil && df.Enabled() {
+			if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
+				t.pool.HandleDeception(pr, d)
+				t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: pr.Label(), Reason: "deception_" + string(d.Kind)})
+				if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
+					drainAndClose(resp.Body)
+					return nil, fmt.Errorf("%w: %s", ErrDeceptionDetected, d.Reason)
+				}
+			}
+		}
 		if _, banned := t.ban[resp.StatusCode]; banned {
 			pr.markBan(t.pool.now(), fmt.Sprintf("HTTP %d", resp.StatusCode), t.cfg.BanCooldown.Std())
 			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: pr.Label(), Reason: "proxy_ban"})

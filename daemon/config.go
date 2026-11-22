@@ -73,6 +73,14 @@ type JobConfig struct {
 	Path           string   `json:"path"`
 	SingleUse      bool     `json:"single_use"`
 
+	// Differential-fuzz fields.
+	Mutations        []string           `json:"mutations"`
+	TechStack        []string           `json:"tech_stack"`
+	Pairs            int                `json:"pairs"`
+	JitterMaxIQR     omnislash.Duration `json:"jitter_max_iqr"`
+	Hold             omnislash.Duration `json:"hold"`
+	NeighborShiftNCD float64            `json:"neighbor_shift_ncd"`
+
 	// Attempts is the number of probe runs inside one scheduled execution.
 	Attempts int `json:"attempts"`
 	// UntilSuccess stops retrying this job once it succeeds, and with
@@ -142,7 +150,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("daemon: job %q: tls must be h1, h2 or none", j.Name)
 		}
 		switch j.Probe {
-		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel":
+		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel", "differential-fuzz":
 		default:
 			return fmt.Errorf("daemon: job %q: unsupported probe %q", j.Name, j.Probe)
 		}

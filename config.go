@@ -121,8 +121,9 @@ type StatsConfig struct {
 
 // GatewayConfig controls the local rotating CONNECT proxy.
 type GatewayConfig struct {
-	Listen string `json:"listen"`
-	Token  string `json:"token"`
+	Listen         string `json:"listen"`
+	Token          string `json:"token"`
+	ProxyPinHeader string `json:"proxy_pin_header,omitempty"` // debug/audit only: pin requests to proxy label for Replay
 }
 
 // RateLimitConfig enables token buckets. PerProxyRPS limits each upstream
@@ -142,12 +143,27 @@ type RateLimitConfig struct {
 // means unlimited. The breaker is fail-closed: while open, every dial and HTTP
 // request is refused instead of rotating to another proxy.
 type SafetyConfig struct {
-	Enabled      bool     `json:"enabled"`
-	StopStatuses []int    `json:"stop_statuses"`
-	Threshold    int      `json:"threshold"`
-	Window       Duration `json:"window"`
-	Cooldown     Duration `json:"cooldown"`
-	MaxRequests  int64    `json:"max_requests"`
+	Enabled      bool            `json:"enabled"`
+	StopStatuses []int           `json:"stop_statuses"`
+	Threshold    int             `json:"threshold"`
+	Window       Duration        `json:"window"`
+	Cooldown     Duration        `json:"cooldown"`
+	MaxRequests  int64           `json:"max_requests"`
+	Deception    DeceptionConfig `json:"deception"`
+}
+
+// DeceptionConfig enables defensive response-side filtering for tarpit/deception
+// targets. It never bypasses deception; it detects and excludes/quarantines.
+type DeceptionConfig struct {
+	Enabled             bool     `json:"enabled"`
+	BaselineSamples     int      `json:"baseline_samples"`
+	MaxBodySample       int64    `json:"max_body_sample"`
+	SimilarityThreshold float64  `json:"similarity_threshold"`
+	RepeatStatus        int      `json:"repeat_status"`
+	RepeatThreshold     int      `json:"repeat_threshold"`
+	LatencySpikeFactor  float64  `json:"latency_spike_factor"`
+	QuarantineSecrets   bool     `json:"quarantine_secrets"`
+	Action              string   `json:"action"` // "cooldown" | "disable" | "mark"
 }
 
 // AuditConfig writes one JSON object per event to Path. Path "-" means stdout.
@@ -271,6 +287,7 @@ const (
 	StrategyLeastUsed    = "least_used"
 	StrategySticky       = "sticky"
 	StrategyLatencyAware = "latency_aware"
+	StrategyThompson     = "thompson"
 )
 
 // Trust tiers select the admission policy. Strict is the default for public
@@ -339,6 +356,17 @@ func DefaultConfig() Config {
 			Threshold:    5,
 			Window:       Duration(60 * time.Second),
 			Cooldown:     Duration(10 * time.Minute),
+			Deception: DeceptionConfig{
+				Enabled:             false,
+				BaselineSamples:     2,
+				MaxBodySample:       64 << 10,
+				SimilarityThreshold: 0.92,
+				RepeatStatus:        200,
+				RepeatThreshold:     8,
+				LatencySpikeFactor:  4.0,
+				QuarantineSecrets:   true,
+				Action:              "cooldown",
+			},
 		},
 		Audit: AuditConfig{},
 		Scope: ScopeConfig{
@@ -504,6 +532,27 @@ func (c *Config) normalize() {
 	if c.Safety.Cooldown == 0 {
 		c.Safety.Cooldown = d.Safety.Cooldown
 	}
+	if c.Safety.Deception.BaselineSamples == 0 {
+		c.Safety.Deception.BaselineSamples = d.Safety.Deception.BaselineSamples
+	}
+	if c.Safety.Deception.MaxBodySample == 0 {
+		c.Safety.Deception.MaxBodySample = d.Safety.Deception.MaxBodySample
+	}
+	if c.Safety.Deception.SimilarityThreshold == 0 {
+		c.Safety.Deception.SimilarityThreshold = d.Safety.Deception.SimilarityThreshold
+	}
+	if c.Safety.Deception.RepeatStatus == 0 {
+		c.Safety.Deception.RepeatStatus = d.Safety.Deception.RepeatStatus
+	}
+	if c.Safety.Deception.RepeatThreshold == 0 {
+		c.Safety.Deception.RepeatThreshold = d.Safety.Deception.RepeatThreshold
+	}
+	if c.Safety.Deception.LatencySpikeFactor == 0 {
+		c.Safety.Deception.LatencySpikeFactor = d.Safety.Deception.LatencySpikeFactor
+	}
+	if c.Safety.Deception.Action == "" {
+		c.Safety.Deception.Action = d.Safety.Deception.Action
+	}
 	if c.Scope.DNSCacheTTL == 0 {
 		c.Scope.DNSCacheTTL = d.Scope.DNSCacheTTL
 	}
@@ -598,7 +647,7 @@ func (c *Config) Validate() error {
 		add("default_scheme: unsupported %q", c.DefaultScheme)
 	}
 	switch c.Strategy {
-	case StrategyRoundRobin, StrategyRandom, StrategyLeastUsed, StrategySticky, StrategyLatencyAware:
+	case StrategyRoundRobin, StrategyRandom, StrategyLeastUsed, StrategySticky, StrategyLatencyAware, StrategyThompson:
 	default:
 		add("strategy: unsupported %q", c.Strategy)
 	}
@@ -684,6 +733,29 @@ func (c *Config) Validate() error {
 	}
 	if c.Safety.MaxRequests < 0 {
 		add("safety.max_requests must be >= 0")
+	}
+	if c.Safety.Deception.BaselineSamples < 1 {
+		add("safety.deception.baseline_samples must be >= 1")
+	}
+	if c.Safety.Deception.MaxBodySample < 0 {
+		add("safety.deception.max_body_sample must be >= 0")
+	}
+	if c.Safety.Deception.SimilarityThreshold <= 0 || c.Safety.Deception.SimilarityThreshold > 1 {
+		add("safety.deception.similarity_threshold must be in (0,1]")
+	}
+	if c.Safety.Deception.RepeatStatus < 100 || c.Safety.Deception.RepeatStatus > 599 {
+		add("safety.deception.repeat_status: invalid status %d", c.Safety.Deception.RepeatStatus)
+	}
+	if c.Safety.Deception.RepeatThreshold < 1 {
+		add("safety.deception.repeat_threshold must be >= 1")
+	}
+	if c.Safety.Deception.LatencySpikeFactor <= 0 {
+		add("safety.deception.latency_spike_factor must be > 0")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Safety.Deception.Action)) {
+	case "cooldown", "disable", "mark":
+	default:
+		add("safety.deception.action must be cooldown, disable or mark")
 	}
 	if err := validateScopeConfig(c.Scope); err != nil {
 		add("scope: %v", err)

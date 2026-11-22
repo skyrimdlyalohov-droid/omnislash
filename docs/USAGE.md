@@ -73,6 +73,11 @@ go run ./cmd/omnislash faq -topic rate-limit
 - **L3 runtime**: `HTTP2ConsistencyLayer` + `HTTP2FrameLayer` + `http.Transport.HTTP2` settings.
 - **L4 runtime**: `BehavioralTimingLayer` (jitter, warm-up, adaptive hook).
 - **OSIS deception detection (defensive)**: `is_honeypot`, `deception_risk` в `targets_verified.json`.
+- **Response-side deception/tarpit filter (Go runtime)**: baseline/wildcard calibration, synthetic-200 detection, quarantine unverified secrets/tokens/paths (no auto-reuse), anomaly reaction (cooldown/disable/mark, circuit trip). Config: `safety.deception.*`.
+- **Caido integration**: `osint/caido_client.py` (GraphQL, `CAIDO_PAT`) - create project/scope, export HTTPQL/Findings to unified JSON; gateway debug proxy pinning via `gateway.proxy_pin_header` for Replay same exit-IP.
+- **Nuclei integration**: external scanner via `Nuclei -> Caido(8080) -> OmniSlash Gateway(3128) -> Internet`; results filtered by `osint/filter_nuclei.py` before report. `probe/` stays direct via `Dialer`/`Session`.
+- **OSINT -> Planner -> omnislashd**: `osint/engine.py` enriches `targets_verified.json` (tech/cdn/webserver/cache_headers/baseline/origin_ips/auth_context); `osint/planner.py` drops honeypot/high-deception targets and generates daemon `jobs.json` + fail-closed `generated_scope.allow_hosts`.
+- **omnislashd -> Caido bridge**: `osint/caido_bridge.py` watches daemon JSONL audit and forwards confirmed, non-unverified findings to Caido Replay/notes with proxy label for `gateway.proxy_pin_header`.
 - **Traffic acceleration**: pool strategy `latency_aware` (выбор по минимальной EWMA latency).
 
 ## 6. Tests

@@ -12,3 +12,10 @@ config.local.json
 /lab/*.log
 /lab/audit.jsonl
 /lab/nuclei-results.jsonl
+
+# Python/runtime artifacts
+__pycache__/
+*.pyc
+/omnislash-audit.jsonl
+/runs/
+/state/

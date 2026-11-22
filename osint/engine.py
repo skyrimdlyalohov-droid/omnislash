@@ -23,6 +23,7 @@ Output schema (targets_verified.json):
 """
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -31,7 +32,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 DB_PATH = os.environ.get("OSIS_CACHE_DB", "/tmp/osint_omnislash_cache.sqlite3")
 TTL_DAYS = int(os.environ.get("OSIS_TTL_DAYS", "7"))
@@ -326,11 +327,168 @@ def score_confidence(verified_sources, honeypot_sources, behind_waf):
     return score
 
 
+CACHE_HEADER_KEYS = ["x-cache", "cf-cache-status", "age", "via", "vary", "cache-control"]
+TECH_KEYWORDS = {
+    "cloudflare": "Cloudflare",
+    "akamai": "Akamai",
+    "varnish": "Varnish",
+    "nginx": "Nginx",
+    "envoy": "Envoy",
+    "haproxy": "HAProxy",
+    "apache": "Apache",
+    "iis": "IIS",
+    "cloudfront": "CloudFront",
+    "fastly": "Fastly",
+}
+
+
+def _title_hash(title: str) -> str:
+    if not title:
+        return ""
+    return hashlib.sha256(title.strip().encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def parse_httpx_json(path: Optional[str]) -> Dict[str, Any]:
+    """Parse httpx JSON/JSONL output; returns first/most relevant record fields."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read().strip()
+    except Exception:
+        return {}
+    if not text:
+        return {}
+    items: List[Dict[str, Any]] = []
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            items = [x for x in obj if isinstance(x, dict)]
+        elif isinstance(obj, dict):
+            # could be single object or wrapped
+            if "results" in obj and isinstance(obj["results"], list):
+                items = [x for x in obj["results"] if isinstance(x, dict)]
+            else:
+                items = [obj]
+    except Exception:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    items.append(obj)
+            except Exception:
+                continue
+    if not items:
+        return {}
+    # prefer https/200-ish, else first
+    items.sort(key=lambda x: (0 if str(x.get("url", "")).startswith("https://") else 1, 0 if int(x.get("status_code", x.get("status-code", 0)) or 0) < 400 else 1))
+    it = items[0]
+    headers = it.get("header") or it.get("headers") or {}
+    if isinstance(headers, list):
+        # httpx sometimes emits list of "K: V"
+        h2 = {}
+        for h in headers:
+            if isinstance(h, str) and ":" in h:
+                k, v = h.split(":", 1)
+                h2[k.strip().lower()] = v.strip()
+        headers = h2
+    if not isinstance(headers, dict):
+        headers = {}
+    norm_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+    tech = it.get("tech") or it.get("technologies") or []
+    if isinstance(tech, str):
+        tech = [tech]
+    tech = [str(t) for t in tech if t]
+    webserver = str(it.get("webserver") or it.get("web_server") or norm_headers.get("server", "") or "")
+    cdn_name = str(it.get("cdn_name") or it.get("cdn") or "")
+    if not cdn_name:
+        for k, name in TECH_KEYWORDS.items():
+            if k in webserver.lower() or any(k in t.lower() for t in tech):
+                if name in {"Cloudflare", "Akamai", "CloudFront", "Fastly", "Varnish"}:
+                    cdn_name = name
+                    break
+    # merge tech keywords
+    merged = list(dict.fromkeys(tech))
+    for k, name in TECH_KEYWORDS.items():
+        hay = " ".join([webserver.lower()] + [t.lower() for t in merged] + [cdn_name.lower()])
+        if k in hay and name not in merged:
+            merged.append(name)
+    cache_headers = {k: norm_headers[k] for k in CACHE_HEADER_KEYS if k in norm_headers}
+    baseline = {
+        "status_code": int(it.get("status_code", it.get("status-code", 0)) or 0),
+        "content_length": int(it.get("content_length", it.get("content-length", 0)) or 0),
+        "words": int(it.get("words", it.get("word_count", 0)) or 0),
+        "lines": int(it.get("lines", it.get("line_count", 0)) or 0),
+        "title_hash": _title_hash(str(it.get("title", ""))),
+    }
+    return {
+        "tech": merged,
+        "cdn_name": cdn_name,
+        "webserver": webserver,
+        "cache_headers": cache_headers,
+        "baseline": baseline,
+        "httpx_raw": {"url": it.get("url"), "host": it.get("host", it.get("input"))},
+    }
+
+
+def parse_caido_auth(path: Optional[str]) -> Dict[str, str]:
+    """Import optional auth context from Caido export for job headers (no auto-reuse in probes)."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    # Accept either explicit auth_context or infer from first request headers.
+    ctx = obj.get("auth_context") if isinstance(obj, dict) else None
+    if isinstance(ctx, dict):
+        out = {}
+        for k in ["Cookie", "Authorization", "User-Agent"]:
+            v = ctx.get(k) or ctx.get(k.lower())
+            if v:
+                out[k] = str(v)
+        return out
+    reqs = obj.get("requests") if isinstance(obj, dict) else None
+    if isinstance(reqs, list) and reqs:
+        r0 = reqs[0] if isinstance(reqs[0], dict) else {}
+        headers = r0.get("headers") or {}
+        if isinstance(headers, dict):
+            out = {}
+            for k in ["Cookie", "Authorization", "User-Agent"]:
+                v = headers.get(k) or headers.get(k.lower())
+                if v:
+                    out[k] = str(v)
+            return out
+    return {}
+
+
+def extract_origin_ips(flags: Dict[str, Any], host_ips: Dict[str, Set[str]], main_ip: Optional[str]) -> List[str]:
+    """Best-effort origin IPs from enrichment/host resolution; keep unverified."""
+    ips = set()
+    for s in host_ips.values():
+        ips |= set(s)
+    if main_ip:
+        ips.discard(main_ip)
+    # include any IPs reported by enrichment flags in future; currently flags are bools.
+    for f in flags.values():
+        if isinstance(f, dict):
+            for ip in f.get("ips", []) or []:
+                if isinstance(ip, str):
+                    ips.add(ip)
+    return sorted(ips)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Omnislash OSIS scoring engine")
     ap.add_argument("--targets", default=None, help="path to targets file (one host per line) or comma list")
     ap.add_argument("--out", default="/tmp/targets_verified.json")
     ap.add_argument("--domain", default=None, help="single domain mode")
+    ap.add_argument("--httpx-json", default=None, help="optional httpx JSON/JSONL to enrich tech/baseline/cache headers")
+    ap.add_argument("--caido-auth", default=None, help="optional Caido export JSON to import auth context")
     args = ap.parse_args(argv)
 
     domain = args.domain
@@ -361,6 +519,10 @@ def main(argv=None):
     recommended_profile = "l7_web" if behind_waf else "full"
     known_ports = [80, 443]
 
+    hx = parse_httpx_json(args.httpx_json)
+    auth_context = parse_caido_auth(args.caido_auth)
+    origin_ips = extract_origin_ips(flags, host_ips, target_ip)
+
     record = {
         "target": domain,
         "ip": target_ip,
@@ -370,6 +532,13 @@ def main(argv=None):
         "deception_risk": deception_risk,
         "recommended_profile": recommended_profile,
         "known_ports": known_ports,
+        "tech": hx.get("tech", []),
+        "cdn_name": hx.get("cdn_name", ""),
+        "webserver": hx.get("webserver", ""),
+        "cache_headers": hx.get("cache_headers", {}),
+        "baseline": hx.get("baseline", {"status_code": 0, "content_length": 0, "words": 0, "lines": 0, "title_hash": ""}),
+        "origin_ips": origin_ips,
+        "auth_context": auth_context,
     }
 
     with open(args.out, "w") as f:

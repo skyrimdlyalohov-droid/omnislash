@@ -180,7 +180,23 @@ func (g *Gateway) handleConnect(ctx context.Context, conn net.Conn, br *bufio.Re
 		return
 	}
 
-	upstream, err := g.dialer.DialContext(ctx, "tcp", target)
+	var (
+		upstream net.Conn
+		err      error
+	)
+	pinHeader := strings.TrimSpace(g.dialer.pool.cfg.Gateway.ProxyPinHeader)
+	if pinHeader != "" {
+		if label := strings.TrimSpace(req.Header.Get(pinHeader)); label != "" {
+			if pr, ok := g.dialer.pool.ProxyByLabel(label); ok {
+				upstream, err = g.dialer.dialProxy(ctx, pr, target)
+			} else {
+				err = fmt.Errorf("pinned proxy %q not found", label)
+			}
+		}
+	}
+	if upstream == nil && err == nil {
+		upstream, err = g.dialer.DialContext(ctx, "tcp", target)
+	}
 	if err != nil {
 		g.log.Debug("gateway dial failed", "target", target, "error", err)
 		g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "dial_error"})
@@ -253,7 +269,23 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 		return
 	}
 
-	upstream, err := g.dialer.DialContext(ctx, "tcp", target)
+	var (
+		upstream net.Conn
+		err      error
+	)
+	pinHeader := strings.TrimSpace(g.dialer.pool.cfg.Gateway.ProxyPinHeader)
+	if pinHeader != "" {
+		if label := strings.TrimSpace(req.Header.Get(pinHeader)); label != "" {
+			if pr, ok := g.dialer.pool.ProxyByLabel(label); ok {
+				upstream, err = g.dialer.dialProxy(ctx, pr, target)
+			} else {
+				err = fmt.Errorf("pinned proxy %q not found", label)
+			}
+		}
+	}
+	if upstream == nil && err == nil {
+		upstream, err = g.dialer.DialContext(ctx, "tcp", target)
+	}
 	if err != nil {
 		g.log.Debug("gateway dial failed", "target", target, "error", err)
 		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "dial_error"})
@@ -275,6 +307,7 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 		return
 	}
 
+	start := time.Now()
 	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
 	if err != nil {
 		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "response_read_error"})
@@ -282,10 +315,35 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 		return
 	}
 	defer resp.Body.Close()
+	latency := time.Since(start)
 
 	g.dialer.pool.RecordStatus(resp.StatusCode)
+	pr, hasProxy := ProxyOf(upstream)
+	if df := g.dialer.pool.Deception(); df != nil && df.Enabled() {
+		// Ensure request URL is absolute for inspection.
+		if resp.Request == nil {
+			resp.Request = req
+		}
+		if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
+			var pptr *Proxy
+			if hasProxy {
+				pptr = pr
+			}
+			g.dialer.pool.HandleDeception(pptr, d)
+			proxyLabel := ""
+			if hasProxy {
+				proxyLabel = pr.Label()
+			}
+			g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: proxyLabel, Reason: "deception_" + string(d.Kind)})
+			if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
+				writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "deception/tarpit response blocked")
+				return
+			}
+		}
+	}
+
 	ev := AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode}
-	if pr, ok := ProxyOf(upstream); ok {
+	if hasProxy {
 		ev.Proxy = pr.Label()
 	} else {
 		ev.Reason = "direct"
