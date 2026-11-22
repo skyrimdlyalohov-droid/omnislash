@@ -1,0 +1,22 @@
+id: lab-git-config-exposure
+info:
+  name: Lab exposed .git/config
+  author: omnislash-lab
+  severity: medium
+  description: Detects a deliberately exposed .git/config marker in the fallback lab target.
+  tags: lab,exposure,git
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/.git/config"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "[core]"
+          - "repositoryformatversion"
+        condition: and

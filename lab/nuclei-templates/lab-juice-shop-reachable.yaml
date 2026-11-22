@@ -1,0 +1,20 @@
+id: lab-juice-shop-reachable
+info:
+  name: Lab Juice Shop reachable
+  author: omnislash-lab
+  severity: info
+  description: Confirms the local Juice Shop target is reachable through the safety gateway.
+  tags: lab,juice-shop
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "OWASP Juice Shop"

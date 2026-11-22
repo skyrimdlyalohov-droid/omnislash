@@ -64,8 +64,15 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if req.URL == nil {
 		return nil, errors.New("omnislash: nil request URL")
 	}
+	ctx, err := t.pool.WaitGlobal(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	if err := t.pool.Allow(); err != nil {
+		t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "circuit_open"})
+		return nil, err
+	}
 	t.prune()
-	ctx := req.Context()
 	factory, canRetry, err := prepareBody(req, t.cfg.MaxBodyBuffer)
 	if err != nil {
 		return nil, err
@@ -97,6 +104,10 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if err := t.pool.Allow(); err != nil {
+			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "circuit_open"})
+			return nil, err
+		}
 		pr, pickErr := t.pool.pick(excluded, req.URL.Host)
 		if pickErr != nil {
 			if t.pool.cfg.AllowDirect && attempt == 0 {
@@ -105,7 +116,12 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				if rErr != nil {
 					return nil, rErr
 				}
-				return t.directTransport().RoundTrip(directReq)
+				resp, rErr := t.directTransport().RoundTrip(directReq)
+				if rErr == nil && resp != nil {
+					t.pool.RecordStatus(resp.StatusCode)
+					t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Reason: "direct"})
+				}
+				return resp, rErr
 			}
 			break
 		}
@@ -122,10 +138,13 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				return nil, ctx.Err()
 			}
 			t.log.Debug("request via proxy failed", "proxy", pr.Label(), "url", req.URL.Redacted(), "error", rtErr)
+			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Proxy: pr.Label(), Reason: "proxy_error"})
 			continue
 		}
+		t.pool.RecordStatus(resp.StatusCode)
 		if _, banned := t.ban[resp.StatusCode]; banned {
 			pr.markBan(t.pool.now(), fmt.Sprintf("HTTP %d", resp.StatusCode), t.cfg.BanCooldown.Std())
+			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: pr.Label(), Reason: "proxy_ban"})
 			if attempt < attempts-1 {
 				drainAndClose(resp.Body)
 				lastErr = fmt.Errorf("%s: banned with HTTP %d", pr.Label(), resp.StatusCode)
@@ -133,6 +152,7 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			}
 			return resp, nil
 		}
+		t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: pr.Label()})
 		return resp, nil
 	}
 
@@ -257,4 +277,11 @@ func drainAndClose(body io.ReadCloser) {
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, 32<<10))
 	_ = body.Close()
+}
+
+func (t *RotatingTransport) audit(ev AuditEvent) {
+	if t == nil || t.pool == nil {
+		return
+	}
+	t.pool.Audit().Log(ev)
 }

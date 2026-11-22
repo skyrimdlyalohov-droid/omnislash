@@ -1,0 +1,42 @@
+# Local-only vulnerable targets for the omnislash safety lab.
+#
+# Safety boundaries:
+#   * every published port is bound to 127.0.0.1;
+#   * the lab network is internal, so containers cannot reach the internet;
+#   * no proxy rotation or traffic obfuscation is configured here;
+#   * scan only these two services, through the lab omnislash gateway.
+#
+# Start:  docker compose -f lab/docker-compose.yml up -d
+# Stop:   docker compose -f lab/docker-compose.yml down
+name: omnislash-lab
+
+services:
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: omnislash-lab-juice-shop
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - lab
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: omnislash-lab-dvwa
+    ports:
+      - "127.0.0.1:8080:80"
+    networks:
+      - lab
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m
+
+networks:
+  lab:
+    internal: true

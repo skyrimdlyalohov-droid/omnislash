@@ -52,11 +52,15 @@
   прокси в кулдаун и повторяют запрос через другой IP.
 - **TLS через прокси**: `DialTLSContext` отдаёт `net.Conn`, сканер сам решает,
   какие байты и с каким ALPN/SNI отправлять.
-- **Локальный CONNECT-шлюз**: `127.0.0.1:3128`, через который любой инструмент
-  (curl, свой сканер, сторонний бинарь) ходит с ротацией IP. CONNECT
-  байт-прозрачен, поэтому подходит для smuggling-пейлоадов.
+- **Локальный HTTP-шлюз**: `127.0.0.1:3128`, через который любой инструмент
+  (curl, свой сканер, сторонний бинарь) ходит с ротацией IP. Обычные HTTP-запросы
+  пересылаются по одному и отдают статус в safety-breaker; HTTPS/raw TCP идут
+  через байт-прозрачный CONNECT.
 - **Stats endpoint**: JSON-снимок состояния пула, здоровья и scrape-цикла.
-- **Ограничение скорости на прокси** (token bucket), чтобы не сжигать IP.
+- **Ограничение скорости** (token bucket) на прокси и на весь пул, чтобы
+  ротация не умножала эффективную частоту запросов.
+- **Safety-контур**: глобальный лимит на весь пул (не на прокси), fail-closed
+  scope, circuit breaker по `403/429/503` и JSONL-аудит без тел запросов.
 
 Собственным остаётся только то, что нельзя взять готовым: байт-точный raw
 TCP/TLS транспорт и связка «источник → валидатор → пул → dialer». Инварианты
@@ -72,7 +76,7 @@ TCP/TLS транспорт и связка «источник → валидат
                  |  scope + cooldown + limiter | ---> proxy #2 ──> target
                  +-----------------------------+ ---> proxy #N ──> target
                           |
-                 local CONNECT gateway 127.0.0.1:3128
+                 local HTTP gateway 127.0.0.1:3128
 ```
 
 ## Интеграционная матрица
@@ -80,12 +84,12 @@ TCP/TLS транспорт и связка «источник → валидат
 | Поверхность | Из коробки | Атрибуция IP | Ограничение |
 |---|---|---|---|
 | Go-сканер через `Dialer` / `Session` | да | `ProxyOf(conn)`, сессия = один exit-IP | нужен raw TCP/TLS клиент |
-| Локальный CONNECT-шлюз (`serve`) | да | по соединению, не по HTTP-запросу | любой инструмент с `HTTPS_PROXY`; HTTP absolute-form не поддерживается |
+| Локальный HTTP-шлюз (`serve`) | да | по соединению, не по HTTP-запросу | HTTP absolute-form + CONNECT; статусы HTTP-ответов идут в safety-breaker |
 | `RotatingTransport` | да | на каждый HTTP-запрос/keep-alive | только для обычного HTTP, не для smuggling |
-| Python / Burp / сторонние плагины | TODO | — | используйте CONNECT-шлюз как временный адаптер |
+| Python / Burp / сторонние плагины | TODO | — | используйте HTTP-шлюз как временный адаптер |
 | HTTP-парсеры (не raw) | осознанно нет | — | `http_parsing` admission проверяет байт-прозрачность, но сам слой не парсит payload |
 
-Честная граница: «из коробки» — Go и CONNECT-шлюз. Адаптеры для Python/Burp
+Честная граница: «из коробки» — Go и HTTP-шлюз. Адаптеры для Python/Burp
 пока не входят в поставку; для них есть только шлюз без per-request
 атрибуции.
 
@@ -100,7 +104,7 @@ make down        # остановить
 
 `make up` собирает образ `omnislash:1.0.0` и поднимает готовый пайплайн:
 
-- `127.0.0.1:3128` — CONNECT-шлюз с ротацией (только loopback);
+- `127.0.0.1:3128` — HTTP-шлюз с ротацией (только loopback);
 - `127.0.0.1:9090/stats` — состояние пула, health и scrape;
 - `127.0.0.1:9090/readyz` — healthcheck контейнера;
 - внутри контейнера уже включён `scraper` из `config.example.json`, поэтому
@@ -161,7 +165,7 @@ go run ./cmd/gateway -config config.json -proxies proxies.txt -listen 127.0.0.1:
 - фоновый health-check (если включён);
 - фоновый scrape/validation по `scraper.refresh_interval`.
 
-Проверка ротации (curl для HTTPS использует CONNECT):
+Проверка ротации (для HTTP curl использует forward-режим, для HTTPS — CONNECT):
 
 ```bash
 for i in 1 2 3 4 5; do
@@ -169,9 +173,11 @@ for i in 1 2 3 4 5; do
 done
 ```
 
-Каждый запрос может выйти с другого IP. Для HTTP-целей curl использует
-absolute-form GET, а шлюз принимает только CONNECT; для HTTP-сканирования
-открывайте CONNECT на порт 80 вручную (пример ниже).
+Каждый запрос может выйти с другого IP. Для HTTP-целей curl отправляет
+absolute-form GET: шлюз пересылает запрос и учитывает статус ответа в
+safety-breaker. Для HTTPS клиент открывает CONNECT; статусы внутри TLS шлюз
+не видит, поэтому circuit breaker на этом пути реагирует только на ошибки
+соединения.
 
 `fetch` — встроенная проверка без шлюза:
 
@@ -186,7 +192,7 @@ absolute-form GET, а шлюз принимает только CONNECT; для H
 omnislash check  [флаги]   проверить все прокси и показать таблицу/JSON
 omnislash scrape [флаги]   собрать, строго проверить и показать живые прокси
 omnislash fetch  [флаги]   N HTTP-запросов через ротатор (демо)
-omnislash serve  [флаги]   CONNECT-шлюз + stats + health/scrape loops
+omnislash serve  [флаги]   HTTP-шлюз + stats + health/scrape loops
 omnislash healthcheck      проверить /readyz (для Docker healthcheck)
 ```
 
@@ -232,18 +238,25 @@ HTTP/HTTPS-прокси всегда делает `CONNECT` и дальше не
 | `health.*` | интервал/таймаут/параллелизм проб, `probe_url`, стартовая проверка |
 | `http.*` | таймауты, ретраи, `ban_statuses`, кулдаун бана, keep-alive |
 | `stats.listen` | адрес JSON-статистики, пусто — выключено |
-| `gateway.listen` | адрес локального CONNECT-шлюза, пусто — выключено |
+| `gateway.listen` | адрес локального HTTP-шлюза (HTTP forward + CONNECT), пусто — выключено |
 | `gateway.token` | если задан, клиент обязан прислать `Proxy-Authorization: Bearer ...` |
 | `rate_limit.per_proxy_rps` | лимит новых соединений на прокси в секунду (0 — выключено) |
+| `rate_limit.global_rps` | общий лимит на весь пул, независимо от ротации (0 — выключено) |
+| `safety.*` | fail-closed остановка после `stop_statuses` в окне `window`; `threshold`, `cooldown`, опциональный `max_requests` |
+| `audit.*` | JSONL-журнал событий: `enabled`, `path`; query string и userinfo вырезаются |
 | `scope.*` | fail-closed allowlist целей: хосты/CIDR/порты, блокировка private/metadata, DNS-пиннинг |
 | `scraper.*` | источники, интервал обновления, лимиты, строгая валидация |
 | `scraper.validation.mode` | `connect` (CONNECT + сертификат + пауза) или `http_parsing` (N-байт HTTP echo) |
 | `scraper.validation.admission.*` | canary/echo-адреса, hold, размер echo, timeout, запрет skip-verify в strict connect |
 | `log_level` | `debug`, `info`, `warn`, `error` |
 
+`safety.enabled` по умолчанию `false`. Включайте его явно для сканирования:
+после `threshold` ответов из `stop_statuses` в окне `window` шлюз и транспорт
+перестают отправлять запросы на `cooldown`. `audit.enabled` также выключен по
+умолчанию; путь `-` пишет JSONL в stdout.
+
 `ban_statuses` по умолчанию `[403, 407, 429, 503]`. Учтите: `403` может быть
-ответом WAF на конкретный путь, а не баном IP. Для «тихого» сканирования
-оставьте `[407, 429]` и разбирайте 403 самостоятельно.
+ответом WAF на конкретный путь, а не баном IP. Для «тихого» сканированияоставьте `[407, 429]` и разбирайте 403 самостоятельно.
 
 ## Автосбор и строгая валидация
 
@@ -448,15 +461,15 @@ backconnect-прокси провайдера, который меняет вы�
 Полный пример: `examples/rawdial/main.go`. Минимальный шаблон подключения
 своего сканера: `examples/dialer/main.go`.
 
-### Вариант 2: локальный CONNECT-шлюз для любого инструмента
+### Вариант 2: локальный HTTP-шлюз для любого инструмента
 
 ```go
 gw, _ := omnislash.NewGateway("127.0.0.1:3128", dialer, "", nil)
 go gw.Serve(ctx)
 ```
 
-Сканер открывает TCP к шлюзу, отправляет CONNECT и дальше работает с
-полученным потоком как с обычным сокетом:
+Для HTTPS и произвольного TCP сканер открывает соединение к шлюзу, отправляет
+CONNECT и дальше работает с полученным потоком как с обычным сокетом:
 
 ```text
 CONNECT target.example:443 HTTP/1.1
@@ -469,6 +482,15 @@ Host: target.example:443
 
 Это удобно, если сканер уже умеет работать через `HTTP_PROXY`/`HTTPS_PROXY`
 или написан на другом языке.
+
+Для обычных HTTP-целей клиент отправляет absolute-form GET. Шлюз пересылает
+запросы по одному, видит статус ответа и передаёт его в safety-breaker. Именно
+так Nuclei работает через шлюз с `-rate-limit 4`: после нескольких `403/429/503`
+шлюз закрывается и отвечает `503` на следующие запросы. Внутри CONNECT статусы
+TLS недоступны, поэтому для HTTPS действует только ограничение соединений.
+
+Готовый локальный стенд с Juice Shop/DVWA, шаблонами Nuclei и проверкой всех
+контролей: [lab/README.md](lab/README.md).
 
 ### Обычный HTTP-транспорт (разведка, не smuggling)
 

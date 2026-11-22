@@ -15,10 +15,11 @@ import (
 	"time"
 )
 
-// Gateway is a local HTTP CONNECT proxy that tunnels each connection through a
-// rotating upstream proxy. Point any raw TCP/TLS scanner at it and every new
-// CONNECT gets the next source IP. CONNECT is byte-transparent, so malformed
-// HTTP requests used by request-smuggling scanners are not rewritten.
+// Gateway is a local HTTP forward proxy. Plain HTTP requests are forwarded
+// request-by-request so the gateway can feed target status codes into the
+// safety breaker; HTTPS and raw TCP use CONNECT, which stays byte-transparent.
+// Every new upstream connection is selected by the pool, so tools that cannot
+// be rebuilt in Go can still use proxy rotation.
 type Gateway struct {
 	listener net.Listener
 	dialer   *Dialer
@@ -125,15 +126,21 @@ func (g *Gateway) handle(ctx context.Context, conn net.Conn) {
 		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "malformed proxy request")
 		return
 	}
-	if req.Method != http.MethodConnect {
-		writeHTTPError(conn, http.StatusMethodNotAllowed, "Method Not Allowed", "only CONNECT is supported")
-		return
-	}
 	if !g.authorized(req.Header.Get("Proxy-Authorization")) {
 		writeProxyAuthRequired(conn)
 		return
 	}
+	if req.Method == http.MethodConnect {
+		g.handleConnect(ctx, conn, br, req)
+		return
+	}
+	g.handleHTTP(ctx, conn, req)
+}
 
+// handleConnect establishes a byte-transparent tunnel. The gateway cannot see
+// HTTP status codes inside TLS, so the breaker only reacts to CONNECT failures
+// on this path. Use the plain-HTTP path when status-level safety is required.
+func (g *Gateway) handleConnect(ctx context.Context, conn net.Conn, br *bufio.Reader, req *http.Request) {
 	target := req.Host
 	if target == "" {
 		target = req.URL.Host
@@ -155,17 +162,38 @@ func (g *Gateway) handle(ctx context.Context, conn net.Conn) {
 	// substitute for that check.
 	if _, err := g.dialer.pool.scope.CheckTarget(ctx, target); err != nil {
 		g.log.Debug("gateway target rejected by scope", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "scope_rejected"})
 		writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target is outside the configured scope")
+		return
+	}
+
+	ctx, waitErr := g.dialer.pool.WaitGlobal(ctx)
+	if waitErr != nil {
+		g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "rate_limited"})
+		writeHTTPError(conn, http.StatusTooManyRequests, "Too Many Requests", "global rate limit exceeded")
+		return
+	}
+	if err := g.dialer.pool.Allow(); err != nil {
+		g.log.Warn("gateway refused by safety circuit", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "circuit_open"})
+		writeHTTPError(conn, http.StatusServiceUnavailable, "Service Unavailable", "safety circuit is open")
 		return
 	}
 
 	upstream, err := g.dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
 		g.log.Debug("gateway dial failed", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "dial_error"})
 		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "upstream connection failed")
 		return
 	}
 	defer upstream.Close()
+
+	if pr, ok := ProxyOf(upstream); ok {
+		g.audit(AuditEvent{Kind: "connect", Target: target, Status: http.StatusOK, Proxy: pr.Label()})
+	} else {
+		g.audit(AuditEvent{Kind: "connect", Target: target, Status: http.StatusOK, Reason: "direct"})
+	}
 
 	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
@@ -188,6 +216,88 @@ func (g *Gateway) handle(ctx context.Context, conn net.Conn) {
 	wg.Wait()
 }
 
+// handleHTTP forwards one absolute-form HTTP request. Unlike CONNECT, the
+// response status is visible here, so block statuses are recorded by the
+// safety breaker and the next request is refused with 503.
+func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Request) {
+	if req.URL == nil || !req.URL.IsAbs() || !strings.EqualFold(req.URL.Scheme, "http") {
+		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "absolute http:// URL required; use CONNECT for HTTPS")
+		return
+	}
+	target := req.URL.Host
+	if target == "" {
+		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "request target is missing")
+		return
+	}
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		target = net.JoinHostPort(strings.Trim(target, "[]"), "80")
+	}
+
+	if _, err := g.dialer.pool.scope.CheckTarget(ctx, target); err != nil {
+		g.log.Debug("gateway target rejected by scope", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "scope_rejected"})
+		writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target is outside the configured scope")
+		return
+	}
+
+	ctx, waitErr := g.dialer.pool.WaitGlobal(ctx)
+	if waitErr != nil {
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "rate_limited"})
+		writeHTTPError(conn, http.StatusTooManyRequests, "Too Many Requests", "global rate limit exceeded")
+		return
+	}
+	if err := g.dialer.pool.Allow(); err != nil {
+		g.log.Warn("gateway refused by safety circuit", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "circuit_open"})
+		writeHTTPError(conn, http.StatusServiceUnavailable, "Service Unavailable", "safety circuit is open")
+		return
+	}
+
+	upstream, err := g.dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		g.log.Debug("gateway dial failed", "target", target, "error", err)
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "dial_error"})
+		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "upstream connection failed")
+		return
+	}
+	defer upstream.Close()
+
+	// Strip proxy-only headers before the request reaches the origin. One
+	// request per connection keeps the forwarding path small and predictable.
+	req.RequestURI = ""
+	req.Header.Del("Proxy-Authorization")
+	req.Header.Del("Proxy-Connection")
+	req.Header.Del("Expect")
+	req.Close = true
+	if err := req.Write(upstream); err != nil {
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "request_write_error"})
+		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "failed to forward request")
+		return
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
+	if err != nil {
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "response_read_error"})
+		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "invalid upstream response")
+		return
+	}
+	defer resp.Body.Close()
+
+	g.dialer.pool.RecordStatus(resp.StatusCode)
+	ev := AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode}
+	if pr, ok := ProxyOf(upstream); ok {
+		ev.Proxy = pr.Label()
+	} else {
+		ev.Reason = "direct"
+	}
+	g.audit(ev)
+
+	resp.Close = true
+	if err := resp.Write(conn); err != nil {
+		g.log.Debug("gateway response write failed", "target", target, "error", err)
+	}
+}
+
 func (g *Gateway) authorized(header string) bool {
 	if g.token == "" {
 		return true
@@ -198,6 +308,13 @@ func (g *Gateway) authorized(header string) bool {
 	}
 	got := []byte(strings.TrimSpace(strings.TrimPrefix(header, prefix)))
 	return subtle.ConstantTimeCompare(got, []byte(g.token)) == 1
+}
+
+func (g *Gateway) audit(ev AuditEvent) {
+	if g == nil || g.dialer == nil || g.dialer.pool == nil {
+		return
+	}
+	g.dialer.pool.Audit().Log(ev)
 }
 
 func closeWrite(conn net.Conn) {

@@ -1,0 +1,27 @@
+#!/usr/sbin/nft -f
+# Omnislash — Pre-Flight OSINT Isolation Module
+# Egress whitelist for OSINT enrichment (Stage 3) and DNS handling (Stage 1/2 sources).
+# Forcing DNS via local unbound/coredns over DoH/DoT through an isolated tunnel is assumed
+# at the resolver layer; this ruleset enforces the OSINT-only egress allowlist.
+
+flush ruleset
+
+table inet osint_egress {
+	chain osint_egress {
+		type filter hook output priority 0; policy drop;
+
+		# Established flows + loopback
+		ct state established,reply accept
+		iif "lo" accept
+
+		# DNS via local resolver only (unbound/coredns)
+		udp dport 53 accept
+
+		# Approved OSINT API endpoints (CIDR placeholders — replace per deployment)
+		ip daddr 192.0.2.0/24 accept   # e.g. crt.sh (TEST-NET placeholder)
+		ip daddr 198.51.100.0/24 accept  # e.g. reserved placeholder for enrichment API
+
+		# Any other egress is dropped (default-deny)
+		drop
+	}
+}

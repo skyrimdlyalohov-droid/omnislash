@@ -13,9 +13,9 @@ import (
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	common := addCommonFlags(fs)
-	listen := fs.String("listen", "", "адрес локального CONNECT-шлюза (off — выключить)")
+	listen := fs.String("listen", "", "адрес локального HTTP-шлюза (off — выключить)")
 	statsAddr := fs.String("stats", "", "адрес stats-сервера (off — выключить)")
-	token := fs.String("token", "", "Bearer-токен для CONNECT-шлюза")
+	token := fs.String("token", "", "Bearer-токен для HTTP-шлюза")
 	noHealth := fs.Bool("no-health", false, "не запускать health-check")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -114,7 +114,7 @@ func cmdServe(args []string) error {
 				errCh <- fmt.Errorf("gateway: %w", err)
 			}
 		}()
-		logger.Info("rotating CONNECT gateway listening",
+		logger.Info("rotating HTTP gateway listening",
 			"addr", gateway.Addr().String(), "proxies", pool.Len(), "available", pool.Available())
 	}
 	if cfg.Stats.Listen != "" {

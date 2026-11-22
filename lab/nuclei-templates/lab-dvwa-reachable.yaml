@@ -1,0 +1,20 @@
+id: lab-dvwa-reachable
+info:
+  name: Lab DVWA reachable
+  author: omnislash-lab
+  severity: info
+  description: Confirms the local DVWA target is reachable through the safety gateway.
+  tags: lab,dvwa
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/login.php"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "Damn Vulnerable Web Application"

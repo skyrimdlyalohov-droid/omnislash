@@ -46,6 +46,14 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	if d.pool.closed.Load() {
 		return nil, ErrPoolClosed
 	}
+	var err error
+	ctx, err = d.pool.WaitGlobal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.pool.Allow(); err != nil {
+		return nil, err
+	}
 
 	target, err := d.pool.scope.CheckTarget(ctx, addr)
 	if err != nil {
@@ -93,6 +101,14 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 // failure and returns a connection that releases the in-flight gauge on Close.
 // The target is checked against the pool scope before any proxy is contacted.
 func (d *Dialer) DialProxy(ctx context.Context, pr *Proxy, target string) (net.Conn, error) {
+	var err error
+	ctx, err = d.pool.WaitGlobal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.pool.Allow(); err != nil {
+		return nil, err
+	}
 	checked, err := d.pool.scope.CheckTarget(ctx, target)
 	if err != nil {
 		return nil, err

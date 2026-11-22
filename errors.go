@@ -20,4 +20,9 @@ var (
 
 	// ErrSessionClosed is returned after Session.Close.
 	ErrSessionClosed = errors.New("omnislash: experiment session closed")
+
+	// ErrCircuitOpen is returned when the safety circuit breaker has stopped
+	// traffic after repeated block responses or after the request budget was
+	// exhausted.
+	ErrCircuitOpen = errors.New("omnislash: safety circuit is open")
 )

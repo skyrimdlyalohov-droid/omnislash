@@ -130,9 +130,9 @@ finding that a proxy was used.
   `serve` or `cmd/gateway` is trusted input; only the per-connection TLS
   verification done by the client protects that path.
 - `check` runs health and egress probes, not admission.
-- The CONNECT gateway attributes an exit IP to a TCP connection, not to an
-  individual HTTP request. Tools that need per-request attribution must use
-  `Dialer`/`Session`.
+- The HTTP gateway attributes an exit IP to an upstream connection. Plain HTTP
+  is forwarded one request per connection; CONNECT is one exit per tunnel.
+  Tools that need pinned per-session attribution must use `Dialer`/`Session`.
 - Free public proxies are intermittent: the same proxy can pass a canary and
   later serve a wrong certificate. Verification is therefore per connection,
   not a one-time property of the pool entry.
@@ -146,12 +146,14 @@ proxy sources -> Colly -> dedupe/shuffle -> egress canaries
                                              |
                                    atomic Pool.Replace (hot swap)
                                              |
-scanner -> Dialer / Session / CONNECT gateway -> opaque proxy tunnel -> target
+scanner -> Dialer / Session / HTTP gateway -> opaque proxy tunnel -> target
 probe   -> Runner -> pinned Session -------------------^  (conn.Write only)
 daemon  -> probe jobs -> Runner (one pinned Session per attempt)
 ```
 
-The proxy never receives target bytes through `net/http`; HTTP proxies always
-use CONNECT, SOCKS5 tunnels are byte-transparent, and the gateway copies raw
-streams. Admission probes are the only place where omnislash itself writes
-HTTP-like bytes, and they are isolated from scanner traffic.
+The proxy never receives target bytes through `net/http`; upstream HTTP proxies
+always use CONNECT, SOCKS5 tunnels are byte-transparent, and the gateway copies
+raw streams for CONNECT. The gateway's plain-HTTP mode parses and re-serializes
+requests so it can observe response statuses; use CONNECT when byte-exact
+payloads matter. Admission probes are the only other place where omnislash
+itself writes HTTP-like bytes, and they are isolated from scanner traffic.

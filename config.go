@@ -73,6 +73,8 @@ type Config struct {
 	Stats              StatsConfig     `json:"stats"`
 	Gateway            GatewayConfig   `json:"gateway"`
 	RateLimit          RateLimitConfig `json:"rate_limit"`
+	Safety             SafetyConfig    `json:"safety"`
+	Audit              AuditConfig     `json:"audit"`
 	Scope              ScopeConfig     `json:"scope"`
 	Scraper            ScraperConfig   `json:"scraper"`
 	LogLevel           string          `json:"log_level"`
@@ -123,10 +125,37 @@ type GatewayConfig struct {
 	Token  string `json:"token"`
 }
 
-// RateLimitConfig enables a per-proxy token bucket. Zero RPS disables it.
+// RateLimitConfig enables token buckets. PerProxyRPS limits each upstream
+// proxy; GlobalRPS limits the whole pool regardless of rotation. Zero disables
+// the corresponding limiter. A safe scanning profile sets global_rps to 4 and
+// global_burst to 1 so proxy rotation cannot multiply the effective rate.
 type RateLimitConfig struct {
 	PerProxyRPS float64 `json:"per_proxy_rps"`
 	Burst       int     `json:"burst"`
+	GlobalRPS   float64 `json:"global_rps"`
+	GlobalBurst int     `json:"global_burst"`
+}
+
+// SafetyConfig stops all traffic when the target starts rejecting the scan.
+// Statuses are counted in a sliding window; reaching Threshold trips the
+// breaker for Cooldown. MaxRequests is an optional hard request budget; zero
+// means unlimited. The breaker is fail-closed: while open, every dial and HTTP
+// request is refused instead of rotating to another proxy.
+type SafetyConfig struct {
+	Enabled      bool     `json:"enabled"`
+	StopStatuses []int    `json:"stop_statuses"`
+	Threshold    int      `json:"threshold"`
+	Window       Duration `json:"window"`
+	Cooldown     Duration `json:"cooldown"`
+	MaxRequests  int64    `json:"max_requests"`
+}
+
+// AuditConfig writes one JSON object per event to Path. Path "-" means stdout.
+// The audit log contains method, target, status, proxy label and reason, never
+// request or response bodies.
+type AuditConfig struct {
+	Enabled bool   `json:"enabled"`
+	Path    string `json:"path"`
 }
 
 // ScopeConfig is a fail-closed target allowlist for the dialer and gateway.
@@ -303,6 +332,14 @@ func DefaultConfig() Config {
 		Stats:     StatsConfig{Listen: "127.0.0.1:9090"},
 		Gateway:   GatewayConfig{Listen: "127.0.0.1:3128"},
 		RateLimit: RateLimitConfig{},
+		Safety: SafetyConfig{
+			Enabled:      false,
+			StopStatuses: []int{403, 429, 503},
+			Threshold:    5,
+			Window:       Duration(60 * time.Second),
+			Cooldown:     Duration(10 * time.Minute),
+		},
+		Audit: AuditConfig{},
 		Scope: ScopeConfig{
 			DNSCacheTTL: Duration(5 * time.Minute),
 			DNSTimeout:  Duration(3 * time.Second),
@@ -450,6 +487,21 @@ func (c *Config) normalize() {
 	}
 	if c.RateLimit.PerProxyRPS > 0 && c.RateLimit.Burst == 0 {
 		c.RateLimit.Burst = 1
+	}
+	if c.RateLimit.GlobalRPS > 0 && c.RateLimit.GlobalBurst == 0 {
+		c.RateLimit.GlobalBurst = 1
+	}
+	if c.Safety.Threshold == 0 {
+		c.Safety.Threshold = d.Safety.Threshold
+	}
+	if len(c.Safety.StopStatuses) == 0 {
+		c.Safety.StopStatuses = append([]int(nil), d.Safety.StopStatuses...)
+	}
+	if c.Safety.Window == 0 {
+		c.Safety.Window = d.Safety.Window
+	}
+	if c.Safety.Cooldown == 0 {
+		c.Safety.Cooldown = d.Safety.Cooldown
 	}
 	if c.Scope.DNSCacheTTL == 0 {
 		c.Scope.DNSCacheTTL = d.Scope.DNSCacheTTL
@@ -608,6 +660,29 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimit.Burst < 0 {
 		add("rate_limit.burst must be >= 0")
+	}
+	if c.RateLimit.GlobalRPS < 0 {
+		add("rate_limit.global_rps must be >= 0")
+	}
+	if c.RateLimit.GlobalBurst < 0 {
+		add("rate_limit.global_burst must be >= 0")
+	}
+	for _, code := range c.Safety.StopStatuses {
+		if code < 100 || code > 599 {
+			add("safety.stop_statuses: invalid status %d", code)
+		}
+	}
+	if c.Safety.Threshold < 1 {
+		add("safety.threshold must be >= 1")
+	}
+	if c.Safety.Window <= 0 {
+		add("safety.window must be > 0")
+	}
+	if c.Safety.Cooldown <= 0 {
+		add("safety.cooldown must be > 0")
+	}
+	if c.Safety.MaxRequests < 0 {
+		add("safety.max_requests must be >= 0")
 	}
 	if err := validateScopeConfig(c.Scope); err != nil {
 		add("scope: %v", err)

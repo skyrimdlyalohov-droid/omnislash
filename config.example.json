@@ -45,7 +45,21 @@
   },
   "rate_limit": {
     "per_proxy_rps": 0,
-    "burst": 0
+    "burst": 0,
+    "global_rps": 4,
+    "global_burst": 1
+  },
+  "safety": {
+    "enabled": true,
+    "stop_statuses": [403, 429, 503],
+    "threshold": 5,
+    "window": "60s",
+    "cooldown": "10m",
+    "max_requests": 0
+  },
+  "audit": {
+    "enabled": true,
+    "path": "omnislash-audit.jsonl"
   },
   "scope": {
     "enabled": true,

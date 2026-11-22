@@ -43,6 +43,8 @@ func run(args []string) error {
 		return cmdScrape(args[1:])
 	case "healthcheck":
 		return cmdHealthcheck(args[1:])
+	case "faq":
+		return cmdFaq(args[1:])
 	case "version", "-version", "--version":
 		fmt.Println("omnislash", version)
 		return nil
@@ -62,7 +64,10 @@ func printUsage() {
   omnislash check  [флаги]   проверить прокси из файла
   omnislash scrape [флаги]   собрать, проверить и показать живые прокси
   omnislash fetch  [флаги]   сделать N запросов через разные IP (демо)
-  omnislash serve  [флаги]   поднять локальный CONNECT-шлюз + stats
+  omnislash serve  [флаги]   поднять локальный HTTP-шлюз + stats
+
+Команды:
+  omnislash faq [флаги]   показать FAQ (опционально -topic <ключ>)
 
 Служебное:
   omnislash healthcheck [флаги]  проверить /readyz (для Docker healthcheck)

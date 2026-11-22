@@ -6,3 +6,9 @@ config.local.json
 
 # daemon runtime evidence
 /examples/daemon/*.jsonl
+
+# local safety lab runtime artifacts
+/lab/bin/
+/lab/*.log
+/lab/audit.jsonl
+/lab/nuclei-results.jsonl

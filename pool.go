@@ -1,6 +1,7 @@
 package omnislash
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -40,6 +41,10 @@ type Pool struct {
 	scraperMu    sync.RWMutex
 	scraperStats func() ScraperStats
 
+	globalLimiter *tokenBucket
+	circuit       *CircuitBreaker
+	audit         *AuditLogger
+
 	now func() time.Time
 }
 
@@ -69,14 +74,26 @@ func NewPool(cfg *Config, proxies []*Proxy, logger *slog.Logger) (*Pool, error) 
 			p.limiter = newTokenBucket(c.RateLimit.PerProxyRPS, c.RateLimit.Burst)
 		}
 	}
-	return &Pool{
+	audit, err := newAuditLogger(c.Audit)
+	if err != nil {
+		return nil, err
+	}
+	p := &Pool{
 		cfg:     c,
 		proxies: proxies,
 		scope:   scope,
 		log:     logger,
 		sticky:  make(map[string]stickyEntry),
+		audit:   audit,
 		now:     time.Now,
-	}, nil
+	}
+	if c.RateLimit.GlobalRPS > 0 {
+		p.globalLimiter = newTokenBucket(c.RateLimit.GlobalRPS, c.RateLimit.GlobalBurst)
+	}
+	if c.Safety.Enabled {
+		p.circuit = NewCircuitBreaker(c.Safety, p.now)
+	}
+	return p, nil
 }
 
 // Config returns a copy of the pool configuration.
@@ -155,7 +172,79 @@ func (p *Pool) Replace(proxies []*Proxy) {
 }
 
 // Close marks the pool as closed. Existing connections are not interrupted.
-func (p *Pool) Close() { p.closed.Store(true) }
+func (p *Pool) Close() {
+	p.closed.Store(true)
+	if p.audit != nil {
+		_ = p.audit.Close()
+	}
+}
+
+// WaitGlobal acquires one slot from the pool-wide rate limiter. The returned
+// context carries a marker so nested dials do not consume a second slot for the
+// same application request. A closed or nil limiter is a no-op.
+func (p *Pool) WaitGlobal(ctx context.Context) (context.Context, error) {
+	if p == nil || p.globalLimiter == nil {
+		return ctx, nil
+	}
+	if ctx.Value(globalWaitKey{}) != nil {
+		return ctx, nil
+	}
+	if err := p.globalLimiter.wait(ctx); err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, globalWaitKey{}, true), nil
+}
+
+type globalWaitKey struct{}
+
+// Allow checks the safety breaker. It returns ErrCircuitOpen while traffic is
+// stopped.
+func (p *Pool) Allow() error {
+	if p == nil {
+		return nil
+	}
+	return p.circuit.Allow()
+}
+
+// RecordStatus feeds one target response into the safety breaker.
+func (p *Pool) RecordStatus(status int) {
+	if p == nil {
+		return
+	}
+	p.circuit.RecordStatus(status)
+}
+
+// TripSafety opens the safety breaker immediately.
+func (p *Pool) TripSafety(reason string) {
+	if p == nil {
+		return
+	}
+	p.circuit.Trip(reason)
+}
+
+// ResetSafety closes the safety breaker and clears the window and budget.
+func (p *Pool) ResetSafety() {
+	if p == nil {
+		return
+	}
+	p.circuit.Reset()
+}
+
+// CircuitState returns the current safety breaker state.
+func (p *Pool) CircuitState() CircuitState {
+	if p == nil {
+		return CircuitState{}
+	}
+	return p.circuit.State()
+}
+
+// Audit returns the configured audit logger, or nil when auditing is disabled.
+func (p *Pool) Audit() *AuditLogger {
+	if p == nil {
+		return nil
+	}
+	return p.audit
+}
 
 // SetScraperStats registers a callback that exposes scraper state in the pool
 // stats snapshot. It is optional and primarily used by ServeStats.
@@ -186,6 +275,7 @@ type Stats struct {
 	Available   int           `json:"available"`
 	InCooldown  int           `json:"in_cooldown"`
 	Disabled    int           `json:"disabled"`
+	Circuit     *CircuitState `json:"circuit,omitempty"`
 	Proxies     []ProxyStats  `json:"proxies"`
 	Scraper     *ScraperStats `json:"scraper,omitempty"`
 }
@@ -198,6 +288,10 @@ func (p *Pool) Stats() Stats {
 		GeneratedAt: now,
 		Total:       len(proxies),
 		Proxies:     make([]ProxyStats, 0, len(proxies)),
+	}
+	if p.circuit != nil {
+		cs := p.circuit.State()
+		s.Circuit = &cs
 	}
 	for _, pr := range proxies {
 		ps := pr.stats(now)

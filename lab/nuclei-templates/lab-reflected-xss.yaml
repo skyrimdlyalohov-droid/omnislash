@@ -1,0 +1,20 @@
+id: lab-reflected-xss
+info:
+  name: Lab reflected XSS marker
+  author: omnislash-lab
+  severity: medium
+  description: Detects the deliberately unescaped q parameter in the fallback lab target.
+  tags: lab,xss
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/rest/products/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        part: body
+        words:
+          - "<script>alert(1)</script>"

@@ -1,6 +1,7 @@
-// Command gateway starts only the local rotating CONNECT proxy. It is the
+// Command gateway starts only the local rotating HTTP gateway. It is the
 // integration point for tools that cannot be rebuilt in Go: point their
-// HTTPS_PROXY at the listener and every new CONNECT gets the next exit IP.
+// HTTP_PROXY at the listener for plain HTTP, or HTTPS_PROXY for CONNECT, and
+// every new upstream connection gets the next exit IP.
 package main
 
 import (
@@ -60,7 +61,7 @@ func main() {
 			}
 		}()
 	}
-	log.Printf("omnislash CONNECT gateway on %s (proxies=%d)", gw.Addr(), pool.Len())
+	log.Printf("omnislash HTTP gateway on %s (proxies=%d)", gw.Addr(), pool.Len())
 	if err := gw.Serve(ctx); err != nil {
 		log.Fatal(err)
 	}
