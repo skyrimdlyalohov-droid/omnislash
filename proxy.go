@@ -46,7 +46,31 @@ type Proxy struct {
 	bans          atomic.Uint64
 	inflight      atomic.Int64
 	lastUsedUnix  atomic.Int64
+
+	// Echelon 3 pool stratification and tail-latency control.
+	latencySamples []time.Duration
+	p90Latency     time.Duration
+	admissionMode  string
+	lastBan        time.Time
 }
+
+// Proxy tiers. Sniper proxies are reserved for final synchronized series and
+// cross-proxy verification; Infantry handles background OSINT/calibration.
+const (
+	TierInfantry = "infantry"
+	TierSniper   = "sniper"
+
+	// Aliases matching the architecture vocabulary.
+	InfantryTier = TierInfantry
+	SniperTier   = TierSniper
+)
+
+const (
+	maxLatencySamples = 64
+	sniperIQR         = 20 * time.Millisecond
+	banWindow         = time.Hour
+	infantryFloor     = 300 * time.Millisecond
+)
 
 // NewProxy parses a proxy URL. If raw has no scheme, defaultScheme is used.
 // Empty lines and comments are rejected; ParseProxyList skips them.
@@ -209,6 +233,11 @@ func (p *Proxy) markSuccess(now time.Time, latency time.Duration) {
 		} else {
 			p.latency = time.Duration(float64(p.latency)*0.8 + float64(latency)*0.2)
 		}
+		p.latencySamples = append(p.latencySamples, latency)
+		if len(p.latencySamples) > maxLatencySamples {
+			p.latencySamples = p.latencySamples[len(p.latencySamples)-maxLatencySamples:]
+		}
+		p.p90Latency = percentileDuration(p.latencySamples, 0.90)
 	}
 	p.mu.Unlock()
 }
@@ -267,11 +296,133 @@ func (p *Proxy) markBan(now time.Time, reason string, cooldown time.Duration) {
 	defer p.mu.Unlock()
 	p.failures++
 	p.alive = false
+	p.lastBan = now
 	p.lastError = "banned: " + reason
 	until := now.Add(cooldown)
 	if until.After(p.cooldownUntil) {
 		p.cooldownUntil = until
 	}
+}
+
+// setAdmissionMode records which admission suite this proxy passed.
+func (p *Proxy) setAdmissionMode(mode string) {
+	p.mu.Lock()
+	p.admissionMode = mode
+	p.mu.Unlock()
+}
+
+// AdmissionMode returns the admission suite the proxy passed, if known.
+func (p *Proxy) AdmissionMode() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.admissionMode
+}
+
+// P90Latency returns the rolling 90th percentile latency.
+func (p *Proxy) P90Latency() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.p90Latency > 0 {
+		return p.p90Latency
+	}
+	return p.latency
+}
+
+// IQR returns the interquartile range of recent latency samples.
+func (p *Proxy) IQR() time.Duration {
+	p.mu.Lock()
+	samples := append([]time.Duration(nil), p.latencySamples...)
+	p.mu.Unlock()
+	if len(samples) < 2 {
+		return 0
+	}
+	sortDurations(samples)
+	q1 := percentileDuration(samples, 0.25)
+	q3 := percentileDuration(samples, 0.75)
+	if q3 < q1 {
+		return 0
+	}
+	return q3 - q1
+}
+
+// AdaptiveTimeout is the tail-latency cut used for Infantry background checks:
+// max(1.5 * p90, 300ms).
+func (p *Proxy) AdaptiveTimeout() time.Duration {
+	p90 := p.P90Latency()
+	if p90 <= 0 {
+		return infantryFloor
+	}
+	t := time.Duration(float64(p90) * 1.5)
+	if t < infantryFloor {
+		t = infantryFloor
+	}
+	return t
+}
+
+// Tier classifies the proxy for scheduling. Sniper requires http_parsing
+// admission, IQR < 20ms and no ban in the last hour.
+func (p *Proxy) Tier() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tierLocked(time.Now())
+}
+
+func (p *Proxy) tierLocked(now time.Time) string {
+	if p.disabled || !p.alive {
+		return TierInfantry
+	}
+	if p.admissionMode != AdmissionModeHTTPParsing {
+		return TierInfantry
+	}
+	if len(p.latencySamples) < 3 || p.p90Latency <= 0 {
+		return TierInfantry
+	}
+	if p.iqrLocked() >= sniperIQR {
+		return TierInfantry
+	}
+	if !p.lastBan.IsZero() && now.Sub(p.lastBan) < banWindow {
+		return TierInfantry
+	}
+	return TierSniper
+}
+
+func (p *Proxy) iqrLocked() time.Duration {
+	samples := append([]time.Duration(nil), p.latencySamples...)
+	if len(samples) < 2 {
+		return 0
+	}
+	sortDurations(samples)
+	q1 := percentileDuration(samples, 0.25)
+	q3 := percentileDuration(samples, 0.75)
+	if q3 < q1 {
+		return 0
+	}
+	return q3 - q1
+}
+
+func sortDurations(v []time.Duration) {
+	for i := 1; i < len(v); i++ {
+		for j := i; j > 0 && v[j] < v[j-1]; j-- {
+			v[j], v[j-1] = v[j-1], v[j]
+		}
+	}
+}
+
+func percentileDuration(sorted []time.Duration, q float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if len(sorted) == 1 {
+		return sorted[0]
+	}
+	pos := q * float64(len(sorted)-1)
+	lo := int(pos)
+	hi := lo + 1
+	if hi >= len(sorted) {
+		return sorted[len(sorted)-1]
+	}
+	frac := pos - float64(lo)
+	return time.Duration(float64(sorted[lo]) + frac*float64(sorted[hi]-sorted[lo]))
 }
 
 func (p *Proxy) setDisabled(v bool) {

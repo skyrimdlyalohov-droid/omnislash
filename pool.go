@@ -2,6 +2,7 @@ package omnislash
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -569,4 +570,77 @@ func sampleGamma(alpha float64) float64 {
 func inSet(set map[*Proxy]struct{}, p *Proxy) bool {
 	_, ok := set[p]
 	return ok
+}
+
+// ErrNoSniper is returned when no proxy qualifies for the SniperTier reserve.
+var ErrNoSniper = errors.New("omnislash: no sniper-tier proxy available")
+
+// AcquireSniper returns a proxy reserved for final synchronized series and
+// cross-proxy verification. It never falls back to Infantry.
+func (p *Pool) AcquireSniper(ctx context.Context) (*Proxy, error) {
+	if p.closed.Load() {
+		return nil, ErrPoolClosed
+	}
+	if _, err := p.WaitGlobal(ctx); err != nil {
+		return nil, err
+	}
+	if err := p.Allow(); err != nil {
+		return nil, err
+	}
+	now := p.now()
+	var candidates []*Proxy
+	for _, pr := range p.snapshot() {
+		if !pr.available(now) {
+			continue
+		}
+		if pr.tierLocked(now) != TierSniper {
+			continue
+		}
+		candidates = append(candidates, pr)
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoSniper
+	}
+	var chosen *Proxy
+	switch p.cfg.Strategy {
+	case StrategyRandom:
+		chosen = p.pickRandom(candidates, now, nil)
+	case StrategyLeastUsed:
+		chosen = p.pickLeastUsed(candidates, now, nil)
+	case StrategyLatencyAware:
+		chosen = p.pickLatencyAware(candidates, now, nil)
+	case StrategyThompson:
+		chosen = p.pickThompson(candidates, now, nil)
+	default:
+		chosen = p.pickRoundRobin(candidates, now, nil)
+	}
+	if chosen == nil {
+		return nil, ErrNoSniper
+	}
+	chosen.uses.Add(1)
+	return chosen, nil
+}
+
+// SniperCount returns the number of currently eligible SniperTier proxies.
+func (p *Pool) SniperCount() int {
+	now := p.now()
+	n := 0
+	for _, pr := range p.snapshot() {
+		if pr.available(now) && pr.tierLocked(now) == TierSniper {
+			n++
+		}
+	}
+	return n
+}
+
+// InfantryCount returns the number of available InfantryTier proxies.
+func (p *Pool) InfantryCount() int {
+	now := p.now()
+	n := 0
+	for _, pr := range p.snapshot() {
+		if pr.available(now) && pr.tierLocked(now) == TierInfantry {
+			n++
+		}
+	}
+	return n
 }

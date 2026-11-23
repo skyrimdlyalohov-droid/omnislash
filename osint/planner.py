@@ -8,9 +8,34 @@ scope fail-closed, and carries baseline metadata for runtime deception checks.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import sys
 from typing import Any, Dict, List
+
+# Optional Echelon 2 knowledge base
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+try:
+    from research.knowledge_base import DEFAULT_VAULT_PATH, find_keys_for_stack, load_vault
+except Exception:  # pragma: no cover - optional dependency path
+    DEFAULT_VAULT_PATH = os.path.join("state", "zero_day_vault.json")
+    def load_vault(path=DEFAULT_VAULT_PATH): return {"version": 1, "keys": []}
+    def find_keys_for_stack(vault, tech_stack): return []
+try:
+    from research.waf_inference import DEFAULT_WAF_PROFILES, adapt_payload_for_waf, get_profile, load_profiles
+except Exception:  # pragma: no cover
+    DEFAULT_WAF_PROFILES = os.path.join("state", "waf_profiles.json")
+    def load_profiles(path=DEFAULT_WAF_PROFILES): return {"version": 1, "profiles": []}
+    def get_profile(store, host): return None
+    def adapt_payload_for_waf(payload, profile): return payload
+try:
+    from research.adaptive_prober import AdaptiveProbePlanner, adaptive_observations_from_records
+except Exception:  # pragma: no cover - optional adaptive dependency path
+    AdaptiveProbePlanner = None
+    def adaptive_observations_from_records(records): return {}
 
 
 CACHE_HEADER_HINTS = {"x-cache", "cf-cache-status", "age", "via", "vary", "cache-control"}
@@ -93,6 +118,22 @@ def has_reverse_proxy_downgrade(target: Dict[str, Any]) -> bool:
     return False
 
 
+def wants_upgrade_desync(target: Dict[str, Any]) -> str:
+    """Return upgrade type if target shows WebSocket/gRPC/H2C indicators, else empty."""
+    tech = " ".join(_norm_tech(target)).lower()
+    ports = [int(p) for p in (target.get("known_ports") or []) if str(p).isdigit()]
+    if any(k in tech for k in ["grpc", "h2c"]):
+        return "grpc"
+    if any(k in tech for k in ["websocket", "ws://", "wss://", "socket.io"]):
+        return "websocket"
+    if any(p in ports for p in [8080, 8443, 9000]):
+        # nonstandard ports - try websocket by default, grpc also possible
+        if any(p in ports for p in [50051, 9000]):
+            return "grpc"
+        return "websocket"
+    return ""
+
+
 def _target_addr(target: Dict[str, Any]) -> str:
     host = str(target.get("target") or target.get("host") or "").strip()
     port = 443
@@ -128,7 +169,7 @@ def _base_job(name: str, target: Dict[str, Any], probe: str, tls: str) -> Dict[s
     }
 
 
-def plan_target(target: Dict[str, Any], critical_endpoints: List[str] = None) -> List[Dict[str, Any]]:
+def plan_target(target: Dict[str, Any], critical_endpoints: List[str] = None, vault: Dict[str, Any] = None, waf_store: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     critical_endpoints = list(critical_endpoints or target.get("critical_endpoints") or [])
     if is_excluded(target):
         return []
@@ -138,6 +179,44 @@ def plan_target(target: Dict[str, Any], critical_endpoints: List[str] = None) ->
     jobs: List[Dict[str, Any]] = []
     tech = _norm_tech(target)
     tech_l = " ".join(tech).lower()
+
+    # Echelon 2: Universal Key from zero-day vault - skip long evolution.
+    if vault:
+        keys = find_keys_for_stack(vault, tech)
+        if keys:
+            k = keys[0]
+            j = _base_job(f"{host}-universal-key", target, "raw-replay", "h1")
+            raw_b64 = k.get("raw_payload_b64", "")
+            if waf_store and raw_b64:
+                prof = get_profile(waf_store, host)
+                if prof is not None:
+                    try:
+                        raw = base64.b64decode(raw_b64.encode("ascii"))
+                        raw = adapt_payload_for_waf(raw, prof)
+                        raw_b64 = base64.b64encode(raw).decode("ascii")
+                        j.setdefault("metadata", {})["waf_adapted"] = True
+                    except Exception:
+                        pass
+            j["raw_payload_b64"] = raw_b64
+            j["success_contains"] = str((k.get("metadata") or {}).get("success_contains", ""))
+            j["attempts"] = 1
+            j["until_success"] = True
+            j["metadata"]["universal_key"] = {
+                "id": k.get("id"),
+                "tech_stack_hash": k.get("tech_stack_hash"),
+                "mutation_type": k.get("mutation_type"),
+                "protocol_edge": k.get("protocol_edge"),
+                "gittins_index": 9999.0,
+            }
+            j["metadata"]["gittins_index"] = 9999.0
+            jobs.append(j)
+            ut = wants_upgrade_desync(target)
+            if ut:
+                uj = _base_job(f"{host}-upgrade-desync", target, "upgrade-desync", "h1")
+                uj["upgrade_type"] = ut
+                uj["attempts"] = 1
+                jobs.append(uj)
+            return jobs
 
     # Cache/tunnel mapping
     if has_cache_signals(target) and has_h2_support(target):
@@ -173,13 +252,87 @@ def plan_target(target: Dict[str, Any], critical_endpoints: List[str] = None) ->
             j["until_success"] = False
             jobs.append(j)
 
+    # Upgrade-desync for WebSocket/gRPC/H2C or nonstandard ports.
+    ut = wants_upgrade_desync(target)
+    if ut:
+        uj = _base_job(f"{host}-upgrade-desync", target, "upgrade-desync", "h1")
+        uj["upgrade_type"] = ut
+        uj["attempts"] = 1
+        jobs.append(uj)
+
     # If nothing matched but target is clean and web, add conservative smuggle-chain only for reverse proxies? no - avoid noise.
     # Keep fail-closed: no jobs if no clear signal.
     return jobs
 
 
-def build_daemon_config(targets: List[Dict[str, Any]], omnislash_config: str = "config.json", log_file: str = "omnislashd-audit.jsonl") -> Dict[str, Any]:
+def _telemetry_lookup(target: Dict[str, Any], telemetry: Dict[str, Any]) -> Any:
+    if not telemetry:
+        return None
+    host = str(target.get("target") or target.get("host") or "").strip()
+    keys = [host, _target_addr(target), f"{host}:443", f"{host}:80"]
+    for key in keys:
+        entry = telemetry.get(key.lower())
+        if entry is not None:
+            return entry
+    return None
+
+
+def plan_target_adaptive(
+    target: Dict[str, Any],
+    telemetry_entry: Any = None,
+    max_probes: int = 7,
+    min_posterior: float = 0.55,
+    sniper_pool: Any = None,
+) -> Any:
+    """Plan diagnostics (first pass) or a strike (telemetry pass).
+
+    The planner emits diagnostic jobs while the posterior is diffuse. Once
+    ``omnislashd`` telemetry and the syndrome decoder concentrate probability
+    above ``min_posterior``, it emits one targeted job instead.
+    """
+    if AdaptiveProbePlanner is None:
+        raise RuntimeError("research.adaptive_prober is unavailable")
+    if is_excluded(target):
+        return [], {}
+    host = str(target.get("target") or target.get("host") or "").strip()
+    if not host:
+        return [], {}
+    actions = None
+    observation = None
+    if isinstance(telemetry_entry, dict):
+        actions = telemetry_entry.get("actions")
+        observation = telemetry_entry.get("observation")
+    planner = AdaptiveProbePlanner()
+    plan = planner.plan(
+        target,
+        observations=actions,
+        observation=observation,
+        max_probes=max(1, int(max_probes)),
+        min_posterior=float(min_posterior),
+        sniper_pool=sniper_pool,
+    )
+    summary = plan.to_dict()
+    jobs = list(summary.pop("jobs", []) or [])
+    summary["host"] = host
+    summary["job_count"] = len(jobs)
+    summary["job_names"] = [str(j.get("name", "")) for j in jobs]
+    return jobs, summary
+
+
+def build_daemon_config(
+    targets: List[Dict[str, Any]],
+    omnislash_config: str = "config.json",
+    log_file: str = "omnislashd-audit.jsonl",
+    vault: Dict[str, Any] = None,
+    waf_store: Dict[str, Any] = None,
+    adaptive: bool = False,
+    adaptive_telemetry: Dict[str, Any] = None,
+    adaptive_max_probes: int = 7,
+    adaptive_min_posterior: float = 0.55,
+    sniper_pool: Any = None,
+) -> Dict[str, Any]:
     jobs: List[Dict[str, Any]] = []
+    adaptive_plans: List[Dict[str, Any]] = []
     allow_hosts: List[str] = []
     seen_hosts = set()
     for t in targets:
@@ -188,7 +341,18 @@ def build_daemon_config(targets: List[Dict[str, Any]], omnislash_config: str = "
         host = str(t.get("target") or t.get("host") or "").strip()
         if not host:
             continue
-        t_jobs = plan_target(t, t.get("critical_endpoints") or [])
+        if adaptive:
+            t_jobs, plan_summary = plan_target_adaptive(
+                t,
+                _telemetry_lookup(t, adaptive_telemetry or {}),
+                max_probes=adaptive_max_probes,
+                min_posterior=adaptive_min_posterior,
+                sniper_pool=sniper_pool,
+            )
+            if plan_summary:
+                adaptive_plans.append(plan_summary)
+        else:
+            t_jobs = plan_target(t, t.get("critical_endpoints") or [], vault=vault, waf_store=waf_store)
         if t_jobs:
             jobs.extend(t_jobs)
             if host not in seen_hosts:
@@ -199,7 +363,7 @@ def build_daemon_config(targets: List[Dict[str, Any]], omnislash_config: str = "
                 if ip and ip not in seen_hosts:
                     seen_hosts.add(ip)
                     allow_hosts.append(ip)
-    return {
+    cfg: Dict[str, Any] = {
         "omnislash_config": omnislash_config,
         "proxies": "",
         "log_file": log_file,
@@ -213,6 +377,38 @@ def build_daemon_config(targets: List[Dict[str, Any]], omnislash_config: str = "
             "allow_private": False,
         },
     }
+    if adaptive:
+        strike = any(
+            str((j.get("metadata") or {}).get("adaptive", {}).get("action", "")) == "strike"
+            for j in jobs
+        )
+        cfg["adaptive"] = {
+            "schema": "omnislash.adaptive-plan/v1",
+            "mode": "strike" if strike else "diagnostic",
+            "max_probes": adaptive_max_probes,
+            "min_posterior": adaptive_min_posterior,
+            "plans": adaptive_plans,
+        }
+    return cfg
+
+
+def load_jsonl(path: str) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    records.append(obj)
+    except FileNotFoundError:
+        return []
+    return records
 
 
 def main(argv=None):
@@ -223,7 +419,17 @@ def main(argv=None):
     ap.add_argument("--log-file", default="omnislashd-audit.jsonl")
     ap.add_argument("--only-diff", action="store_true", help="Only plan targets marked as new/changed (_diff) or from diff scanner output")
     ap.add_argument("--previous", default="", help="Optional previous targets_verified.json for internal diff when --only-diff is set")
+    ap.add_argument("--vault", default=DEFAULT_VAULT_PATH, help="Zero-day vault JSON path")
+    ap.add_argument("--waf-profiles", default=DEFAULT_WAF_PROFILES, help="WAF profiles JSON path")
+    ap.add_argument("--adaptive", action="store_true", help="Compact adaptive diagnostics instead of the full vector set")
+    ap.add_argument("--adaptive-telemetry", default="", help="omnislashd JSONL audit used to strike the confirmed syndrome")
+    ap.add_argument("--adaptive-max-probes", type=int, default=7, help="Hard request budget per target (default 7)")
+    ap.add_argument("--adaptive-min-posterior", type=float, default=0.55, help="Strike only above this posterior")
+    ap.add_argument("--adaptive-plan-out", default="", help="Optional JSON file for the adaptive decision trace")
+    ap.add_argument("--sniper-pool", type=int, default=-1, help="Sniper reserve size for arbitrage priority (optional)")
     args = ap.parse_args(argv)
+    if (args.adaptive_telemetry or args.adaptive_plan_out) and not args.adaptive:
+        ap.error("--adaptive-telemetry/--adaptive-plan-out require --adaptive")
 
     targets = load_targets(args.inp)
     if args.only_diff:
@@ -240,11 +446,40 @@ def main(argv=None):
             marked = [t for t in targets if t.get("_diff") in {"new", "changed"}]
             if any("_diff" in t for t in targets):
                 targets = marked
-    cfg = build_daemon_config(targets, omnislash_config=args.omnislash_config, log_file=args.log_file)
+    vault = load_vault(args.vault)
+    waf_store = load_profiles(args.waf_profiles)
+    telemetry = {}
+    if args.adaptive_telemetry:
+        telemetry = adaptive_observations_from_records(load_jsonl(args.adaptive_telemetry))
+    cfg = build_daemon_config(
+        targets,
+        omnislash_config=args.omnislash_config,
+        log_file=args.log_file,
+        vault=vault,
+        waf_store=waf_store,
+        adaptive=args.adaptive,
+        adaptive_telemetry=telemetry,
+        adaptive_max_probes=args.adaptive_max_probes,
+        adaptive_min_posterior=args.adaptive_min_posterior,
+        sniper_pool=None if args.sniper_pool < 0 else args.sniper_pool,
+    )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    print(json.dumps({"jobs": len(cfg["jobs"]), "allow_hosts": cfg["generated_scope"]["allow_hosts"], "only_diff": bool(args.only_diff)}, ensure_ascii=False))
+    adaptive_info = cfg.get("adaptive") or {}
+    if args.adaptive_plan_out:
+        with open(args.adaptive_plan_out, "w", encoding="utf-8") as f:
+            json.dump(adaptive_info, f, indent=2, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+    print(json.dumps({
+        "jobs": len(cfg["jobs"]),
+        "allow_hosts": cfg["generated_scope"]["allow_hosts"],
+        "only_diff": bool(args.only_diff),
+        "vault_keys": len(vault.get("keys", [])),
+        "adaptive_mode": adaptive_info.get("mode", ""),
+        "adaptive_telemetry_hosts": len(telemetry),
+        "adaptive_jobs": len(cfg["jobs"]) if args.adaptive else 0,
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":

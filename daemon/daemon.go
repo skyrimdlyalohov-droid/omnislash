@@ -446,6 +446,20 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 			Timeout:          timeout,
 			NeighborShiftNCD: ncd,
 		}, nil
+	case "raw-replay":
+		return &probe.RawReplayProbe{
+			RawPayloadB64:   j.RawPayloadB64,
+			RawPayloadHex:   j.RawPayloadHex,
+			SuccessContains: j.SuccessContains,
+			Timeout:         timeout,
+		}, nil
+	case "upgrade-desync":
+		return &probe.UpgradeDesyncProbe{
+			UpgradeType:     j.UpgradeType,
+			Path:            j.Path,
+			SuccessContains: j.SuccessContains,
+			Timeout:         timeout,
+		}, nil
 	default:
 		return nil, fmt.Errorf("daemon: unsupported probe %q", j.Probe)
 	}

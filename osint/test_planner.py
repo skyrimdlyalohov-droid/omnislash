@@ -80,6 +80,41 @@ class TestPlanner(unittest.TestCase):
         self.assertIn("good.example.com", allow)
         self.assertNotIn("no-signal.example.com", allow)
 
+    def test_adaptive_mode_generates_compact_diagnostics(self):
+        target = {
+            "target": "edge.example.com",
+            "is_honeypot": False,
+            "deception_risk": "low",
+            "tech": ["Cloudflare", "Nginx"],
+            "cache_headers": {"x-cache": "HIT"},
+            "known_ports": [443],
+        }
+        cfg = planner.build_daemon_config([target], adaptive=True)
+        self.assertEqual(cfg["adaptive"]["mode"], "diagnostic")
+        self.assertLessEqual(len(cfg["jobs"]), 7)
+        actions = [j["metadata"]["adaptive"]["action"] for j in cfg["jobs"]]
+        self.assertIn("framing", actions)
+        self.assertIn("unkeyed", actions)
+
+    def test_adaptive_telemetry_strikes_confirmed_syndrome(self):
+        target = {
+            "target": "edge.example.com",
+            "is_honeypot": False,
+            "deception_risk": "low",
+            "tech": ["Cloudflare", "Nginx"],
+            "known_ports": [443],
+        }
+        telemetry = {
+            "edge.example.com": {
+                "actions": {"framing": False, "h2": False, "upgrade": False, "cache": True, "unkeyed": False},
+                "observation": {"status": 200, "close_type": "KEEPALIVE", "headers": {"X-Cache": "HIT", "CF-Ray": "abc"}, "body": "cached"},
+            }
+        }
+        cfg = planner.build_daemon_config([target], adaptive=True, adaptive_telemetry=telemetry, adaptive_min_posterior=0.5)
+        self.assertEqual(cfg["adaptive"]["mode"], "strike")
+        self.assertEqual(len(cfg["jobs"]), 1)
+        self.assertEqual(cfg["jobs"][0]["metadata"]["adaptive"]["action"], "strike")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

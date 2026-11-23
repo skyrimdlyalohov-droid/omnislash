@@ -133,12 +133,65 @@ bash lab/e2e_smoke_test.sh
 make radar TARGET=example.com RADAR_ARGS="--skip-notify"
 ```
 
+## Echelon 2 (Zero-Marginal-Cost Incubator & Global Projection)
+
+| Модуль | Файл | Назначение |
+|---|---|---|
+| Local stack matrix | `sandbox/docker-compose.stacks.yml` | Локальные связки `Nginx/Envoy/HAProxy -> Python/Node` для фаззинга без интернета |
+| Incubator | `lab/run-incubator.sh`, `make incubate` | `omnislashd differential-fuzz + oracle` против `127.0.0.1`, `trust_tier: trusted`, узкий scope |
+| Knowledge base | `research/knowledge_base.py`, `state/zero_day_vault.json` | Universal Keys: `raw_payload_b64`, `mutation_type`, `protocol_edge`, `tech_stack_hash` |
+| Planner integration | `osint/planner.py` | При совпадении `tech_stack_hash` ставит `raw-replay` Universal Key с высоким Gittins; адаптирует payload через WAFProfile |
+| WAF inference | `research/waf_inference.py`, `state/waf_profiles.json` | Упрощённый active grammar inference/L* для HTTP-токенов; `adapt_payload_for_waf` |
+| Upgrade-desync | `probe/ws_grpc.go`, `daemon/*`, `osint/planner.py` | `probe: "upgrade-desync"` (WebSocket/gRPC/H2C upgrade), авто-активация по WS/gRPC/портам 8080/8443/9000 |
+| Global projector | `osint/global_projector.py`, `make project` | Поиск целей по `tech_stack_hash` в локальном кэше/Shodan/Censys query, Gittins ranking, Wald SPRT 3-5 запросов, verifier+notifier |
+
+```bash
+# Локальный инкубатор (нулевая стоимость)
+make incubate INCUBATE_ARGS="--skip-docker"
+
+# Глобальная проекция Universal Key
+make project TECH="nginx+python+h1.1" PROJECT_ARGS="--targets ./targets_verified.json --skip-notify"
+```
+
+## Echelon 3 (Two-Tier Pool, N×M Matrix, Layer Differential)
+
+| Модуль | Файл | Назначение |
+|---|---|---|
+| Stratified pool | `proxy.go`, `pool.go`, `dialer.go` | `SniperTier` только при `http_parsing` admission, IQR `<20ms`, ≥3 latency samples и отсутствии бана за 1h; `InfantryTier` — весь остальной трафик; `AcquireSniper`/`DialSniperContext` не деградируют до Infantry |
+| Tail-latency cut | `proxy.go`, `dialer.go` | rolling P90; для Infantry handshake обрывается на `max(1.5*P90, 300ms)`, Sniper не ограничивается этим потолком |
+| Matrix scheduler | `daemon/matrix_scheduler.go` | `Targets × Proxies` fan-out, строгий `per_host_min_interval` 3s + гауссов джиттер, окно параллелизма на хост, AIMD: `+1` на чистый ответ, `floor(W/2)` и кулдаун на `429/403/503`/аномалию |
+| Layer spectrometer | `research/layer_analyzer.py` | ортогональные маркеры (`Via`, `Server`, `CF-Ray`, `X-Cache`, формат ошибок) → softmax-вектор `CDN → Envoy → Nginx → HAProxy → backend`, Information Gain |
+| Metadata DDT | `research/layer_analyzer.py` | `MetadataDDT` сравнивает `X-Request-ID`/`ETag`/`Vary`/`Age`/`CF-Ray` на сдвигах входа, выделяет `Unkeyed Inputs` |
+| Normalization synthesizer | `research/layer_analyzer.py` | по `WAFProfile` синтезирует проверки расхождения парсинга: colon/OWS, NUL, chunk extension, alternate whitespace |
+
+## Echelon 4 (State Reconstruction, Game Arbitrage, Minimal Artifacts)
+
+| Модуль | Файл | Назначение |
+|---|---|---|
+| State graph miner | `research/state_and_chains.py` | парсит raw/JSON последовательности Caido, строит `S_0→…→S_n`, помечает критические переходы (cart/balance/role/session) и формирует `cross-state-race` задачи с `sync: "last-byte"` и предусловиями |
+| Chain synthesizer | `research/state_and_chains.py` | объединяет подтверждённые аномалии в граф достижимости; `z3-solver` опционален, при его отсутствии — детерминированный BFS по правилам; `unverified` отбрасываются |
+| Weibull/Kelly scorer | `research/game_arbitrage.py` | `S = impact * exp(-(age/scale)^shape) * f_Kelly`; при `sniper_pool < min_sniper_pool` эффективные odds падают пропорционально дефициту резерва |
+| ddmin / MDL | `research/game_arbitrage.py` | 1-минимальные bytes/str/header-list пейлоады через детерминированный delta debugging |
+| Minimal artifact | `research/game_arbitrage.py`, `osint/notifier.py`, `osint/caido_bridge.py` | детерминированный `omnislash.minimal-artifact/v1` (минимальный запрос, response diff, proxy attribution, replay steps, sha256) без генеративного текста; передаётся в Caido Replay/Telegram только после сжатия |
+
+## Adaptive Probing (O(log2 N), Syndrome Decoding)
+
+| Модуль | Файл | Назначение |
+|---|---|---|
+| Group testing | `research/adaptive_prober.py` | `GroupTestSplitter` мультиплексирует до 64 ортогональных кандидатов (unkeyed headers, framing) в один batch-оракул, бинарным расщеплением локализует триггер за `1 + ceil(log2 N)` запросов; триггер = `ncd_delta`/`ttfb_residual_ms`/status-header shift |
+| Syndrome decoder | `research/adaptive_prober.py` | `SyndromeDecoder` сопоставляет `[status, error_signature, FIN/RST/KEEPALIVE, ttfb_residual_ms, ncd_delta]` с эталонными синдромами Nginx/Envoy/HAProxy/Cloudflare/Akamai/Go/Gunicorn и возвращает `(frontend_parser, backend_parser, recommended_vector)` |
+| ID3 planner | `research/adaptive_prober.py` | `AdaptiveProbePlanner` выбирает следующий зонд по Shannon Information Gain `IG(S,A)=H(S)-Σ|S_v|/|S|H(S_v)`, отсекает ветки ниже `prune_threshold`, эмитит не более 4-7 диагностических запросов или один strike при `posterior >= min_posterior` |
+| Planner integration | `osint/planner.py` | `--adaptive` создаёт компактный диагностический пакет; `--adaptive-telemetry` читает `omnislashd` JSONL и достреливает подтверждённый синдром; `--adaptive-plan-out` сохраняет trace `omnislash.adaptive-plan/v1` |
+| ddmin/Caido handoff | `research/adaptive_prober.py`, `osint/caido_bridge.py`, `osint/notifier.py` | `distill_trigger()` = `GroupTestSplitter` → `ddmin` → `omnislash.minimal-artifact/v1`; `--adaptive-artifacts` прикрепляет минимальный артефакт к Caido Replay/Telegram |
+| Radar flow | `lab/run-radar.sh` | `--adaptive` выполняет diagnostic pass, re-plan по телеметрии и один strike pass; все probe-запуски остаются через `omnislashd`/`Dialer/Session` с обычными safety-инвариантами |
+
 ## Что проверяется тестами
 
 ```bash
 go test ./... -count=1
 go vet ./...
 python3 -m unittest discover -s osint -p "test_*.py"
+python3 -m unittest discover -s research -p "test_*.py"
 bash lab/e2e_smoke_test.sh
 git diff --check
 ```

@@ -212,6 +212,9 @@ func (v *Validator) attempt(ctx context.Context, pr *Proxy, realIP net.IP) (Vali
 	if err := v.admit(ctx, pr); err != nil {
 		return res, err
 	}
+	if v.cfg.Admission.Enabled {
+		pr.setAdmissionMode(v.cfg.Mode)
+	}
 	res.EgressIP = egress.String()
 	res.Canaries = successes
 	res.Latency = v.now().Sub(attemptStarted)

@@ -8,7 +8,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar incubate project test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -81,6 +81,17 @@ e2e:
 RADAR_ARGS ?=
 radar:
 	bash lab/run-radar.sh --target "$(TARGET)" $(RADAR_ARGS)
+
+# Echelon 2 incubator: local zero-cost differential fuzzing against docker stacks
+INCUBATE_ARGS ?=
+incubate:
+	bash lab/run-incubator.sh $(INCUBATE_ARGS)
+
+# Echelon 2 global projector: fan-out universal key to matching targets
+# Usage: make project TECH="nginx+python+h1.1" [PROJECT_ARGS="--targets targets_verified.json --skip-notify"]
+PROJECT_ARGS ?=
+project:
+	python3 osint/global_projector.py --tech "$(TECH)" $(PROJECT_ARGS)
 
 clean:
 	rm -rf bin

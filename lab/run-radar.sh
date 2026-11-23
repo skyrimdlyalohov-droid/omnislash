@@ -16,6 +16,8 @@ CAIDO_URL="${CAIDO_URL:-}"
 CAIDO_PAT="${CAIDO_PAT:-}"
 SKIP_DAEMON=0
 SKIP_NOTIFY=0
+ADAPTIVE=0
+ADAPTIVE_ARTIFACTS=""
 
 usage() {
   cat <<'USAGE'
@@ -30,6 +32,8 @@ Options:
   --proxies <file>       Proxy list
   --runs-dir <dir>       Runs dir (default ./runs)
   --state-dir <dir>      State dir (default ./state)
+  --adaptive             Compact O(log2 N) diagnostic package, then strike on telemetry
+  --adaptive-artifacts <file>  Minimal artifacts for Caido/Telegram handoff
   --skip-daemon          Skip omnislashd execution
   --skip-notify          Skip Telegram/Caido notifier
 USAGE
@@ -46,6 +50,8 @@ while [[ $# -gt 0 ]]; do
     --proxies) PROXIES="$2"; shift 2;;
     --runs-dir) RUNS_DIR="$2"; shift 2;;
     --state-dir) STATE_DIR="$2"; shift 2;;
+    --adaptive) ADAPTIVE=1; shift;;
+    --adaptive-artifacts) ADAPTIVE_ARTIFACTS="$2"; shift 2;;
     --skip-daemon) SKIP_DAEMON=1; shift;;
     --skip-notify) SKIP_NOTIFY=1; shift;;
     -h|--help) usage; exit 0;;
@@ -76,7 +82,11 @@ log "Phase 2: Diff scan"
 python3 "$ROOT/osint/diff_scanner.py" --current "$CUR" --previous "$PREV" --out "$DIFF" --stats-out "$RUN_DIR/diff-stats.json" > "$RUN_DIR/diff.stdout.log"
 
 log "Phase 3: Planner (only-diff)"
-python3 "$ROOT/osint/planner.py" --in "$DIFF" --out "$RUN_DIR/jobs.json" --omnislash-config "$RUN_DIR/omnislash.config.json" --log-file "$RUN_DIR/omnislashd-audit.jsonl" --only-diff > "$RUN_DIR/planner.stdout.log"
+PLANNER_ARGS=(--in "$DIFF" --out "$RUN_DIR/jobs.json" --omnislash-config "$RUN_DIR/omnislash.config.json" --log-file "$RUN_DIR/omnislashd-audit.jsonl" --only-diff)
+if [[ "$ADAPTIVE" -eq 1 ]]; then
+  PLANNER_ARGS+=(--adaptive --adaptive-plan-out "$RUN_DIR/adaptive-plan.json")
+fi
+python3 "$ROOT/osint/planner.py" "${PLANNER_ARGS[@]}" > "$RUN_DIR/planner.stdout.log"
 
 # Build transport config from base
 python3 - "$BASE_CONFIG" "$RUN_DIR/jobs.json" "$RUN_DIR/omnislash.config.json" "$RUN_DIR/omnislash-audit.jsonl" <<'PY'
@@ -112,6 +122,33 @@ else
   log "Phase 4: omnislashd skipped"
 fi
 
+if [[ "$ADAPTIVE" -eq 1 && -f "$RUN_DIR/omnislashd-audit.jsonl" ]]; then
+  log "Phase 4b: Adaptive re-plan from daemon telemetry"
+  python3 "$ROOT/osint/planner.py" \
+    --in "$DIFF" --out "$RUN_DIR/jobs.strike.json" \
+    --omnislash-config "$RUN_DIR/omnislash.config.json" \
+    --log-file "$RUN_DIR/omnislashd-audit.jsonl" \
+    --only-diff --adaptive \
+    --adaptive-telemetry "$RUN_DIR/omnislashd-audit.jsonl" \
+    --adaptive-plan-out "$RUN_DIR/adaptive-strike-plan.json" \
+    > "$RUN_DIR/planner-strike.stdout.log" || true
+  STRIKE_JOBS="$(python3 - "$RUN_DIR/jobs.strike.json" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        print(len(json.load(f).get("jobs", [])))
+except Exception:
+    print(0)
+PY
+)"
+  if [[ "${STRIKE_JOBS:-0}" -gt 0 ]]; then
+    log "Phase 4c: targeted strike ($STRIKE_JOBS job(s))"
+    "$ROOT/bin/omnislashd" -config "$RUN_DIR/jobs.strike.json" -once >> "$RUN_DIR/omnislashd.stdout.log" 2>&1 || true
+  else
+    log "Phase 4c: no posterior above threshold; strike skipped"
+  fi
+fi
+
 log "Phase 5: Verify (2 cross-proxy confirmations required)"
 if [[ -f "$RUN_DIR/omnislashd-audit.jsonl" ]]; then
   python3 "$ROOT/research/verifier.py" --in "$RUN_DIR/omnislashd-audit.jsonl" --out "$RUN_DIR/verified.json" --min-verifications 2 > "$RUN_DIR/verifier.stdout.log" || true
@@ -123,7 +160,11 @@ if [[ "$SKIP_NOTIFY" -eq 0 ]]; then
   log "Phase 6: Notify (confidence>=85, 2 cross-proxy verifications)"
   [[ -n "$CAIDO_URL" ]] && export CAIDO_URL
   [[ -n "$CAIDO_PAT" ]] && export CAIDO_PAT
-  python3 "$ROOT/osint/notifier.py" --in "$RUN_DIR/verified.json" --out "$RUN_DIR/notify.json" --min-confidence 85 > "$RUN_DIR/notifier.stdout.log" || true
+  NOTIFY_ARGS=(--in "$RUN_DIR/verified.json" --out "$RUN_DIR/notify.json" --min-confidence 85)
+  if [[ -n "$ADAPTIVE_ARTIFACTS" && -f "$ADAPTIVE_ARTIFACTS" ]]; then
+    NOTIFY_ARGS+=(--adaptive-artifacts "$ADAPTIVE_ARTIFACTS")
+  fi
+  python3 "$ROOT/osint/notifier.py" "${NOTIFY_ARGS[@]}" > "$RUN_DIR/notifier.stdout.log" || true
 else
   log "Phase 6: Notify skipped"
 fi

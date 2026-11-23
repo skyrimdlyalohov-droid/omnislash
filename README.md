@@ -615,6 +615,49 @@ go run ./cmd/omnislashd -config examples/daemon/daemon-cache-tunnel.json -once
 `<script>alert(1)</script>`. Лаба была доведена до `Solved`; так как инстанс
 одноразовый, для новой лабы замените хост в обоих JSON-файлах.
 
+## Эшелоны пайплайна
+
+Поверх транспортного ядра работают четыре эшелона. Каждый следующий использует
+результаты предыдущего, но не ослабляет safety-инварианты: fail-closed scope,
+глобальный лимит, stop statuses, карантин `unverified` и прямой выход `probe/`
+в обход Caido MITM.
+
+```text
+targets_verified.json ──> planner ──> MatrixScheduler (Targets × Proxies)
+                                            │
+              InfantryTier ─────────────────┤──── SniperTier
+              OSINT/calibration                   Last-Byte Sync
+              layer/WAF profiles                  cross-proxy verifier
+                    │                                  │
+                    └──────> ChainSynthesizer <────────┘
+                                     │
+                              ddmin + minimal artifact
+                                     │
+                         Caido Replay + Telegram + audit
+```
+
+| Эшелон | Задача | Ключевые модули | Запуск |
+|---|---|---|---|
+| 1 | Meta-controller, дифференциальная проверка, radar изменений периметра | `research/oracle.py`, `research/meta_controller.py`, `research/verifier.py`, `osint/diff_scanner.py`, `lab/run-radar.sh` | `make radar TARGET=example.com RADAR_ARGS="--skip-notify"` |
+| 2 | Локальный 0-day инкубатор, WAF grammar, Universal Keys, глобальная проекция | `research/knowledge_base.py`, `research/waf_inference.py`, `sandbox/`, `lab/run-incubator.sh`, `osint/global_projector.py` | `make incubate INCUBATE_ARGS="--skip-docker"`, `make project TECH="nginx+python+h1.1"` |
+| 3 | Двухлиговый пул, `N×M` планировщик, дифференциальный анализ прослоек | `proxy.go`, `pool.go`, `dialer.go`, `daemon/matrix_scheduler.go`, `research/layer_analyzer.py` | встроено в `omnislashd` и `research/`; проверка — `go test ./... -count=1` |
+| 4 | Реконструкция состояний, синтез цепочек, игровой арбитраж, минимальные артефакты | `research/state_and_chains.py`, `research/game_arbitrage.py`, `osint/caido_bridge.py`, `osint/notifier.py` | встроено в post-processing; проверка — `python3 -m unittest discover -s research -p "test_*.py"` |
+
+Ключевые инварианты эшелонов 3/4:
+
+- `SniperTier` — только `http_parsing` admission, `IQR < 20ms`, минимум три
+  замера и отсутствие бана за последний час. Фоновые OSINT-задачи в этот резерв
+  не допускаются; `AcquireSniper` не откатывается на Infantry.
+- Matrix scheduler держит `per_host_min_interval = 3s + jitter`; на `429` или
+  аномалию окно хоста уменьшается вдвое, хост уходит в кулдаун, суммарный RPS
+  распределяется по разным целям, а не по одной.
+- `ChainSynthesizer` принимает только подтверждённые находки; `unverified`
+  попадают в `skipped` и не участвуют в достижимости. `z3` опционален —
+  без него работает детерминированный BFS.
+- Любая находка перед отправкой в Caido/Telegram сжимается `ddmin` до
+  1-минимального запроса; отчёт `omnislash.minimal-artifact/v1` содержит
+  sha256, diff ответа, атрибуцию прокси и шаги Replay, но не генеративный текст.
+
 ## Ротация, здоровье и кулдауны
 
 - Health-check открывает туннель и делает `GET probe_url`. Успех — прокси
@@ -660,6 +703,21 @@ make test
 make race
 make vet
 make lint
+
+# Python-контуры (OSINT + research/Echelon 1-4)
+python3 -m unittest discover -s osint -p "test_*.py"
+python3 -m unittest discover -s research -p "test_*.py"
+
+# Adaptive probing: compact O(log2 N) diagnostic -> telemetry strike
+python3 osint/planner.py --in targets_verified.json --out jobs.json --adaptive --adaptive-plan-out adaptive-plan.json
+# после запуска omnislashd:
+python3 osint/planner.py --in targets_verified.json --out jobs.strike.json --adaptive --adaptive-telemetry omnislashd-audit.jsonl
+
+# Локальный E2E smoke без интернета
+bash lab/e2e_smoke_test.sh
+
+# Чистота патча
+git diff --check
 ```
 
 Тесты поднимают локальные fake SOCKS5/CONNECT/TLS-серверы и проверяют

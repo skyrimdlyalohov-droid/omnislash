@@ -140,12 +140,18 @@ func (d *Dialer) dialProxyRaw(ctx context.Context, pr *Proxy, target string) (ne
 	if err := pr.acquire(ctx); err != nil {
 		return nil, err
 	}
+	handshake := d.pool.cfg.HandshakeTimeout.Std()
+	if pr.Tier() == TierInfantry && pr.P90Latency() > 0 {
+		if cut := pr.AdaptiveTimeout(); cut > 0 && cut < handshake {
+			handshake = cut
+		}
+	}
 	conn, err := dialThroughProxy(
 		ctx,
 		d.base,
 		pr,
 		target,
-		d.pool.cfg.HandshakeTimeout.Std(),
+		handshake,
 		d.pool.cfg.ProxyTLSSkipVerify,
 	)
 	if err != nil {
@@ -153,6 +159,26 @@ func (d *Dialer) dialProxyRaw(ctx context.Context, pr *Proxy, target string) (ne
 		return nil, err
 	}
 	return &trackedConn{Conn: conn, release: pr.release, proxy: pr}, nil
+}
+
+// DialSniperContext dials a target through a SniperTier proxy only. It is the
+// transport entry point for final synchronized series and cross-proxy
+// verification, and it never silently falls back to Infantry.
+func (d *Dialer) DialSniperContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("omnislash: unsupported network %q", network)
+	}
+	target, err := d.pool.scope.CheckTarget(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	pr, err := d.pool.AcquireSniper(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return d.dialProxy(ctx, pr, target)
 }
 
 // DialTLSContext dials target through the pool and performs a TLS handshake.

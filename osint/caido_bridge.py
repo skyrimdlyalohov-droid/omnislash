@@ -43,6 +43,56 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
     return items
 
 
+def load_adaptive_artifacts(path: str) -> Dict[str, Dict[str, Any]]:
+    """Index ``omnislash.minimal-artifact/v1`` records by host."""
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        items = obj.get("artifacts") or obj.get("minimal_artifacts") or []
+        if not items and obj.get("schema") == "omnislash.minimal-artifact/v1":
+            items = [obj]
+    elif isinstance(obj, list):
+        items = obj
+    else:
+        items = []
+    index: Dict[str, Dict[str, Any]] = {}
+    for art in items:
+        if not isinstance(art, dict):
+            continue
+        host = str(art.get("host") or art.get("target") or "").strip().lower()
+        if not host:
+            continue
+        index[host] = art
+        index[host.split(":")[0]] = art
+    return index
+
+
+def attach_adaptive_artifact(
+    record: Dict[str, Any],
+    finding: Dict[str, Any],
+    artifacts: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not artifacts or finding.get("minimal_artifact"):
+        return finding
+    candidates = [
+        str(record.get("target") or ""),
+        str(finding.get("host") or ""),
+        str(finding.get("target") or ""),
+    ]
+    for host in candidates:
+        host = host.strip().lower()
+        if not host:
+            continue
+        artifact = artifacts.get(host) or artifacts.get(host.split(":")[0])
+        if artifact:
+            enriched = dict(finding)
+            enriched["minimal_artifact"] = artifact
+            return enriched
+    return finding
+
+
 def is_unverified(record: Dict[str, Any], finding: Dict[str, Any]) -> bool:
     if record.get("unverified") is True:
         return True
@@ -106,6 +156,7 @@ def build_replay_payload(record: Dict[str, Any], finding: Dict[str, Any]) -> Dic
             "statuses": record.get("statuses", []),
         },
         "raw_response_hint": raw_hint,
+        "minimal_artifact": finding.get("minimal_artifact"),
         "note": "Replay via Caido with same exit IP by setting gateway.proxy_pin_header to proxy_label.",
     }
 
@@ -143,11 +194,17 @@ def send_to_caido(client: CaidoClient, payload: Dict[str, Any]) -> Dict[str, Any
     return {"ok": False, "error": last_err, "payload": payload}
 
 
-def process_records(records: Iterable[Dict[str, Any]], client: CaidoClient, seen: Set[str] = None) -> List[Dict[str, Any]]:
+def process_records(
+    records: Iterable[Dict[str, Any]],
+    client: CaidoClient,
+    seen: Set[str] = None,
+    artifacts: Dict[str, Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     seen = seen if seen is not None else set()
     out = []
     for rec in records:
         for finding in confirmed_findings(rec):
+            finding = attach_adaptive_artifact(rec, finding, artifacts or {})
             key = finding_key(rec, finding)
             if key in seen:
                 continue
@@ -157,7 +214,13 @@ def process_records(records: Iterable[Dict[str, Any]], client: CaidoClient, seen
     return out
 
 
-def watch_file(path: str, client: CaidoClient, interval: float = 2.0, once: bool = False) -> List[Dict[str, Any]]:
+def watch_file(
+    path: str,
+    client: CaidoClient,
+    interval: float = 2.0,
+    once: bool = False,
+    artifacts: Dict[str, Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     seen: Set[str] = set()
     offset = 0
     results: List[Dict[str, Any]] = []
@@ -179,7 +242,7 @@ def watch_file(path: str, client: CaidoClient, interval: float = 2.0, once: bool
                         recs.append(obj)
                 except Exception:
                     pass
-            results.extend(process_records(recs, client, seen))
+            results.extend(process_records(recs, client, seen, artifacts=artifacts))
         if once:
             break
         time.sleep(interval)
@@ -193,11 +256,13 @@ def main(argv=None):
     ap.add_argument("--pat", default=os.environ.get("CAIDO_PAT", ""))
     ap.add_argument("--watch", action="store_true")
     ap.add_argument("--interval", type=float, default=2.0)
+    ap.add_argument("--adaptive-artifacts", default="", help="JSON artifacts from GroupTestSplitter/ddmin")
     ap.add_argument("--out", default="", help="optional output JSON report")
     args = ap.parse_args(argv)
 
     client = CaidoClient(url=args.url, pat=args.pat)
-    results = watch_file(args.audit, client, interval=args.interval, once=not args.watch)
+    artifacts = load_adaptive_artifacts(args.adaptive_artifacts)
+    results = watch_file(args.audit, client, interval=args.interval, once=not args.watch, artifacts=artifacts)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)

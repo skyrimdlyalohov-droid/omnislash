@@ -1,0 +1,49 @@
+# Local 0-day incubator stacks - no internet egress required for fuzzing.
+# Use with: docker compose -f sandbox/docker-compose.stacks.yml up -d
+name: omnislash-incubator
+
+services:
+  backend-python:
+    image: python:3.12-alpine
+    command: ["python", "-m", "http.server", "8000"]
+    networks: [incubator]
+    ports:
+      - "127.0.0.1:18001:8000"
+
+  backend-node:
+    image: node:22-alpine
+    command: ["node", "-e", "require('http').createServer((req,res)=>{let b='';req.on('data',c=>b+=c);req.on('end',()=>res.end('ok:'+req.method+':'+req.url+':'+b.length));}).listen(8000)"]
+    networks: [incubator]
+    ports:
+      - "127.0.0.1:18002:8000"
+
+  nginx-front:
+    image: nginx:1.27-alpine
+    depends_on: [backend-python]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks: [incubator]
+    ports:
+      - "127.0.0.1:18080:80"
+
+  haproxy-front:
+    image: haproxy:3.0-alpine
+    depends_on: [backend-node]
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks: [incubator]
+    ports:
+      - "127.0.0.1:18081:8080"
+
+  envoy-front:
+    image: envoyproxy/envoy:v1.31-latest
+    depends_on: [backend-python]
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+    networks: [incubator]
+    ports:
+      - "127.0.0.1:18082:8080"
+
+networks:
+  incubator:
+    driver: bridge

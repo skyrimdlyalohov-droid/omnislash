@@ -81,6 +81,13 @@ type JobConfig struct {
 	Hold             omnislash.Duration `json:"hold"`
 	NeighborShiftNCD float64            `json:"neighbor_shift_ncd"`
 
+	// Raw replay / universal key fields.
+	RawPayloadB64 string `json:"raw_payload_b64"`
+	RawPayloadHex string `json:"raw_payload_hex"`
+
+	// Upgrade-desync fields.
+	UpgradeType string `json:"upgrade_type"` // websocket, grpc, h2c
+
 	// Attempts is the number of probe runs inside one scheduled execution.
 	Attempts int `json:"attempts"`
 	// UntilSuccess stops retrying this job once it succeeds, and with
@@ -150,7 +157,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("daemon: job %q: tls must be h1, h2 or none", j.Name)
 		}
 		switch j.Probe {
-		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel", "differential-fuzz":
+		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel", "differential-fuzz", "raw-replay", "upgrade-desync":
 		default:
 			return fmt.Errorf("daemon: job %q: unsupported probe %q", j.Name, j.Probe)
 		}
