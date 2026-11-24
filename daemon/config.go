@@ -37,6 +37,15 @@ type Config struct {
 	// ControlAddr enables a localhost control endpoint (/healthz, /status).
 	ControlAddr string `json:"control_addr"`
 
+	// LearningEnabled turns on the audit-log feedback loop. Nil means enabled:
+	// the daemon reads its own JSONL audit log at startup and uses observed
+	// success rates to rank variants and mutations on subsequent attempts.
+	LearningEnabled *bool `json:"learning_enabled,omitempty"`
+	// LearningSources are additional audit JSONL files to replay at startup.
+	// Paths are resolved against the daemon config directory. The daemon's own
+	// log_file is always included in addition to these.
+	LearningSources []string `json:"learning_sources,omitempty"`
+
 	Jobs []JobConfig `json:"jobs"`
 }
 
@@ -58,15 +67,41 @@ type JobConfig struct {
 	// Probe is "smuggle-chain", "smuggle", "race" or "h2race".
 	Probe string `json:"probe"`
 
-	Variant         string `json:"variant"`
-	VictimMethod    string `json:"victim_method"`
-	VictimPath      string `json:"victim_path"`
+	Variant      string `json:"variant"`
+	VictimMethod string `json:"victim_method"`
+	VictimPath   string `json:"victim_path"`
+
+	// Smuggled request fields for the TE.CL variant of smuggle-chain and the
+	// H2.CL probe. Smuggled* describe the HTTP/1.1 request carried in the
+	// surplus DATA; Body, when set, is written verbatim instead.
+	SmuggledMethod string `json:"smuggled_method"`
+	SmuggledPath   string `json:"smuggled_path"`
+	SmuggledHost   string `json:"smuggled_host"`
+	SmuggledBody   string `json:"smuggled_body"`
+	SmuggledPrefix string `json:"smuggled_prefix"`
+	Body           string `json:"body"`
+
+	// H2.CL fields. DeclaredLength is the HTTP/2 content-length header; the
+	// surplus DATA is the smuggled request. Authority overrides :authority.
+	DeclaredLength  int    `json:"declared_length"`
+	DeclaredLengths []int  `json:"declared_lengths"`
+	Authority       string `json:"authority"`
+	Scheme          string `json:"scheme"`
+	// SameConnectionVictim reuses the poisoned h2 connection; SkipVictim leaves
+	// the smuggled response for the lab's real browser.
+	SameConnectionVictim bool               `json:"same_connection_victim"`
+	SkipVictim           bool               `json:"skip_victim"`
+	HoldAfterPoison      omnislash.Duration `json:"hold_after_poison"`
+	ReadExtraStream      bool               `json:"read_extra_stream"`
+
 	SuccessContains string `json:"success_contains"`
 	// SuccessFinding requires a finding of this kind. It is how a job states
 	// "cache_poisoned", not merely "the probe completed".
 	SuccessFinding string   `json:"success_finding"`
 	PoisonPath     string   `json:"poison_path"`
 	GadgetPath     string   `json:"gadget_path"`
+	Host           string   `json:"host"`
+	TunnelHost     string   `json:"tunnel_host"`
 	PaddingPaths   []string `json:"padding_paths"`
 	Count          int      `json:"count"`
 	Method         string   `json:"method"`
@@ -94,10 +129,11 @@ type JobConfig struct {
 	// exit_on_success stops the daemon.
 	UntilSuccess bool `json:"until_success"`
 
-	Interval   omnislash.Duration `json:"interval"`
-	Timeout    omnislash.Duration `json:"timeout"`
-	Idle       omnislash.Duration `json:"idle"`
-	RetryDelay omnislash.Duration `json:"retry_delay"`
+	Interval    omnislash.Duration `json:"interval"`
+	Timeout     omnislash.Duration `json:"timeout"`
+	Idle        omnislash.Duration `json:"idle"`
+	RetryDelay  omnislash.Duration `json:"retry_delay"`
+	VictimDelay omnislash.Duration `json:"victim_delay"`
 }
 
 // LoadConfig reads path and resolves relative file paths against its directory.
@@ -114,6 +150,9 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.OmnislashConfig = resolvePath(base, cfg.OmnislashConfig)
 	cfg.Proxies = resolvePath(base, cfg.Proxies)
 	cfg.LogFile = resolvePath(base, cfg.LogFile)
+	for i, src := range cfg.LearningSources {
+		cfg.LearningSources[i] = resolvePath(base, src)
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -157,7 +196,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("daemon: job %q: tls must be h1, h2 or none", j.Name)
 		}
 		switch j.Probe {
-		case "smuggle-chain", "smuggle", "race", "h2race", "h2-tunnel", "differential-fuzz", "raw-replay", "upgrade-desync":
+		case "smuggle-chain", "smuggle", "race", "h2race", "h2-cl", "h2-tunnel", "differential-fuzz", "raw-replay", "upgrade-desync":
 		default:
 			return fmt.Errorf("daemon: job %q: unsupported probe %q", j.Name, j.Probe)
 		}
@@ -170,10 +209,13 @@ func (c *Config) Validate() error {
 		if j.Probe == "h2-tunnel" && j.tlsMode() != "h2" {
 			return fmt.Errorf("daemon: job %q: h2-tunnel requires tls=h2", j.Name)
 		}
+		if j.Probe == "h2-cl" && j.tlsMode() != "h2" {
+			return fmt.Errorf("daemon: job %q: h2-cl requires tls=h2", j.Name)
+		}
 		if j.Probe == "smuggle" && j.Variant == string(probe.VariantH2Downgrade) && j.tlsMode() != "h2" {
 			return fmt.Errorf("daemon: job %q: h2.downgrade requires tls=h2", j.Name)
 		}
-		if j.Interval.Std() < 0 || j.Timeout.Std() < 0 || j.Idle.Std() < 0 || j.RetryDelay.Std() < 0 {
+		if j.Interval.Std() < 0 || j.Timeout.Std() < 0 || j.Idle.Std() < 0 || j.RetryDelay.Std() < 0 || j.VictimDelay.Std() < 0 || j.HoldAfterPoison.Std() < 0 {
 			return fmt.Errorf("daemon: job %q: durations must not be negative", j.Name)
 		}
 	}
@@ -183,6 +225,12 @@ func (c *Config) Validate() error {
 // IsEnabled reports whether the job should run. Jobs are enabled by default.
 func (j *JobConfig) IsEnabled() bool {
 	return j.Enabled == nil || *j.Enabled
+}
+
+// IsLearningEnabled reports whether the audit feedback loop is active. Nil
+// means enabled, so existing configs gain learning without a schema change.
+func (c *Config) IsLearningEnabled() bool {
+	return c.LearningEnabled == nil || *c.LearningEnabled
 }
 
 func (j *JobConfig) interval() time.Duration {

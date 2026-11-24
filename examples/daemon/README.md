@@ -1,5 +1,53 @@
 # Daemon lab configs
 
+## Learning from audit logs
+
+The daemon re-reads its `log_file` at startup. Each record now carries a
+`learning` label (`host`, `variant`, `mutation`, `tech_stack`, `finding`), and
+the daemon ranks `variant: "auto"` choices and `differential-fuzz` mutations by
+the smoothed success rate from those records. `learning_sources` can point to
+previous labs' audit files; their technique-level success becomes a global
+prior (`host: "*"`) that is overridden by evidence from the current host. The
+source JSON is never mutated; `GET /experience` on `control_addr` shows the
+learned cells. Set `"learning_enabled": false` to disable the feedback loop.
+
+## H2.CL (HTTP/2 downgrade desync)
+
+`daemon-h2-cl.json` sends HEADERS with a deliberately short
+`declared_length` and a DATA frame carrying a full HTTP/1.1 request. A
+front-end that downgrades to HTTP/1.1 while trusting the declared length leaves
+the surplus DATA bytes on its back-end connection; the victim's next request
+receives the smuggled response. The DATA can be rendered from `smuggled_*`
+fields or supplied byte-exactly in `body`; the latter is needed when the
+smuggled request's own `Content-Length` must intentionally differ from the
+literal bytes that follow it. No base64 Universal Key is needed.
+
+For the lab pattern, the exploit-server file is stored at `/resources` and the
+smuggled request declares `Content-Length: 5` while carrying the literal body
+`x=1`. With `skip_victim: true`, the poisoned response is left queued for the
+real browser; `hold_after_poison` can keep the client socket open while the
+victim visits. `same_connection_victim`, `read_extra_stream`, `victim_delay`,
+`declared_lengths`, `scheme` and `smuggled_prefix` are diagnostic switches used
+while mapping a new front-end. They are not proof by themselves: the success
+marker must still appear in a victim response or the lab status must change.
+
+The full lab case — including provenance, the exact evidence files and the
+negative results — lives in [`playbooks/h2-cl-resources-redirect.json`](../../playbooks/h2-cl-resources-redirect.json).
+It can be imported into the zero-day vault with
+`research/knowledge_base.py import-playbook`, or loaded as a provenance-tagged
+ordering prior with `omnislashd -playbook ...`. See
+[`playbooks/README.md`](../../playbooks/README.md) for the honest boundary
+between replay and learning.
+
+## TE.CL chain (front-end security control bypass)
+
+`daemon-tecl-chain.json` builds the TE.CL payload from structured fields — no
+base64 Universal Key needed. The front-end honours `Transfer-Encoding`, the
+back-end honours `Content-Length: 4`, and the chunk data is parsed by the
+back-end as a second request. Set `smuggled_path`, `smuggled_host` and
+`success_contains` for the target lab; `variant: "te.cl"` selects this mode.
+Every stage uses a separate connection from the same pinned session.
+
 ## HTTP request smuggling, basic CL.TE
 
 - `config.lab.json` — transport: trusted tier, direct egress, scope locked to

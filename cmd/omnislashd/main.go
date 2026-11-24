@@ -23,6 +23,7 @@ import (
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
 	"github.com/skyrimdlyalohov-droid/omnislash/daemon"
+	"github.com/skyrimdlyalohov-droid/omnislash/playbook"
 	"github.com/skyrimdlyalohov-droid/omnislash/probe"
 )
 
@@ -37,12 +38,17 @@ func main() {
 
 func run() error {
 	var (
-		configPath = flag.String("config", "", "daemon config file")
-		once       = flag.Bool("once", false, "run every job once and exit")
-		jobName    = flag.String("job", "", "run only this job once and exit")
-		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
-		versionOut = flag.Bool("version", false, "print version")
+		configPath    = flag.String("config", "", "daemon config file")
+		once          = flag.Bool("once", false, "run every job once and exit")
+		jobName       = flag.String("job", "", "run only this job once and exit")
+		logLevel      = flag.String("log-level", "info", "debug|info|warn|error")
+		versionOut    = flag.Bool("version", false, "print version")
+		playbookPaths []string
 	)
+	flag.Func("playbook", "curated playbook case JSON; seeds experience with a provenance-tagged prior (repeatable)", func(path string) error {
+		playbookPaths = append(playbookPaths, path)
+		return nil
+	})
 	flag.Parse()
 	if *versionOut {
 		fmt.Println("omnislashd", version)
@@ -86,6 +92,14 @@ func run() error {
 	d, err := daemon.New(cfg, runners, logger, audit)
 	if err != nil {
 		return err
+	}
+	for _, path := range playbookPaths {
+		caseFile, err := playbook.Load(path)
+		if err != nil {
+			return err
+		}
+		d.Learn(caseFile.Seeds())
+		logger.Info("playbook loaded", "path", path, "id", caseFile.ID, "provenance", caseFile.Provenance.Kind)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

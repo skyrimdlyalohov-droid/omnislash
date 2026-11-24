@@ -8,7 +8,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from research.knowledge_base import add_universal_key, find_keys_for_stack, load_vault, save_vault, tech_stack_hash
+from research.knowledge_base import (
+    add_universal_key,
+    find_keys_for_stack,
+    import_playbook,
+    load_vault,
+    save_vault,
+    tech_stack_hash,
+)
 from osint.planner import build_daemon_config
 
 
@@ -62,6 +69,41 @@ class TestKnowledgeBase(unittest.TestCase):
             self.assertTrue(jobs[0].get("raw_payload_b64"))
             self.assertEqual(jobs[0]["metadata"]["universal_key"]["tech_stack_hash"], "nginx+python+h1.1")
             self.assertEqual(jobs[0]["metadata"]["gittins_index"], 9999.0)
+
+    def test_import_playbook_emits_h2_cl_job(self):
+        case_path = os.path.join(REPO_ROOT, "playbooks", "h2-cl-resources-redirect.json")
+        with open(case_path, "r", encoding="utf-8") as f:
+            case = json.load(f)
+        with tempfile.TemporaryDirectory() as td:
+            vault_path = os.path.join(td, "vault.json")
+            vault = load_vault(vault_path)
+            entry = import_playbook(vault, case, template="verify")
+            save_vault(vault, vault_path)
+            loaded = load_vault(vault_path)
+            self.assertEqual(entry["technique"], "h2-cl")
+            self.assertEqual(entry["tls"], "h2")
+            self.assertEqual(entry["provenance"], "solution-derived")
+            self.assertFalse(entry["metadata"]["autonomous_discovery"])
+            self.assertEqual(entry["metadata"]["case_id"], "h2-cl-resources-redirect")
+
+            targets = [{
+                "target": "h2.example.com",
+                "known_ports": [443],
+                "tech": ["nginx", "h2"],
+                "exploit_host": "exploit.example.net",
+                "is_honeypot": False,
+                "deception_risk": "low",
+            }]
+            cfg = build_daemon_config(targets, vault=loaded)
+            jobs = [j for j in cfg["jobs"] if j["probe"] == "h2-cl"]
+            self.assertEqual(len(jobs), 1)
+            job = jobs[0]
+            self.assertEqual(job["tls"], "h2")
+            self.assertEqual(job["declared_length"], 0)
+            self.assertIn("Host: exploit.example.net", job["body"])
+            self.assertFalse(job["skip_victim"])
+            self.assertEqual(job["success_contains"], "alert(document.cookie)")
+            self.assertEqual(job["metadata"]["universal_key"]["provenance"], "solution-derived")
 
     def test_tech_stack_hash(self):
         self.assertEqual(tech_stack_hash(["Envoy", "Gunicorn"]), "envoy+gunicorn")

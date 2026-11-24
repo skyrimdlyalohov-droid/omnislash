@@ -54,9 +54,10 @@ type Daemon struct {
 	audit io.Writer
 	now   func() time.Time
 
-	mu      sync.Mutex
-	states  map[string]*JobState
-	auditMu sync.Mutex
+	mu       sync.Mutex
+	states   map[string]*JobState
+	auditMu  sync.Mutex
+	learning *ExperienceStore
 
 	slots  chan struct{}
 	wg     sync.WaitGroup
@@ -83,19 +84,41 @@ func New(cfg *Config, exec Executor, logger *slog.Logger, audit io.Writer) (*Dae
 		conc = 1
 	}
 	d := &Daemon{
-		cfg:    *cfg,
-		exec:   exec,
-		log:    logger,
-		audit:  audit,
-		now:    time.Now,
-		slots:  make(chan struct{}, conc),
-		states: make(map[string]*JobState, len(cfg.Jobs)),
+		cfg:      *cfg,
+		exec:     exec,
+		log:      logger,
+		audit:    audit,
+		now:      time.Now,
+		slots:    make(chan struct{}, conc),
+		states:   make(map[string]*JobState, len(cfg.Jobs)),
+		learning: NewExperienceStore(""),
+	}
+	if cfg.IsLearningEnabled() {
+		d.learning = NewExperienceStore(cfg.LogFile)
+		if err := d.learning.Load(); err != nil {
+			logger.Warn("experience load failed", "path", cfg.LogFile, "error", err)
+		}
+		sources := append([]string(nil), cfg.LearningSources...)
+		if err := d.learning.LoadFiles(sources); err != nil {
+			logger.Warn("experience sources load failed", "sources", sources, "error", err)
+		}
+		logger.Info("experience loaded", "own_log", cfg.LogFile, "sources", sources, "cells", len(d.learning.Summary()))
 	}
 	for i := range cfg.Jobs {
 		j := &cfg.Jobs[i]
 		d.states[j.Name] = &JobState{Name: j.Name}
 	}
 	return d, nil
+}
+
+// Learn adds curated playbook priors to the same ranking table as audit
+// records. It is a no-op when learning is disabled. Seeds keep their own
+// counters and provenance, so /experience never mistakes them for observations.
+func (d *Daemon) Learn(seeds []ExperienceSeed) {
+	if d == nil || d.learning == nil || !d.cfg.IsLearningEnabled() {
+		return
+	}
+	d.learning.Seed(seeds)
 }
 
 // Run schedules jobs until ctx is cancelled or exit_on_success fires. A
@@ -264,14 +287,18 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 		if err := ctx.Err(); err != nil {
 			return Outcome{Job: j.Name, Result: last, Err: err}
 		}
-		p, err := buildProbe(j)
+		// Learning changes the *attempt*, not the declared job: the original
+		// config stays as the operator wrote it, while each attempt uses the
+		// currently best-ranked variant or mutation.
+		attemptJob := d.applyLearning(j)
+		p, err := buildProbe(&attemptJob)
 		if err != nil {
-			d.record(j, attempt, nil, err, false)
+			d.record(&attemptJob, attempt, nil, err, false)
 			return Outcome{Job: j.Name, Result: last, Err: err}
 		}
-		res, err := d.exec.Run(ctx, target, p, j.tlsMode())
-		success := jobSucceeded(j, res, err)
-		d.record(j, attempt, res, err, success)
+		res, err := d.exec.Run(ctx, target, p, attemptJob.tlsMode())
+		success := jobSucceeded(&attemptJob, res, err)
+		d.record(&attemptJob, attempt, res, err, success)
 		last, lastErr = res, err
 		if success {
 			d.log.Info("job succeeded", "job", j.Name, "attempt", attempt)
@@ -285,6 +312,82 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 	}
 	d.log.Warn("job finished without success", "job", j.Name, "attempts", attempts, "error", lastErr)
 	return Outcome{Job: j.Name, Result: last, Err: lastErr}
+}
+
+// applyLearning returns a per-attempt copy of the job with learned choices
+// applied. The stored config is never mutated, so a human can always reproduce
+// the exact declared experiment from the JSON file.
+func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
+	c := *j
+	if d == nil || d.learning == nil || !d.cfg.IsLearningEnabled() {
+		return c
+	}
+	host := c.Target.Host
+	if host == "" {
+		host = hostFromAddr(c.Target.Addr)
+	}
+	tech := ""
+	if len(c.TechStack) > 0 {
+		tech = probe.TechStackHash(c.TechStack)
+	}
+	base := ExperienceKey{
+		Host:      host,
+		TLS:       c.tlsMode(),
+		Probe:     c.Probe,
+		TechStack: tech,
+	}
+
+	if c.Probe == "differential-fuzz" {
+		candidates := c.Mutations
+		if len(candidates) == 0 {
+			mutator := probe.Mutator{TechStack: c.TechStack}
+			for _, m := range mutator.Mutations() {
+				candidates = append(candidates, m.Name)
+			}
+		}
+		c.Mutations = d.learning.RankMutations(base, candidates)
+	}
+
+	if c.Variant == "auto" {
+		var candidates []string
+		switch c.Probe {
+		case "smuggle":
+			candidates = []string{string(probe.VariantCLTE), string(probe.VariantTECL), string(probe.VariantTETE)}
+			if c.tlsMode() == "h2" {
+				candidates = append(candidates, string(probe.VariantH2Downgrade))
+			}
+		case "smuggle-chain":
+			candidates = []string{string(probe.VariantCLTE), string(probe.VariantTECL)}
+		}
+		if len(candidates) > 0 {
+			c.Variant = d.learning.Rank(base, candidates)[0]
+		}
+	}
+	return c
+}
+
+// learningMeta extracts the stable training label from an attempt. Full
+// evidence remains in Result, which is also written to the audit line.
+func learningMeta(j *JobConfig, res *probe.Result) LearningMeta {
+	host := j.Target.Host
+	if host == "" {
+		host = hostFromAddr(j.Target.Addr)
+	}
+	tech := ""
+	if len(j.TechStack) > 0 {
+		tech = probe.TechStackHash(j.TechStack)
+	}
+	meta := LearningMeta{Host: host, Variant: j.Variant, TechStack: tech}
+	if res != nil {
+		meta.Mutation = res.Mutation
+		for _, f := range res.Findings {
+			if f.Confidence == probe.ConfidenceHigh || f.Confidence == probe.ConfidenceMedium {
+				meta.Finding = f.Kind
+				break
+			}
+		}
+	}
+	return meta
 }
 
 // jobSucceeded decides whether one probe run met the declared goal. With a
@@ -339,18 +442,20 @@ type Record struct {
 	Attribution probe.Attribution `json:"attribution"`
 	Findings    []probe.Finding   `json:"findings,omitempty"`
 	Statuses    []int             `json:"statuses,omitempty"`
+	Learning    LearningMeta      `json:"learning,omitempty"`
 	Result      *probe.Result     `json:"result,omitempty"`
 }
 
 func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error, success bool) {
 	rec := Record{
-		Time:    d.now(),
-		Job:     j.Name,
-		Attempt: attempt,
-		Target:  j.Target.Addr,
-		Probe:   j.Probe,
-		TLS:     j.tlsMode(),
-		Success: success,
+		Time:     d.now(),
+		Job:      j.Name,
+		Attempt:  attempt,
+		Target:   j.Target.Addr,
+		Probe:    j.Probe,
+		TLS:      j.tlsMode(),
+		Success:  success,
+		Learning: learningMeta(j, res),
 	}
 	if err != nil {
 		rec.Error = err.Error()
@@ -372,6 +477,9 @@ func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error,
 			d.auditMu.Unlock()
 		}
 	}
+	if d.learning != nil && d.cfg.IsLearningEnabled() {
+		d.learning.Observe(rec)
+	}
 }
 
 func buildProbe(j *JobConfig) (probe.Probe, error) {
@@ -380,8 +488,13 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 	switch j.Probe {
 	case "smuggle-chain":
 		return &probe.SmuggleChainProbe{
+			Variant:         probe.SmuggleVariant(j.Variant),
 			VictimMethod:    j.VictimMethod,
 			VictimPath:      j.VictimPath,
+			SmuggledMethod:  j.SmuggledMethod,
+			SmuggledPath:    j.SmuggledPath,
+			SmuggledHost:    j.SmuggledHost,
+			SmuggledBody:    j.SmuggledBody,
 			SuccessContains: j.SuccessContains,
 			Attempts:        j.attempts(),
 			Timeout:         timeout,
@@ -411,10 +524,43 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 			Idle:      idle,
 			SingleUse: j.SingleUse,
 		}, nil
+	case "h2-cl":
+		var body []byte
+		if j.Body != "" {
+			body = []byte(j.Body)
+		}
+		return &probe.H2CLProbe{
+			DeclaredLength:       j.DeclaredLength,
+			DeclaredLengths:      j.DeclaredLengths,
+			Body:                 body,
+			Method:               j.Method,
+			Path:                 j.Path,
+			Authority:            j.Authority,
+			Scheme:               j.Scheme,
+			SmuggledMethod:       j.SmuggledMethod,
+			SmuggledPath:         j.SmuggledPath,
+			SmuggledHost:         j.SmuggledHost,
+			SmuggledBody:         j.SmuggledBody,
+			SmuggledPrefix:       j.SmuggledPrefix,
+			VictimMethod:         j.VictimMethod,
+			VictimPath:           j.VictimPath,
+			SameConnectionVictim: j.SameConnectionVictim,
+			SkipVictim:           j.SkipVictim,
+			HoldAfterPoison:      j.HoldAfterPoison.Std(),
+			ReadExtraStream:      j.ReadExtraStream,
+			SuccessContains:      j.SuccessContains,
+			Attempts:             j.attempts(),
+			RetryDelay:           j.RetryDelay.Std(),
+			VictimDelay:          j.VictimDelay.Std(),
+			Timeout:              timeout,
+			Idle:                 idle,
+		}, nil
 	case "h2-tunnel":
 		return &probe.H2TunnelProbe{
 			PoisonPath:   j.PoisonPath,
 			GadgetPath:   j.GadgetPath,
+			Host:         j.Host,
+			TunnelHost:   j.TunnelHost,
 			PaddingPaths: j.PaddingPaths,
 			Marker:       j.SuccessContains,
 			Timeout:      timeout,
@@ -490,6 +636,16 @@ func (d *Daemon) serveControl(ctx context.Context) {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(map[string]any{"jobs": d.Status()})
+	})
+	mux.HandleFunc("/experience", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if d.learning == nil {
+			_ = enc.Encode(map[string]any{"enabled": false, "cells": []ExperienceStat{}})
+			return
+		}
+		_ = enc.Encode(map[string]any{"enabled": d.cfg.IsLearningEnabled(), "cells": d.learning.Summary()})
 	})
 	srv := &http.Server{Addr: d.cfg.ControlAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
