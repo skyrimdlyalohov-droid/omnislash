@@ -237,5 +237,73 @@ class OnlineLoopTests(unittest.TestCase):
         self.assertEqual(weights["online"]["negative"], 2)
 
 
+    def test_proxy_failure_is_counted_but_never_trains_or_publishes(self):
+        before = load_weights(self.weights_path)["global"]["cl:2"]["attempts"]
+        record = _audit_record(1, cl=2)
+        record["result"]["responses"] = []
+        record["outcome"] = "Proxy Failed"
+        record["error"] = "no usable proxy"
+
+        result = self.loop.process_record(record)
+        self.assertEqual(result["outcome"], "Proxy Failed")
+        self.assertFalse(result["applied"])
+        self.assertFalse(result["confirmed"])
+
+        weights = load_weights(self.weights_path)
+        self.assertEqual(weights["global"]["cl:2"]["attempts"], before)
+        self.assertEqual(weights["online"]["outcomes"]["proxy-failed"], 1)
+        self.assertEqual(self.loop.write_status(weights)["outcomes"]["proxy-failed"], 1)
+        self.assertFalse(os.path.exists(self.jobs_path))
+
+    def test_waf_event_is_a_weak_negative_signal(self):
+        before = load_weights(self.weights_path)["global"]["cl:5"]["attempts"]
+        record = _audit_record(2, cl=5, path="/weak-waf", parser_reject=False)
+        record["result"]["responses"] = [{
+            "status": 403, "body": "captcha challenge",
+            "headers": [{"key": "cf-ray", "value": "edge-1"}],
+        }]
+        record["outcome"] = "WAF Blocked"
+
+        result = self.loop.process_record(record)
+        self.assertEqual(result["outcome"], "WAF Blocked")
+        self.assertEqual(result["strength"], 0.25)
+        self.assertFalse(result["confirmed"])
+
+        weights = load_weights(self.weights_path)
+        self.assertEqual(weights["global"]["cl:5"]["attempts"], before + 1)
+        self.assertEqual(weights["online"]["last_strength"], 0.25)
+        self.assertEqual(weights["online"]["outcomes"]["waf-blocked"], 1)
+        self.assertFalse(os.path.exists(self.jobs_path))
+
+    def test_unverified_events_cannot_become_strike_jobs(self):
+        path = "/unverified-chain"
+        events = [
+            (1, "198.51.100.9", False),
+            (2, "198.51.100.10", False),
+            (3, "198.51.100.11", True),
+        ]
+        for attempt, exit_ip, verified in events:
+            record = _audit_record(attempt, cl=5, confirmed=True, path=path,
+                                   exit_ip=exit_ip, proxy="proxy-%d" % attempt)
+            record["attribution"]["verified"] = verified
+            outcome = self.loop.process_record(record)
+            if verified:
+                self.assertTrue(outcome["confirmed"])
+            else:
+                self.assertFalse(outcome["confirmed"])
+
+        jobs = _load_json(self.jobs_path)
+        self.assertEqual(jobs["jobs"], [])
+        self.assertTrue(jobs["candidates"])
+        self.assertFalse(jobs["candidates"][0]["strike"])
+
+        record = _audit_record(4, cl=5, confirmed=True, path=path,
+                               exit_ip="198.51.100.12", proxy="proxy-4")
+        self.loop.process_record(record)
+        jobs = _load_json(self.jobs_path)
+        self.assertEqual(len(jobs["jobs"]), 1)
+        self.assertEqual(len(jobs["jobs"][0]["cross_proxy"]["identities"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

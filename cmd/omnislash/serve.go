@@ -57,6 +57,16 @@ func cmdServe(args []string) error {
 	ctx, stop := signalContext()
 	defer stop()
 
+	// One loopback Python child supplies value-free skeletons for NCD. It is
+	// started once; no os/exec happens per HTTP response.
+	if cfg.Safety.Deception.Enabled && cfg.Safety.Deception.SemanticService {
+		if _, err := omnislash.StartSemanticService(ctx, cfg.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
+		} else {
+			logger.Info("semantic skeleton service started", "addr", cfg.Safety.Deception.SemanticAddr)
+		}
+	}
+
 	// The same control process owns the streaming feedback worker. It tails the
 	// configured audit from a persisted offset, so restarting serve never
 	// replays old attempts or breaks the active transport sessions.

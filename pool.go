@@ -295,7 +295,12 @@ func (p *Pool) HandleDeception(pr *Proxy, d DeceptionDecision) {
 	action := strings.ToLower(strings.TrimSpace(p.cfg.Safety.Deception.Action))
 	switch action {
 	case "mark":
-		// record only
+		// A honeypot is a property of the TARGET, not of the proxy that
+		// carried the request. Ban the target for this session and leave both
+		// the proxy cooldowns and the pool circuit untouched.
+		if p.deception != nil {
+			p.deception.BanTarget(d.Host, d.Prefix, "marked:"+string(d.Kind), d.Kind, p.cfg.Safety.Deception.TargetBanTTL.Std())
+		}
 	case "disable":
 		if pr != nil {
 			pr.markBan(p.now(), "deception:"+string(d.Kind), 24*time.Hour)
@@ -309,10 +314,9 @@ func (p *Pool) HandleDeception(pr *Proxy, d DeceptionDecision) {
 			p.Ban(pr, "deception:"+string(d.Kind), cd)
 		}
 	}
-	// Anomalies/tarpit also open circuit in defensive mode to stop the scan node.
-	if p.circuit != nil && (d.Kind == DeceptionSynthetic200 || d.Kind == DeceptionTarpit || d.Kind == DeceptionRepeat) {
-		p.circuit.Trip("deception:" + string(d.Kind))
-	}
+	// Never trip the pool circuit for deception. The exit IP did not cause a
+	// tarpit or synthetic response; punishing it would break attribution and
+	// silently move the next probe to a different exit.
 }
 
 // SetScraperStats registers a callback that exposes scraper state in the pool

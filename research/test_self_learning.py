@@ -11,13 +11,20 @@ if REPO_ROOT not in sys.path:
 
 from research.semantic_analyzer import ResponseShape
 from research.self_learning import (
+    OUTCOME_PROXY_FAILED,
+    OUTCOME_TARGET_REJECTED,
+    OUTCOME_WAF_BLOCKED,
+    TrainingExample,
     ExperienceLearner,
     LinUCB,
     ParameterInferencer,
+    apply_online_example,
     build_calibration_examples,
     examples_from_audit,
     local_simulations,
+    outcome_label,
     split_by_host,
+    trainable_outcome,
 )
 
 
@@ -177,6 +184,76 @@ class TestExperienceLearning(unittest.TestCase):
         bandit.update("cl:1", context, 0.0)
         ranked = bandit.rank(["cl:1", "cl:5"], context)
         self.assertEqual(ranked[0], "cl:5")
+
+
+class TestOutcomeAwareLearning(unittest.TestCase):
+    def test_outcome_label_separates_transport_failures_from_target_responses(self):
+        self.assertEqual(outcome_label({"error": "no usable proxy"}), OUTCOME_PROXY_FAILED)
+        self.assertEqual(
+            outcome_label({"outcome": "Proxy Failed", "result": {"responses": [{"status": 200}]}}),
+            OUTCOME_PROXY_FAILED,
+        )
+        self.assertEqual(
+            outcome_label({"result": {"responses": [
+                {"status": 403, "body": "captcha challenge", "headers": [{"key": "cf-ray", "value": "x"}]},
+            ]}}),
+            OUTCOME_WAF_BLOCKED,
+        )
+        self.assertEqual(
+            outcome_label({"result": {"responses": [
+                {"status": 400, "body": '{"error":"Invalid request"}'},
+            ]}}),
+            OUTCOME_TARGET_REJECTED,
+        )
+        self.assertEqual(
+            outcome_label({"result": {"responses": [{"status": 200, "body": "ok"}]}}),
+            "Target Response",
+        )
+        self.assertFalse(trainable_outcome(OUTCOME_PROXY_FAILED))
+        self.assertTrue(trainable_outcome(OUTCOME_WAF_BLOCKED))
+
+    def test_proxy_failure_audit_events_never_become_training_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = os.path.join(tmp, "audit.jsonl")
+            records = [
+                {"probe": "h2-cl", "outcome": "Proxy Failed", "error": "dial failed"},
+                {"probe": "h2-cl", "error": "connection reset"},
+            ]
+            with open(audit, "w", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record) + "\n")
+            self.assertEqual(examples_from_audit(audit, fallback_host="lab-a"), [])
+            with open(audit, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"probe": "h2-cl", "outcome": "WAF Blocked",
+                                         "result": {"responses": [{"status": 403, "body": "captcha"}]}}) + "\n")
+            examples = examples_from_audit(audit, fallback_host="lab-a")
+            self.assertEqual(len(examples), 1)
+            self.assertTrue(examples[0].label < 0.5)
+
+    def test_weak_strength_nudges_weights_without_faking_observations(self):
+        weights = ExperienceLearner(alpha=0.3).fit(local_simulations())
+        examples_before = weights["examples"]
+        example = TrainingExample(
+            host="weak-lab", tech="h2",
+            features={"path:/weak-signal": "1", "cl:5": "1"},
+            label=1.0, source="online-audit",
+        )
+        result = apply_online_example(weights, example, strength=0.25)
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["strength"], 0.25)
+        cell = weights["global"]["path:/weak-signal"]
+        self.assertEqual(cell["attempts"], 1)
+        self.assertAlmostEqual(cell["successes"], 0.25)
+        self.assertLess(cell["ema"], 0.5)
+        self.assertEqual(weights["online"]["last_strength"], 0.25)
+        self.assertEqual(weights["examples"], examples_before + 1)
+
+        full = ExperienceLearner(alpha=0.3).fit(local_simulations())
+        apply_online_example(full, example, strength=1.0)
+        strong = full["global"]["path:/weak-signal"]
+        self.assertEqual(strong["attempts"], cell["attempts"])
+        self.assertAlmostEqual(strong["successes"], 1.0)
+        self.assertGreater(strong["ema"], cell["ema"])
 
 
 if __name__ == "__main__":

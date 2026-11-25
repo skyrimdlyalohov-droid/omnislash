@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Dialer opens TCP connections through the pool. Every new connection is
@@ -19,6 +22,11 @@ type Dialer struct {
 	pool *Pool
 	log  *slog.Logger
 	base *net.Dialer
+
+	// fingerprints are rotated one per Session, never per dial inside a
+	// session. fpSeq is atomic because a pool can create sessions concurrently.
+	fingerprints []utls.ClientHelloID
+	fpSeq        atomic.Uint64
 }
 
 // NewDialer creates a dialer for pool.
@@ -26,7 +34,7 @@ func NewDialer(pool *Pool, logger *slog.Logger) *Dialer {
 	if logger == nil {
 		logger = pool.log
 	}
-	return &Dialer{
+	d := &Dialer{
 		pool: pool,
 		log:  logger,
 		base: &net.Dialer{
@@ -34,6 +42,16 @@ func NewDialer(pool *Pool, logger *slog.Logger) *Dialer {
 			KeepAlive: 30 * time.Second,
 		},
 	}
+	for _, name := range pool.cfg.TLSFingerprints {
+		id, err := ParseFingerprint(name)
+		if err != nil {
+			// Config.Validate normally rejects this; never guess a profile.
+			logger.Warn("ignoring invalid TLS fingerprint", "name", name, "error", err)
+			continue
+		}
+		d.fingerprints = append(d.fingerprints, id)
+	}
+	return d
 }
 
 // DialContext implements the function signature expected by http.Transport.

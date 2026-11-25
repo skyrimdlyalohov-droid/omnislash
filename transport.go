@@ -64,6 +64,12 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if req.URL == nil {
 		return nil, errors.New("omnislash: nil request URL")
 	}
+	if df := t.pool.Deception(); df != nil && df.Enabled() {
+		if d, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
+			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_target_banned"})
+			return nil, fmt.Errorf("%w: %s", ErrDeceptionDetected, d.Reason)
+		}
+	}
 	ctx, err := t.pool.WaitGlobal(req.Context())
 	if err != nil {
 		return nil, err
@@ -98,6 +104,17 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			r.GetBody = factory
 		}
 		return r, nil
+	}
+
+	// Deception control traffic goes through the same scope-checked pool path
+	// as the real probe, but never re-enters RoundTrip. Without this, an agent
+	// could stumble into a tarpit before the filter knows the target's baseline.
+	if df := t.pool.Deception(); df != nil && df.Enabled() {
+		baseURL := req.URL.Scheme + "://" + req.URL.Host
+		if _, err := df.EnsureBaseline(ctx, baseURL, pathPrefix(req.URL.Path), t.baselineDoRequest); err != nil {
+			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_baseline_failed"})
+			return nil, fmt.Errorf("%w: %v", ErrDeceptionBaseline, err)
+		}
 	}
 
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -261,6 +278,48 @@ func (t *RotatingTransport) directTransport() *http.Transport {
 		IdleConnTimeout:     t.cfg.IdleConnTimeout.Std(),
 	}
 	return t.direct
+}
+
+// baselineDoRequest issues one control request for deception calibration. It
+// deliberately bypasses RoundTrip: the response is inspected by
+// CalibrateBaseline, not by the normal deception decision path, and recursion
+// would otherwise calibrate the calibration.
+func (t *RotatingTransport) baselineDoRequest(ctx context.Context, rawURL string) (*http.Response, time.Duration, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, _, err := net.SplitHostPort(req.URL.Host); err != nil {
+		port := "80"
+		if req.URL.Scheme == "https" {
+			port = "443"
+		}
+		req.URL.Host = net.JoinHostPort(req.URL.Hostname(), port)
+		req.Host = req.URL.Host
+	}
+	if _, err := t.pool.WaitGlobal(ctx); err != nil {
+		return nil, 0, err
+	}
+	if err := t.pool.Allow(); err != nil {
+		return nil, 0, err
+	}
+	pr, err := t.pool.pick(nil, req.URL.Host)
+	var tr *http.Transport
+	switch {
+	case err == nil:
+		tr = t.transportFor(pr)
+	case t.pool.cfg.AllowDirect:
+		tr = t.directTransport()
+	default:
+		return nil, 0, err
+	}
+	start := t.pool.now()
+	resp, err := tr.RoundTrip(req)
+	latency := t.pool.now().Sub(start)
+	if err != nil {
+		return nil, latency, err
+	}
+	return resp, latency, nil
 }
 
 // prepareBody makes the request body replayable when it is small enough.

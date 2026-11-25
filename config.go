@@ -81,6 +81,10 @@ type Config struct {
 	// OnlineLearning starts the streaming feedback loop next to the control
 	// UI. Nil means enabled; set false to keep serve read-only.
 	OnlineLearning *bool `json:"online_learning,omitempty"`
+	// TLSFingerprints are the ClientHello profiles rotated per Session. Nil
+	// means the defaults (Chrome/iOS/OkHttp); an explicit empty array disables
+	// fingerprinting and keeps crypto/tls for compatibility.
+	TLSFingerprints []string `json:"tls_fingerprints,omitempty"`
 }
 
 // IsOnlineLearningEnabled reports whether the streaming feedback loop should
@@ -164,15 +168,25 @@ type SafetyConfig struct {
 // DeceptionConfig enables defensive response-side filtering for tarpit/deception
 // targets. It never bypasses deception; it detects and excludes/quarantines.
 type DeceptionConfig struct {
-	Enabled             bool    `json:"enabled"`
-	BaselineSamples     int     `json:"baseline_samples"`
-	MaxBodySample       int64   `json:"max_body_sample"`
-	SimilarityThreshold float64 `json:"similarity_threshold"`
-	RepeatStatus        int     `json:"repeat_status"`
-	RepeatThreshold     int     `json:"repeat_threshold"`
-	LatencySpikeFactor  float64 `json:"latency_spike_factor"`
-	QuarantineSecrets   bool    `json:"quarantine_secrets"`
-	Action              string  `json:"action"` // "cooldown" | "disable" | "mark"
+	Enabled             bool     `json:"enabled"`
+	BaselineSamples     int      `json:"baseline_samples"`
+	MaxBodySample       int64    `json:"max_body_sample"`
+	SimilarityThreshold float64  `json:"similarity_threshold"`
+	RepeatStatus        int      `json:"repeat_status"`
+	RepeatThreshold     int      `json:"repeat_threshold"`
+	RepeatWindow        Duration `json:"repeat_window"` // default 10s
+	LatencySpikeFactor  float64  `json:"latency_spike_factor"`
+	NCDTarpit           float64  `json:"ncd_tarpit"`     // default 0.25
+	NCDStructural       float64  `json:"ncd_structural"` // default 0.6
+	QuarantineSecrets   bool     `json:"quarantine_secrets"`
+	Action              string   `json:"action"` // "cooldown" | "disable" | "mark"
+	// SemanticService uses the loopback Python skeleton service so NCD runs on
+	// value-free canonical skeletons instead of raw dynamic bodies. When it is
+	// unavailable the filter falls back to the sampled bytes.
+	SemanticService bool   `json:"semantic_service"`
+	SemanticAddr    string `json:"semantic_addr"` // loopback only, default 127.0.0.1:8000
+	// TargetBanTTL bounds a session-level target ban created by "mark".
+	TargetBanTTL Duration `json:"target_ban_ttl"` // default 5m
 }
 
 // AuditConfig writes one JSON object per event to Path. Path "-" means stdout.
@@ -325,6 +339,7 @@ func DefaultConfig() Config {
 		Strategy:           StrategyRoundRobin,
 		TrustTier:          TrustTierStrict,
 		AllowDirect:        false,
+		TLSFingerprints:    append([]string(nil), DefaultFingerprints...),
 		StickyTTL:          Duration(5 * time.Minute),
 		DialTimeout:        Duration(10 * time.Second),
 		HandshakeTimeout:   Duration(15 * time.Second),
@@ -372,9 +387,15 @@ func DefaultConfig() Config {
 				SimilarityThreshold: 0.92,
 				RepeatStatus:        200,
 				RepeatThreshold:     8,
+				RepeatWindow:        Duration(10 * time.Second),
 				LatencySpikeFactor:  4.0,
+				NCDTarpit:           0.25,
+				NCDStructural:       0.6,
 				QuarantineSecrets:   true,
 				Action:              "cooldown",
+				SemanticService:     true,
+				SemanticAddr:        "127.0.0.1:8000",
+				TargetBanTTL:        Duration(5 * time.Minute),
 			},
 		},
 		Audit: AuditConfig{},
@@ -469,6 +490,9 @@ func (c *Config) normalize() {
 	if c.MaxDialAttempts == 0 {
 		c.MaxDialAttempts = d.MaxDialAttempts
 	}
+	if c.TLSFingerprints == nil {
+		c.TLSFingerprints = append([]string(nil), d.TLSFingerprints...)
+	}
 	if c.Cooldown.Initial == 0 {
 		c.Cooldown.Initial = d.Cooldown.Initial
 	}
@@ -556,8 +580,23 @@ func (c *Config) normalize() {
 	if c.Safety.Deception.RepeatThreshold == 0 {
 		c.Safety.Deception.RepeatThreshold = d.Safety.Deception.RepeatThreshold
 	}
+	if c.Safety.Deception.RepeatWindow == 0 {
+		c.Safety.Deception.RepeatWindow = d.Safety.Deception.RepeatWindow
+	}
 	if c.Safety.Deception.LatencySpikeFactor == 0 {
 		c.Safety.Deception.LatencySpikeFactor = d.Safety.Deception.LatencySpikeFactor
+	}
+	if c.Safety.Deception.NCDTarpit == 0 {
+		c.Safety.Deception.NCDTarpit = d.Safety.Deception.NCDTarpit
+	}
+	if c.Safety.Deception.NCDStructural == 0 {
+		c.Safety.Deception.NCDStructural = d.Safety.Deception.NCDStructural
+	}
+	if c.Safety.Deception.SemanticAddr == "" {
+		c.Safety.Deception.SemanticAddr = d.Safety.Deception.SemanticAddr
+	}
+	if c.Safety.Deception.TargetBanTTL == 0 {
+		c.Safety.Deception.TargetBanTTL = d.Safety.Deception.TargetBanTTL
 	}
 	if c.Safety.Deception.Action == "" {
 		c.Safety.Deception.Action = d.Safety.Deception.Action
@@ -643,6 +682,24 @@ func (c *Config) normalize() {
 }
 
 // Validate checks the configuration for impossible or unsafe values.
+// validateLoopbackAddr forbids remote skeleton services. The analyzer is
+// intelligence-only: no target request is ever routed through it, so there is
+// no reason for it to bind or connect outside the loopback interface.
+func validateLoopbackAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("expected host:port: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("must use a loopback IP literal (127.0.0.0/8 or ::1), got %q", host)
+	}
+	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
+		return fmt.Errorf("invalid address: %w", err)
+	}
+	return nil
+}
+
 func (c *Config) Validate() error {
 	c.normalize()
 	var errs []error
@@ -677,6 +734,11 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxDialAttempts < 1 {
 		add("max_dial_attempts must be >= 1")
+	}
+	for _, name := range c.TLSFingerprints {
+		if _, err := ParseFingerprint(name); err != nil {
+			add("tls_fingerprints: %v", err)
+		}
 	}
 	if c.Cooldown.Initial <= 0 {
 		add("cooldown.initial must be > 0")
@@ -758,8 +820,23 @@ func (c *Config) Validate() error {
 	if c.Safety.Deception.RepeatThreshold < 1 {
 		add("safety.deception.repeat_threshold must be >= 1")
 	}
+	if c.Safety.Deception.RepeatWindow <= 0 {
+		add("safety.deception.repeat_window must be > 0")
+	}
+	if c.Safety.Deception.NCDTarpit <= 0 || c.Safety.Deception.NCDTarpit > 1 {
+		add("safety.deception.ncd_tarpit must be in (0,1]")
+	}
+	if c.Safety.Deception.NCDStructural <= 0 || c.Safety.Deception.NCDStructural > 1 {
+		add("safety.deception.ncd_structural must be in (0,1]")
+	}
 	if c.Safety.Deception.LatencySpikeFactor <= 0 {
 		add("safety.deception.latency_spike_factor must be > 0")
+	}
+	if c.Safety.Deception.TargetBanTTL <= 0 {
+		add("safety.deception.target_ban_ttl must be > 0")
+	}
+	if err := validateLoopbackAddr(c.Safety.Deception.SemanticAddr); err != nil {
+		add("safety.deception.semantic_addr: %v", err)
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Safety.Deception.Action)) {
 	case "cooldown", "disable", "mark":

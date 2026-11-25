@@ -1,861 +1,263 @@
-# omnislash
+# Omnislash
 
-Транспортный слой для инструментов, которым нужна **байт-точность** и
-**недоверенный egress**. `omnislash` даёт пул прокси, строгий admission,
-ротацию исходящих IP и сырой TCP/TLS без `net/http`, чтобы приложение
-отправляло ровно те байты, которые собрало само. HTTP request smuggling —
-референсный потребитель (CL.TE / TE.CL / TE.TE / HTTP/2 desync), но не
-единственный: тот же слой нужен fuzzer'ам, desync- и protocol-differential
-инструментам, кастомным TLS/HTTP-клиентам и любым проверкам, где парсер
-посредника меняет смысл запроса.
+**Platform for controlled, verifiable HTTP desync research.**
 
-## Что внутри
+Omnislash is an AppSec research platform, not a stealth scanner. It gives a
+probe author a byte-exact, attributable socket: the proxy is pinned before the
+handshake, the ClientHello is explicit, and every response is recorded as
+evidence. The learning loop only reorders techniques an operator already
+declared.
 
-- **Пул прокси из файла или из сети**: SOCKS5/SOCKS5h, HTTP CONNECT, HTTPS
-  CONNECT. Поддерживаются логин/пароль, IPv4/IPv6 и доменные имена.
-- **Автосбор бесплатных списков** через [Colly](https://github.com/gocolly/colly):
-  текст, HTML/JSON с regex-извлечением, кастомные заголовки, несколько
-  источников параллельно.
-- **Строгая проверка живых/мёртвых** через
-  [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client): настоящий
-  браузерный/мобильный TLS-фингерпринт, несколько HTTPS-canary, проверка
-  стабильного egress IP, отсев прокси с вашим реальным IP и медленных прокси.
-- **Hot-swap пула**: после каждого scrape проверенный набор атомарно заменяет
-  пул, состояние уже известных прокси (счётчики, кулдаун) сохраняется. Плохой
-  scrape не может обнулить рабочий пул.
-- **Scope/SSRF-защита** на базе
-  [projectdiscovery/networkpolicy](https://github.com/projectdiscovery/networkpolicy):
-  allowlist хостов/CIDR/портов, блокировка private/loopback/link-local и
-  cloud-metadata, локальный DNS-резолв и пиннинг IP.
-- **Ротация на каждое новое TCP-соединение**: `round_robin`, `random`,
-  `least_used`, `sticky` (один прокси на target в течение TTL).
-- **Байт-точные пробы**: `probe/` — smuggling (CL.TE/TE.CL/TE.TE/H2 downgrade),
-  single-packet race H1, last-frame sync H2, гаджеты WAF, cache poisoning.
-  `Probe` получает уже открытый `net.Conn`; `http.Client` и `net.Dial` внутри
-  проб запрещены, запросы уходят только через `conn.Write`.
-- **Демон `omnislashd`**: JSON-конфиг с задачами, расписание, ретраи, JSONL-аудит
-  и `-/healthz|/status`; один запуск задачи = одна pinned-сессия.
-- **Курируемые playbooks** (`playbooks/`): разбор решённой лабы с явным
-  `provenance`; импортируется в zero-day vault для planner'а либо в демон как
-  помеченный prior для ранжирования (не как наблюдение из аудита).
-- **Сессия эксперимента**: `Dialer.NewSession(ttl)` жёстко пиннит один прокси
-  на явный срок. Все запросы эксперимента выходят с одного IP; после TTL или
-  ошибки — отказ, а не тихая ротация.
-- **Два admission-режима**: `connect` проверяет CONNECT, сертификат цели,
-  паузу и повторный запрос в одном туннеле; `http_parsing` требует точного
-  N-байт echo для HTTP-framing (включая конфликтующие `Content-Length`/
-  `Transfer-Encoding`). Негативные фикстуры — буфер, переписчик и обрыватель.
-- **Trust tiers**: `strict` для публичных прокси (полный admission) и
-  `trusted` для своего mobile/LTE-пула (health + egress, без тяжёлых проб).
-- **Fail-closed**: `allow_direct` выключен по умолчанию и запрещён в strict;
-  смерть прокси посреди запроса возвращает ошибку, а не прямой ответ.
-- **Health-check**: параллельные пробы через прокси, восстановление после
-  падения, exponential backoff и автоматический вывод мёртвых прокси из ротации.
-- **Ретраи**: dial-ошибки и «банные» HTTP-статусы (403/407/429/503) переводят
-  прокси в кулдаун и повторяют запрос через другой IP.
-- **TLS через прокси**: `DialTLSContext` отдаёт `net.Conn`, сканер сам решает,
-  какие байты и с каким ALPN/SNI отправлять.
-- **Локальный HTTP-шлюз**: `127.0.0.1:3128`, через который любой инструмент
-  (curl, свой сканер, сторонний бинарь) ходит с ротацией IP. Обычные HTTP-запросы
-  пересылаются по одному и отдают статус в safety-breaker; HTTPS/raw TCP идут
-  через байт-прозрачный CONNECT.
-- **Stats endpoint и встроенный Web UI**: JSON-снимок состояния пула, здоровья и scrape-цикла плюс автономный дашборд на том же локальном порту (см. [Встроенный Web UI](#встроенный-web-ui)).
-- **Ограничение скорости** (token bucket) на прокси и на весь пул, чтобы
-  ротация не умножала эффективную частоту запросов.
-- **Safety-контур**: глобальный лимит на весь пул (не на прокси), fail-closed
-  scope, circuit breaker по `403/429/503` и JSONL-аудит без тел запросов.
+The core is stdlib Go plus refraction-utls; the research loop is stdlib Python.
+There is no Docker, Node.js, npm or CDN dependency, and the learning loop never
+calls the network. The rules are in [MANIFESTO.md](MANIFESTO.md); invariants and
+negative tests are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Собственным остаётся только то, что нельзя взять готовым: байт-точный raw
-TCP/TLS транспорт и связка «источник → валидатор → пул → dialer». Инварианты
-и привязка к негативным тестам — в [ARCHITECTURE.md](ARCHITECTURE.md).
+## Safety Gates
 
-```
-   proxy lists ──> Colly ──> candidates ──> tls-client validator ──┐
-   (text/regex)                         (HTTPS canaries, egress IP) │
-                                                                    v
-                 +-----------------------------+          verified set
-  scanner  --->  |  Dialer / RotatingTransport | <── hot-swap ── Pool
-  (raw/TLS)      |  pool + strategy + health   | ---> proxy #1 ──> target
-                 |  scope + cooldown + limiter | ---> proxy #2 ──> target
-                 +-----------------------------+ ---> proxy #N ──> target
-                          |
-                 local HTTP gateway 127.0.0.1:3128
-```
+Read this before running anything. These are enforced controls, not advice.
 
-## Интеграционная матрица
+1. **Authorized targets only.** Use your own lab instances. Examples use
+   `LAB-ID` placeholders — replace them with your lab ID, never with a public
+   hostname. OSINT modules are intelligence-only; they never auto-attack what
+   they find.
+2. **Fail-closed egress.** `allow_direct: false` by default and forbidden in
+   `trust_tier: strict`. A dead proxy fails the experiment; there is no silent
+   direct fallback.
+3. **Scope before dial.** An explicit scope file (`--scope-file`) or
+   `scope.allow_hosts` is mandatory for unattended runs. Hosts are resolved
+   locally, all addresses are checked, and a checked IP is pinned into CONNECT.
+   Out-of-scope targets get `403` without a dial.
+4. **The transport owns the socket.** A probe receives an already dialed
+   `net.Conn`. No `net.Dial`, no `http.Client`, no `net/http` request writer
+   inside `probe/`. One experiment uses one pinned session and one exit IP.
+5. **Evidence before verdicts.** `unverified` is a quarantine label. Only
+   cross-proxy-verified target responses can become executable strike jobs; two
+   independent attributed exits are required. WAF pages and parser rejections
+   are weak negative evidence; proxy failures do not train at all.
+6. **No evasion claims.** TLS fingerprint rotation exists for protocol
+   reproducibility across intermediaries, not anonymity. We do not build or
+   document WAF/IDS evasion.
+7. **Local-only control plane.** Gateway, stats, dashboard and the semantic
+   skeleton service bind to loopback. Audit lines carry attribution and
+   evidence, not credentials or secrets.
 
-| Поверхность | Из коробки | Атрибуция IP | Ограничение |
-|---|---|---|---|
-| Go-сканер через `Dialer` / `Session` | да | `ProxyOf(conn)`, сессия = один exit-IP | нужен raw TCP/TLS клиент |
-| Локальный HTTP-шлюз (`serve`) | да | по соединению, не по HTTP-запросу | HTTP absolute-form + CONNECT; статусы HTTP-ответов идут в safety-breaker |
-| `RotatingTransport` | да | на каждый HTTP-запрос/keep-alive | только для обычного HTTP, не для smuggling |
-| Python / Burp / сторонние плагины | TODO | — | используйте HTTP-шлюз как временный адаптер |
-| HTTP-парсеры (не raw) | осознанно нет | — | `http_parsing` admission проверяет байт-прозрачность, но сам слой не парсит payload |
-
-Честная граница: «из коробки» — Go и HTTP-шлюз. Адаптеры для Python/Burp
-пока не входят в поставку; для них есть только шлюз без per-request
-атрибуции.
-
-## Запуск одной командой (Docker)
-
-```bash
-make up          # docker compose up -d --build: scrape -> validate -> serve
-make ps          # статус и health
-make logs        # логи scrape/health/gateway
-make down        # остановить
-```
-
-`make up` собирает образ `omnislash:1.0.0` и поднимает готовый пайплайн:
-
-- `127.0.0.1:3128` — HTTP-шлюз с ротацией (только loopback);
-- `127.0.0.1:9090/` — встроенный Web UI (старые JSON-пути сохраняются);
-- `127.0.0.1:9090/stats` — состояние пула, health и scrape;
-- `127.0.0.1:9090/readyz` — healthcheck контейнера;
-- внутри контейнера уже включён `scraper` из `config.example.json`, поэтому
-  пул собирается и проверяется автоматически при старте и по расписанию.
-
-Проверка:
-
-```bash
-docker compose exec omnislash /usr/local/bin/omnislash healthcheck
-for i in 1 2 3; do curl -s -x http://127.0.0.1:3128 https://api.ipify.org; echo; done
-```
-
-Шлюз без compose (после `make docker`):
-
-```bash
-docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:9090:9090 omnislash:1.0.0
-```
-
-Внутри контейнера `scope` включён: в `config.example.json` разрешены
-`api.ipify.org` и `*.example.com`. Добавьте свои цели в `scope.allow_hosts`,
-иначе шлюз вернёт `403` на всё остальное — это fail-closed, а не баг. `502`
-означает, что цель разрешена, но ни один прокси не смог к ней подключиться.
-
-Для своего конфига раскомментируйте `volumes` в `docker-compose.yml` и
-положите `config.local.json` рядом с compose-файлом. Внутри контейнера
-слушатели переопределяются на `0.0.0.0`, но наружу порты опубликованы только
-на `127.0.0.1`.
-
-## Быстрый старт без Docker
-
-```bash
-cp config.example.json config.json
-make build
-
-# собрать, строго проверить и записать живые прокси
-./bin/omnislash scrape -config config.json -write proxies.txt
-
-# либо просто запустить сервис: он сам обновит пул
-./bin/omnislash serve -config config.json
-```
-
-Только шлюз, без сборки бинаря и без scrape-петли:
-
-```bash
-go run ./cmd/gateway -config config.json -proxies proxies.txt -listen 127.0.0.1:3128 -stats 127.0.0.1:9090
-```
-
-`config.example.json` уже содержит несколько бесплатных HTTP-списков и
-включает `scraper`. Scope включён: перед сканированием добавьте свои цели в
-`scope.allow_hosts` (по умолчанию разрешены только `*.example.com` и
-`api.ipify.org`). Если списки недоступны, `serve` продолжит работать со
-старым пулом (или с пустым, пока не появится первый валидный прокси).
-
-`serve` поднимает:
-
-- `127.0.0.1:3128` — локальный CONNECT-прокси с ротацией;
-- `127.0.0.1:9090/` — встроенный дашборд; `/stats`, `/healthz`, `/readyz` — как раньше;
-- `127.0.0.1:9090/stats` — состояние пула, health и scrape;
-- фоновый health-check (если включён);
-- фоновый scrape/validation по `scraper.refresh_interval`.
-
-Проверка ротации (для HTTP curl использует forward-режим, для HTTPS — CONNECT):
-
-```bash
-for i in 1 2 3 4 5; do
-  curl -s -x http://127.0.0.1:3128 https://api.ipify.org; echo
-done
-```
-
-Каждый запрос может выйти с другого IP. Для HTTP-целей curl отправляет
-absolute-form GET: шлюз пересылает запрос и учитывает статус ответа в
-safety-breaker. Для HTTPS клиент открывает CONNECT; статусы внутри TLS шлюз
-не видит, поэтому circuit breaker на этом пути реагирует только на ошибки
-соединения.
-
-`fetch` — встроенная проверка без шлюза:
-
-```bash
-./bin/omnislash fetch -config config.json -proxies proxies.txt \
-  -url https://api.ipify.org -n 10 -concurrency 5
-```
-
-## CLI
-
-```
-omnislash check  [флаги]   проверить все прокси и показать таблицу/JSON
-omnislash scrape [флаги]   собрать, строго проверить и показать живые прокси
-omnislash fetch  [флаги]   N HTTP-запросов через ротатор (демо)
-omnislash serve  [флаги]   HTTP-шлюз + stats + health/scrape loops
-omnislash healthcheck      проверить /readyz (для Docker healthcheck)
-```
-
-Общие флаги: `-config`, `-proxies`, `-log-level`.
-Дополнительно: `check` — `-json`, `-timeout`, `-concurrency`;
-`scrape` — `-source URL` (можно повторять), `-scheme`, `-json`, `-write FILE`,
-`-no-validate`, `-max N`;
-`fetch` — `-url`, `-n`, `-concurrency`, `-insecure`, `-show-body`;
-`serve` — `-listen`, `-stats`, `-token`, `-no-health`
-(`-listen off` / `-stats off` отключают компонент).
-
-## Встроенный Web UI
-
-`web/index.html` — автономная одностраничная страница на vanilla HTML/CSS/JS,
-без отдельного фронтенд-сборщика. Ассет встраивается в бинари через `//go:embed`
-(`web/web.go`), маршруты регистрируются в `ui.go` (`RegisterUI`). Дашборд
-открывается по `GET /` на том же локальном порту, что и статистика:
-`stats.listen` по умолчанию `127.0.0.1:9090`; демон регистрирует его на
-`control_addr`, если адрес задан. Legacy JSON-контуры `/stats`, `/readyz`,
-`/healthz`, `/status`, `/experience` сохраняются без изменений.
-
-| Виджет | Что показывает | Действие |
-|---|---|---|
-| Proxy pool | Sniper, Infantry, cooldown, средний IQR | `POST /api/scrape` — нативный scrape и hot-swap пула |
-| Analytic core & vault | holdout accuracy, число train examples, стек/vault keys | `POST /api/calibrate` — запуск нативной калибровки |
-| Online Feedback Loop | `ACTIVE`/`PAUSED`, счётчик episodes, online accuracy и Δ | `POST /api/learning/toggle`, `POST /api/learning/feedback` — пауза и метки ±2.0 без рестарта |
-| Finding journal | подтверждённые находки из JSONL-аудита с `confidence_score` и NCD | `POST /api/caido/push` — отправить выбранные записи в Caido Replay |
-| Quick Run | цель, проба, путь и результат | `POST /api/run` — один scoped-запуск |
-
-Журнал показывает только подтверждённые находки (`*_confirmed` и им подобные)
-и отбрасывает `unverified`; `confidence_score` выводится из уровня confidence,
-NCD — из аудита (или считается по двум ответам записи). Кнопка калибровки
-запускает `lab/calibrate-brain.sh`, а не «голый» `self_learning.py`, поэтому
-кнопка получает тот же расширенный корпус, что и `make calibrate`.
-
-Безопасность action API:
-
-- `/api/caido/push` вызывает `osint/caido_bridge.py`. URL по умолчанию
-  `http://127.0.0.1:8080/graphql`; разрешены только `localhost`, `127.0.0.1`,
-  `::1` (расширение — через `OMNISLASH_CAIDO_HOSTS`), без учётных данных в URL.
-  PAT передаётся дочернему процессу через окружение (`CAIDO_PAT`) и не
-  сохраняется дашбордом.
-- `/api/run` fail-closed: scope должен быть включён, `scope.allow_hosts` — не
-  пустым, хост цели — в allowlist (включая `*.domain`), а сама цель должна
-  пройти `Scope.CheckTarget` с локальным резолвом/пиннингом. Поддерживаются
-  `adaptive`, `h2-cl`, `smuggle-chain`, `raw-replay`; путь не содержит CRLF.
-  Отказ — `403` без запуска задачи; успешный запуск использует pinned-сессию.
-- Если в конкретном процессе нет скрапера/callback'а для действия, API
-  отвечает `501`, а не имитирует успех.
-
-Цель `make release` собирает `bin/omnislash` и `bin/omnislashd` со встроенным
-UI, поднимает `omnislash serve` на эфемерном loopback-порту, проверяет `GET /`,
-`/stats` и `/api/dashboard`, останавливает процесс и дополнительно делает
-`-h`-проверку `omnislashd`.
-
-## Формат списка прокси
-
-Одна строка — один прокси, `#` в начале строки — комментарий. Дубликаты
-удаляются. Если схема не указана, берётся `default_scheme` из конфига.
+## Architecture
 
 ```text
-127.0.0.1:1080
-socks5://user:password@proxy.example.com:1080
-http://user:password@proxy.example.com:8080
-https://proxy.example.com:8443
+ target scope file / LAB-ID allowlist
+                 │
+ proxy lists ──> scrape ──> admission (CONNECT + TLS + N-byte echo)
+                 │                     │
+                 └──────────────> verified pool ──> Dialer ──> Session (pinned)
+                                                                  │
+                                      utls handshake on the proxy-dialed conn
+                                                                  │
+                                raw net.Conn ──> probe/ (byte-exact writes)
+                                                                  │
+                                              JSONL audit ──> online loop
+                                                                  │
+                                          weights / hypotheses / candidates
+                                                                  │
+                                   two verified exits ──> strike job (optional)
 ```
 
-Для smuggling-сканирования используйте **только SOCKS5 или CONNECT**:
-обычный forward-proxy режим может переписывать запрос. Этот проект для
-HTTP/HTTPS-прокси всегда делает `CONNECT` и дальше не трогает байты.
+The declared job is immutable: each attempt works on a copy. Learning may
+reorder variants, mutations and declared framing lengths; it cannot invent a
+probe, a payload or a finding.
 
-## Конфигурация
-
-Все поля необязательны: отсутствующие берутся из `DefaultConfig()`.
-Пример со всеми полями — `config.example.json`. Ключевые параметры:
-
-| Поле | Смысл |
-|---|---|
-| `default_scheme` | схема для строк без схемы (`socks5` по умолчанию) |
-| `strategy` | `round_robin`, `random`, `least_used`, `sticky` |
-| `trust_tier` | `strict` (полный admission; по умолчанию) или `trusted` (свой пул: health + egress) |
-| `sticky_ttl` | сколько держать один прокси за target в `sticky` |
-| `allow_direct` | **опасно**: ходить напрямую, если прокси кончились. По умолчанию `false`; в `strict` запрещён |
-| `dial_timeout`, `handshake_timeout` | таймауты TCP и прокси-handshake |
-| `max_dial_attempts` | сколько разных прокси пробовать на один dial |
-| `cooldown.*` | exponential backoff после ошибок |
-| `health.*` | интервал/таймаут/параллелизм проб, `probe_url`, стартовая проверка |
-| `http.*` | таймауты, ретраи, `ban_statuses`, кулдаун бана, keep-alive |
-| `stats.listen` | адрес JSON-статистики, пусто — выключено |
-| `gateway.listen` | адрес локального HTTP-шлюза (HTTP forward + CONNECT), пусто — выключено |
-| `gateway.token` | если задан, клиент обязан прислать `Proxy-Authorization: Bearer ...` |
-| `rate_limit.per_proxy_rps` | лимит новых соединений на прокси в секунду (0 — выключено) |
-| `rate_limit.global_rps` | общий лимит на весь пул, независимо от ротации (0 — выключено) |
-| `safety.*` | fail-closed остановка после `stop_statuses` в окне `window`; `threshold`, `cooldown`, опциональный `max_requests` |
-| `audit.*` | JSONL-журнал событий: `enabled`, `path`; query string и userinfo вырезаются |
-| `scope.*` | fail-closed allowlist целей: хосты/CIDR/порты, блокировка private/metadata, DNS-пиннинг |
-| `scraper.*` | источники, интервал обновления, лимиты, строгая валидация |
-| `scraper.validation.mode` | `connect` (CONNECT + сертификат + пауза) или `http_parsing` (N-байт HTTP echo) |
-| `scraper.validation.admission.*` | canary/echo-адреса, hold, размер echo, timeout, запрет skip-verify в strict connect |
-| `log_level` | `debug`, `info`, `warn`, `error` |
-
-`safety.enabled` по умолчанию `false`. Включайте его явно для сканирования:
-после `threshold` ответов из `stop_statuses` в окне `window` шлюз и транспорт
-перестают отправлять запросы на `cooldown`. `audit.enabled` также выключен по
-умолчанию; путь `-` пишет JSONL в stdout.
-
-`ban_statuses` по умолчанию `[403, 407, 429, 503]`. Учтите: `403` может быть
-ответом WAF на конкретный путь, а не баном IP. Для «тихого» сканированияоставьте `[407, 429]` и разбирайте 403 самостоятельно.
-
-## Автосбор и строгая валидация
-
-Цикл одного обновления:
-
-1. **Colly** параллельно скачивает все `scraper.sources` (таймаут, лимит тела,
-   User-Agent, кастомные заголовки).
-2. Для `type: "text"` прокси извлекаются из строк и HTML-мусора; для
-   `type: "regex"` берётся первая группа регулярки. Записи без схемы получают
-   `sources[].scheme` (для бесплатных списков почти всегда `http`).
-3. Кандидаты дедуплицируются, перемешиваются и ограничиваются
-   `max_candidates`.
-4. **tls-client** проверяет каждый прокси с выбранным фингерпринтом:
-   - минимум `validation.min_canaries` HTTPS-canary должны ответить;
-   - все успешные canary должны вернуть один и тот же `egress_ip`
-     (`require_same_egress_ip`);
-   - `egress_ip` не должен быть private/loopback/metadata
-     (`allow_private_egress: false`);
-   - `egress_ip` не должен совпадать с вашим реальным IP
-     (`require_distinct_from_real_ip`);
-   - ответ должен уложиться в `max_latency`.
-5. Для `trust_tier: strict` выполняется admission-набор по
-   `validation.mode`:
-   - `connect`: сырой CONNECT к `admission.tls_canary_url`, проверка цепочки
-     сертификата, пауза `hold` и **второй** запрос в том же туннеле;
-   - `http_parsing`: echo-проба с HTTP-запросом, где одновременно есть
-     `Content-Length` и `Transfer-Encoding`; ответ обязан совпасть байт-в-байт
-     (буфер, переписчик заголовков и обрыватель отсеиваются);
-   - при заданном `admission.echo_addr` дополнительно проверяется
-     N байт туда / N байт обратно. Это должен быть доверенный raw TCP echo
-     endpoint, доступный через проверяемый прокси; без него проверка
-     пропускается, а `http_parsing`-режим требует его обязательно.
-   `trust_tier: trusted` пропускает admission и оставляет health + egress —
-   это режим для собственного mobile/LTE-пула.
-6. Если живых меньше `min_pool_size`, обновление **отбрасывается** и старый пул
-   остаётся нетронутым. Иначе `Pool.Replace` атомарно подменяет набор,
-   сохраняя счётчики и кулдауны уже известных прокси.
-
-Проверить один раз вручную:
+## Quick start (no Docker)
 
 ```bash
-./bin/omnislash scrape -config config.json -write proxies.txt
-./bin/omnislash scrape -config config.json -source https://example.org/list.txt -scheme http -json
+cp config.example.json config.json            # then narrow scope to your LAB-ID
+make build                                    # bin/omnislash
+make daemon-build                             # bin/omnislashd
+bash lab/e2e_smoke_test.sh                    # offline, loopback only
 ```
 
-`scraper.validation.profile` — имя профиля tls-client. Мобильные варианты:
-`safari_ios_26_0`, `safari_ios_18_5`, `okhttp4_android_13`,
-`zalando_android_mobile`. Они меняют TLS ClientHello/HTTP2-настройки, а не
-только User-Agent. `validation.user_agent` подбирайте под профиль: по
-умолчанию используется мобильный Safari UA, для `chrome_*` задайте
-соответствующий desktop UA, иначе отпечаток выглядит несогласованно.
-
-`validation.attempts` задаёт число полных повторов проверки одного прокси.
-Транзиентная ошибка получения вашего реального IP не кэшируется: следующий
-цикл scrape попробует снова.
-
-Важная граница: admission выполняется только в цикле `scrape` (и в
-`serve`/`cmd/gateway`, если включён `scraper`). Команда `check` делает
-health-пробу и egress-проверку, но не admission, а готовый `proxies.txt`
-загружается в пул как есть. Поэтому файл для `serve`/`cmd/gateway` должен
-приходить из `scrape`, а не из `check` и не из сырого списка: иначе
-непроверенные прокси попадут в ротацию. `health.startup_check` при этом
-отсеивает мёртвые и прокси с невалидным сертификатом, но не проверяет
-байт-прозрачность.
-
-## Мобильный трафик без статичного IP
-
-Статичный IP для мобильной симуляции не нужен и обычно вреден: реальные
-мобильные операторы постоянно меняют адрес. Нужен не «один красивый IP», а
-**пул адресов из мобильного ASN**, которые меняются достаточно часто.
-
-Рабочие схемы:
-
-- **Платный mobile/4G backconnect**: провайдер даёт один `host:port`, а IP
-  меняется на каждое новое TCP-соединение или по `session-id` в логине.
-  Добавьте этот endpoint в пул как обычный SOCKS5/HTTP-прокси. Наша ротация
-  на каждое соединение сразу даёт смену IP, а `sticky` с коротким TTL — ту же
-  сессию для связанных запросов.
-- **Свои LTE-модемы / Android-ферма**: каждый модем — отдельный SOCKS5/HTTP
-  выход. Переключение IP — переподключение PDP-контекста или авиарежим. Это
-  самый честный вариант, но требует железа и SIM-карт.
-- **Бесплатные списки** мобильный ASN практически не дают. В них в основном
-  серверные/домашние прокси, часто уже мёртвые или с MITM. Для мобильной
-  симуляции они не подходят.
-
-Что проверять, кроме IP:
-
-- **ASN/оператора**, а не только геолокацию. IP может быть «в стране», но
-  принадлежать хостингу. Для проверки используйте ASN-API провайдера или
-  собственный справочник; в конфиг можно добавить canary, который возвращает
-  ASN, и расширить валидатор.
-- **Согласованность отпечатка**: мобильный TLS-профиль
-  (`safari_ios_26_0` / `okhttp4_android_13`) + мобильный User-Agent + язык/
-  заголовки. Один только прокси не делает трафик мобильным.
-- **CGNAT**: у мобильных операторов много абонентов делят IP. Некоторые сайты
-  это учитывают; помогает смена сессии и ограничение частоты.
-
-Практический конфиг: один источник — backconnect-прокси провайдера,
-`strategy: "random"` или `"round_robin"`, `sticky_ttl: "2m"`,
-`validation.profile: "safari_ios_26_0"`, `require_same_egress_ip: true`,
-`max_latency` под ваш провайдер (мобильные часто медленнее 5 секунд).
-
-## Безопасность недоверенных прокси
-
-Бесплатный прокси — это чужой сервер, который видит ваш трафик и может его
-менять. Модуль снижает риск, но не делает прокси доверенным:
-
-- `scope.enabled: true` + `allow_hosts`/`allow_ports` не даёт сканеру уйти на
-  внутренние адреса, cloud metadata и произвольные порты.
-- При включённом scope имена целей всегда резолвятся локально и проверяются
-  все полученные адреса; с `resolve_locally: true` проверенный IP ещё и
-  пиннится в CONNECT, поэтому прокси не может подменить DNS. Без scope
-  hostname уходит прокси и резолвится на его стороне.
-- Источники `scraper.sources` — доверенная конфигурация оператора. Не
-  подставляйте туда произвольные URL из недоверенных данных: Colly ходит на
-  них напрямую, в обход scope.
-- `allow_direct` по умолчанию `false`: при пустом пуле запрос не уйдёт с
-  вашего реального IP. В `trust_tier: strict` он запрещён конфигурацией;
-  включать его можно только для `trusted`-пула и осознанно.
-- В strict-режиме admission проверяет сертификат цели в CONNECT и
-  байт-прозрачность framing; `admission.tls_skip_verify` нельзя включить в
-  strict connect.
-- Смерть прокси посреди запроса возвращает ошибку. Ни `Dialer`, ни `Session`
-  не делают скрытый direct fallback.
-- Egress-валидация требует HTTPS-сертификат (если не отключён для trusted-пула),
-  стабильный и отличающийся от вашего реального IP. Это отсеивает часть
-  прозрачных MITM, но не гарантирует честность прокси.
-- Не отправляйте через бесплатные прокси токены, cookies, пароли и приватные
-  данные. Для smuggling-проб используйте только авторизованные стенды.
-
-Health-check и валидатор намеренно ходят на фиксированные canary URL в обход
-scope: это не пользовательские цели. Scope применяется к `DialContext`,
-`DialProxy`, прямому dial и локальному шлюзу.
-
-## Интеграция в Go-сканер
-
-### Вариант 1: raw-соединение напрямую через пул
-
-```go
-cfg, _ := omnislash.LoadConfig("config.json")
-proxies, _ := omnislash.LoadProxyFile("proxies.txt", cfg.DefaultScheme)
-pool, _ := omnislash.NewPool(cfg, proxies, nil)
-dialer := omnislash.NewDialer(pool, nil)
-
-conn, err := dialer.DialTLSContext(ctx, "tcp", "target.example:443", &tls.Config{
-    ServerName:         "target.example",
-    InsecureSkipVerify: true,              // только для авторизованных тестов
-    NextProtos:         []string{"http/1.1"},
-})
-if err != nil {
-    return err
-}
-defer conn.Close()
-
-// ВАЖНО: пишем сырые байты, не используем net/http.
-_, err = conn.Write(payload) // "POST / HTTP/1.1\r\nHost: ...\r\n..." с нужной framing
-```
-
-Каждый `DialContext`/`DialTLSContext` выбирает следующий прокси. Если прокси
-умер на handshake, dialer автоматически попробует другой (до
-`max_dial_attempts`), а мёртвый отправит в кулдаун.
-
-Если сканер сам распознал бан по ответу (например, 403/429 на smuggling-пробу),
-он может вывести конкретный прокси из ротации:
-
-```go
-conn, _ := dialer.DialContext(ctx, "tcp", "target.example:443")
-tlsConn := tls.Client(conn, &tls.Config{ServerName: "target.example", NextProtos: []string{"http/1.1"}})
-_ = tlsConn
-// ... сканер пишет свои сырые байты и читает ответ ...
-
-if pr, ok := omnislash.ProxyOf(conn); ok {
-    pool.Ban(pr, "target returned 403", 5*time.Minute)
-}
-```
-
-Для эксперимента, которому нужен один стабильный IP на всю серию запросов,
-используйте не `sticky` (он keyed by target и может истечь), а явную сессию:
-
-```go
-session, err := dialer.NewSession(10 * time.Minute) // один прокси на весь эксперимент
-if err != nil { return err }
-defer session.Close()
-
-for _, probe := range probes {
-    conn, err := session.DialContext(ctx, "tcp", "target.example:443")
-    if err != nil { return err } // отказ, без тихой ротации и direct fallback
-    // ... raw TLS/probe ...
-    _ = conn.Close()
-}
-```
-
-`Session.DialContext` никогда не перебирает другие прокси и не уходит
-напрямую: ошибка прокси — это ошибка эксперимента. Два независимых
-`NewSession` получают разные прокси по стратегии пула.
-
-Граница гарантии: пиннится **endpoint**, а не exit-IP. Если это
-backconnect-прокси провайдера, который меняет выход на каждое соединение,
-сессия этого не заметит. Один endpoint = один выход нужен на уровне пула:
-свои LTE-модемы или провайдерский `session-id` в логине.
-
-Полный пример: `examples/rawdial/main.go`. Минимальный шаблон подключения
-своего сканера: `examples/dialer/main.go`.
-
-### Вариант 2: локальный HTTP-шлюз для любого инструмента
-
-```go
-gw, _ := omnislash.NewGateway("127.0.0.1:3128", dialer, "", nil)
-go gw.Serve(ctx)
-```
-
-Для HTTPS и произвольного TCP сканер открывает соединение к шлюзу, отправляет
-CONNECT и дальше работает с полученным потоком как с обычным сокетом:
-
-```text
-CONNECT target.example:443 HTTP/1.1
-Host: target.example:443
-
-```
-
-После ответа `200 Connection Established` можно делать TLS-handshake и
-отправлять любые байты. Шлюз не парсит и не переписывает их.
-
-Это удобно, если сканер уже умеет работать через `HTTP_PROXY`/`HTTPS_PROXY`
-или написан на другом языке.
-
-Для обычных HTTP-целей клиент отправляет absolute-form GET. Шлюз пересылает
-запросы по одному, видит статус ответа и передаёт его в safety-breaker. Именно
-так Nuclei работает через шлюз с `-rate-limit 4`: после нескольких `403/429/503`
-шлюз закрывается и отвечает `503` на следующие запросы. Внутри CONNECT статусы
-TLS недоступны, поэтому для HTTPS действует только ограничение соединений.
-
-Готовый локальный стенд с Juice Shop/DVWA, шаблонами Nuclei и проверкой всех
-контролей: [lab/README.md](lab/README.md).
-
-### Обычный HTTP-транспорт (разведка, не smuggling)
-
-```go
-transport := omnislash.NewRotatingTransport(pool, dialer, cfg.HTTP, nil)
-client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
-```
-
-Транспорт ротирует IP на каждый запрос, держит keep-alive соединения
-per-proxy, повторяет запрос при сетевых ошибках и «банных» статусах. Тело
-запроса буферизуется до `http.max_body_buffer`, чтобы его можно было безопасно
-повторить.
-
-## Демон проб (`omnislashd`)
-
-`omnislashd` — долгоживущий планировщик проб. Транспорт берётся из обычного
-конфига omnislash, задачи — из JSON рядом:
-
-```bash
-go run ./cmd/omnislashd -config examples/daemon/daemon.json          # демон
-go run ./cmd/omnislashd -config examples/daemon/daemon.json -once    # все задачи один раз
-go run ./cmd/omnislashd -config examples/daemon/daemon.json -job lab-clte-gpost
-```
-
-Задача описывает цель, пробу и критерий успеха:
+A daemon job for an authorized lab instance:
 
 ```json
 {
   "name": "lab-clte-gpost",
-  "target": {"addr": "host:443", "host": "host", "path": "/"},
+  "target": {
+    "addr": "LAB-ID.web-security-academy.net:443",
+    "host": "LAB-ID.web-security-academy.net",
+    "path": "/"
+  },
   "tls": "h1",
   "probe": "smuggle-chain",
-  "victim_method": "POST",
-  "victim_path": "/",
   "success_contains": "Unrecognized method GPOST",
-  "attempts": 3,
-  "until_success": true,
-  "interval": "10s"
+  "attempts": 3
 }
 ```
 
-- `probe`: `smuggle-chain`, `smuggle`, `race`, `h2race`, `h2-cl`, `h2-tunnel`,
-  `differential-fuzz`, `raw-replay`, `upgrade-desync`.
-- `tls`: `h1` (по умолчанию), `h2`, `none`.
-- `success_finding` требует конкретный finding (например, `cache_poisoned`), а
-  не просто завершение пробы. `success_contains` можно использовать вместе с
-  ним как дополнительную проверку тела.
-- `attempts` — сколько прогонов внутри одного запуска; `until_success` снимает
-  задачу с расписания после первого успеха, а `exit_on_success` в корне
-  конфига завершает процесс (CI/lab-режим).
-- `log_file` — JSONL: каждый attempt с атрибуцией, статусами, findings и полным
-  `Result` (сырые записи и ответы). Поле `learning` в строке — компактная метка
-  (`host`, `variant`, `mutation`, `tech_stack`, `finding`), по которой
-  агрегируется опыт.
-- `control_addr` поднимает `GET /healthz`, `GET /status` и `GET /experience`
-  только на localhost.
-
-### Обратная связь: обучение на своих логах
-
-`omnislashd` читает свой же `log_file` при старте и строит таблицу
-успешности по ключу `(host, tls, probe, variant, mutation, tech_stack)`.
-Вероятность успеха сглаживается (`(success+1)/(attempts+2)`), поэтому
-непроверенный вариант не отбрасывается навсегда. Перед каждым attempt daemon
-делает копию задачи и применяет накопленный порядок:
-
-- `variant: "auto"` для `smuggle` и `smuggle-chain` заменяется вариантом с
-  максимальной накопленной вероятностью;
-- мутации `differential-fuzz` переставляются по тому же принципу;
-- исходный JSON конфига не меняется — воспроизводимость сохраняется.
-
-Опыт **не переносится на другой хост**: ключ всегда включает цель. Это не
-нейросеть и не автономный discovery: маркер успеха и сама идея эксплойта
-по-прежнему задаёт оператор. Обучение выбирает порядок уже описанных вариантов, а не
-изобретает новые. Отключить можно `"learning_enabled": false`.
-
-`learning_sources` — список дополнительных JSONL-логов прошлых лаб, которые
-демон проигрывает при старте вместе со своим `log_file`. Пути относительны к
-каталогу конфига. Опыт с другого хоста попадает в глобальную ячейку
-(`host: "*"`) и используется только как стартовый приор: как только по текущему
-хосту появляются собственные attempts, они имеют приоритет.
-
-Просмотреть накопленные ячейки можно через `GET /experience` на `control_addr`
-или по полю `learning` в строках `log_file`.
-
-#### Непрерывный онлайн-цикл без рестарта
-
-`online_learning` включён по умолчанию и для `omnislashd`, и для `omnislash
-serve`. Долгоживущий процесс запускает `python3 research/online_loop.py`, который
-читает тот же JSONL-аудит с сохранённого байтового офсета
-(`state/online_loop_offset.json`), классифицирует каждую завершённую попытку
-через `classify_response_shape` + `TransitionTracker` и атомарно (temp file +
-`os.replace`) обновляет `state/learned_weights.json`. Перезапуск не переигрывает
-старые attempts; активные pinned-сессии не прерываются: daemon подхватывает новые
-веса и `state/jobs_online.json` по `mtime` (опрос каждые 500 мс), а каждый attempt
-работает с копией `JobConfig`. Для `omnislashd` поведение можно переопределить
-флагом `-online-learning=true|false`; однозапусковые режимы (`-once`, `-job`)
-воркер не стартуют.
-
-Важно: онлайн-приоры только переставляют уже объявленные `variant`, `mutation`
-и `cl` и никогда не изобретают probe или verdict. Хосты из `holdout.hosts`
-учитываются как `online.holdout_skipped`, но не попадают в training-ячейки.
-Непроверенные сигналы слабо двигают веса и попадают только в массив `candidates`
-`state/jobs_online.json`; в `jobs` (исполняемые strike) попадает запись только при
-`strike && verified && cross_proxy.verified`, двух независимых подтверждённых
-egress-идентификаторах и непустом `success_finding`. Один JSONL-attempt даёт не
-более одного идентификатора (приоритет `exit_ip`), поэтому непроверенный шум не
-может сам себя «подтвердить».
-
-Дашборд показывает карточку **Online Feedback Loop**: состояние, число
-обработанных episodes, online accuracy/Δ и историю. `GET /api/learning/status`
-возвращает тот же снимок, `POST /api/learning/toggle`
-меняет `state/online_loop_control.json` без сигналов и рестарта. Кнопки
-`Confirm +2.0` / `False Positive −2.0` вызывают `POST /api/learning/feedback` и
-`self_learning.py feedback`: метка `+2.0`/`−2.0` — это два повторения с label
-`1.0`/`0.0`, после чего веса сразу перезаписываются и следующий task
-переранжируется. Для выбранной находки journal в payload уходят host, tech,
-CL, path и finding.
-
-Цикл калибровки расширен и остаётся нативным (без Docker): `make calibrate` /
-`lab/calibrate-brain.sh` собирают примеры из **всех** аудитов `runs/*`, добавляют
-детерминированные локальные пары прокси+бэкенд на `127.0.0.1` (Go `net/http` +
-Python `http.server`: CL/TE, пробелы в заголовках, редиректы, 400/502),
-эталонные негативы WAF-stub (Cloudflare, Akamai, AWS WAF, QRATOR, Nginx) и
-чистый шум, а также симуляции каскадов H2→H1 / CL.TE. Разделение train/validation — строго по хосту или lab ID: один
-хост не может оказаться в обеих выборках. `state/learned_weights.json` теперь
-содержит верхнеуровневое поле `examples` с числом примеров (его показывает
-дашборд), а точность валидации — в `holdout.metrics.accuracy`. Curated
-`solution-derived` сиды в обучение не попадают.
-
-Один запуск задачи создаёт одну pinned-сессию: все соединения пробы (включая
-`smuggle-chain`, которой нужны два сокета) выходят через один прокси и один
-exit IP. Для изолированной лабы без прокси используется `trust_tier: trusted`,
-`allow_direct: true` и узкий `scope`; strict этот режим запрещает.
-
-### Проверка на лабе PortSwigger
-
-Готовая пара конфигов лежит в `examples/daemon/`. Лаба — «HTTP request
-smuggling, basic CL.TE»: front-end считает `Content-Length`, back-end —
-`Transfer-Encoding`. Проба отправляет `POST` с `CL=6` и телом `0\r\n\r\nG`,
-затем на **новом** соединении — обычный `POST`; back-end видит `GPOST` и
-отвечает `403 "Unrecognized method GPOST"`.
-
 ```bash
-go run ./cmd/omnislashd -config examples/daemon/daemon.json -once
+./bin/omnislashd -config examples/daemon/daemon.json -once
+./bin/omnislash serve -config config.json -proxies proxies.txt
 ```
 
-Вывод (сокращён):
+`serve` starts the loopback gateway (`127.0.0.1:3128`), the dashboard and stats
+(`127.0.0.1:9090`), health/scrape loops and (by default) the online learning
+worker. Without a verified proxy in the pool, a strict-config dial is refused;
+it does not leak your real IP.
+
+## Surfaces
+
+| Surface | Use | Boundary |
+|---|---|---|
+| `Dialer` / `Session` | raw TCP/TLS from Go tools | session pins one proxy for its TTL; `ProxyOf(conn)` attributes the exit |
+| `probe/` | smuggling, H2 desync, differential fuzz, raw replay | receives `net.Conn`; writes bytes itself |
+| `omnislashd` | scheduled jobs, retries, JSONL audit | one attempt = one pinned session |
+| `omnislash serve` | local CONNECT gateway + dashboard | loopback only; fail-closed scope |
+| `research/online_loop.py` | stdlib streaming learner | tails audit from a persisted offset; no network |
+| `playbooks/` | curated priors with explicit provenance | priors never presented as observations |
+
+## Transport controls
+
+| Config key | Meaning |
+|---|---|
+| `trust_tier` | `strict` (full admission, direct forbidden) or `trusted` (owned pool) |
+| `allow_direct` | dangerous opt-in for a trusted pool; default `false` |
+| `strategy` | `round_robin`, `random`, `least_used`, `sticky` |
+| `scope.*` | fail-closed allowlist, private/metadata blocking, local DNS pinning |
+| `health.*`, `cooldown.*`, `http.ban_statuses` | liveness, exponential backoff, proxy bans |
+| `rate_limit.global_rps` | pool-wide cap so rotation cannot multiply request rate |
+| `safety.*` | stop statuses in a sliding window, hard request budget, cooldown |
+| `audit.path` | JSONL evidence log (query strings/userinfo stripped) |
+| `scraper.*` | sources, strict validation mode, hot-swap with a minimum pool size |
+| `gateway.listen`, `stats.listen` | loopback listeners; set to `""` to disable |
+
+`403` in `ban_statuses` can be a WAF verdict on a specific path rather than a
+proxy ban. Keep `[407, 429]` for quiet work and interpret `403` from the audit
+evidence instead.
+
+## TLS fingerprint rotation
+
+`tls_fingerprints` rotates a coherent ClientHello per `Session`:
 
 ```json
-[{
-  "job": "lab-clte-gpost",
-  "success": true,
-  "statuses": [200, 403],
-  "findings": [{"kind": "smuggle_confirmed", "confidence": "high"}]
-}]
+"tls_fingerprints": ["chrome_133", "safari_ios", "okhttp"]
 ```
 
-Лаба в этой сессии была доведена до состояния `Solved`; финальный прогон
-`omnislashd` повторил атаку и получил маркер `Unrecognized method GPOST`.
-Инстанс лабы одноразовый: если URL истёк, замените хост в
-`examples/daemon/daemon.json` и `config.lab.json`. Применяйте только к своим
-лабам и авторизованным целям.
+- Defaults are Chrome 133 / iOS Safari / Android OkHttp. Unknown names are a
+  config error — there is no silent Chrome or Go fallback.
+- The handshake uses refraction-utls **on the connection the proxy already
+  dialed**. No utls dial, no direct egress; `ProxyOf(conn)` still reports the
+  pinned proxy after the handshake.
+- An explicit empty array disables fingerprinting and keeps `crypto/tls`.
+- SNI, ALPN and certificate verification come from the caller's `tls.Config`,
+  so a fingerprinted session has the same trust behavior as a stdlib one.
+- This is a reproducibility control. It does not make traffic anonymous.
 
-### Лаба: web cache poisoning via HTTP/2 request tunnelling
+## Deception resistance
 
-Вторая готовая пара — `examples/daemon/daemon-cache-tunnel.json` и
-`config.cache-tunnel.json`. Front-end принимает HTTP/2, но даунгрейдит запрос
-в HTTP/1.1 и не санитайзит `:path`. Проба шлёт `HEAD` с CRLF в `:path`:
+`omnislash` does not bypass tarpits. It detects and quarantines them.
+
+```json
+"safety": {
+  "enabled": true,
+  "stop_statuses": [403, 429, 503],
+  "threshold": 5,
+  "window": "60s",
+  "cooldown": "10m",
+  "deception": {
+    "enabled": true,
+    "semantic_service": true,
+    "semantic_addr": "127.0.0.1:8000",
+    "baseline_samples": 2,
+    "ncd_tarpit": 0.25,
+    "ncd_structural": 0.6,
+    "repeat_status": 200,
+    "repeat_threshold": 8,
+    "repeat_window": "10s",
+    "action": "mark"
+  }
+}
+```
+
+- A baseline is calibrated **before the first probe**. Without a baseline the
+  filter does not guess.
+- The loopback semantic service reduces sampled bodies to value-free canonical
+  skeletons; NCD compares skeletons, not dynamic values. Identical bytes are
+  guarded explicitly, and an unavailable service is reported, not faked.
+- Repeated near-identical responses inside `repeat_window` trigger the action.
+  `mark` bans the target for the session (`target_ban_ttl`); it does **not** trip
+  the proxy circuit.
+- `cooldown` and `disable` are the other actions. All three keep the raw
+  exchange in the audit log so a human can review the verdict.
+
+## Self-learning and hard quarantine
+
+The daemon keeps an epsilon-greedy prior over declared variants, mutations and
+lengths. Defaults: `epsilon=0.12`, `epsilon_min=0.02`, `epsilon_decay=0.995`.
+Decay follows observed attempts, not wall clock. One roll is taken per attempt
+and shared by all ranking stages, so exploration stays near 12% instead of
+stacking to ~22%. Use `learning_enabled: false` to turn it off; learning never
+invents a technique or a verdict.
+
+Attempts are labelled `Proxy Failed`, `WAF Blocked`, `Target Rejected` and
+`Target Response`:
+
+| Class | Training effect |
+|---|---|
+| Proxy Failed | counted in its own class; **never** trains and never yields a candidate |
+| WAF Blocked | weak negative signal (`strength=0.25`) |
+| Target Rejected | weak negative signal (`strength=0.25`) |
+| Target Response | full evidence only when attributed to a verified proxy |
+
+The Python worker tails `audit.path` from a persisted byte offset, atomically
+updates `state/learned_weights.json` and publishes `state/jobs_online.json`.
+Holdout hosts are counted but never enter training cells. Unverified signals
+may nudge weights and land only in `candidates`; a `jobs` (strike) entry needs a
+confirmed queue shift, a real dial address and two independently attributed
+proxy exits. One audit line contributes at most one identity, so noise cannot
+confirm itself.
+
+The dashboard card **Online Feedback Loop** shows state, processed episodes,
+outcome counters and accuracy. `POST /api/learning/toggle` pauses/resumes the
+worker; `POST /api/learning/feedback` applies explicit ±2.0 labels. Calibration
+(`make calibrate`) is native: local simulations plus loopback proxy/backend
+pairs, with train/validation split by host or lab ID.
+
+## CLI and local API
 
 ```text
-/? HTTP/1.1
-Host: <lab>
-
-GET /resources?<script>alert(1)</script> HTTP/1.1
-Host: <lab>
-
-GET /resources/images/blog.svg HTTP/1.1
-Host: <lab>
-
-GET /image/blog/posts/7.jpg HTTP/1.1
-Host: <lab>
-X-Omnislash-Tunnel: <nonce>
+omnislash check|scrape|fetch|serve|healthcheck
+omnislashd -config <daemon.json> [-once] [-job NAME]
 ```
 
-Back-end разбирает три вложенных запроса. `/resources?...` отражает payload
-без кодирования в `Location`, а статические файлы дают достаточно байт, чтобы
-перекрыть `Content-Length` главной страницы. Front-end читает это же число
-байт из back-end и кэширует смешанный ответ под `/`. Затем проба делает
-обычный `GET /` и требует маркер в теле; finding `cache_poisoned` выдаётся
-только после этой проверки.
+`serve` and `omnislashd` expose loopback JSON surfaces: `/stats`, `/status`,
+`/healthz`, `/readyz`, `/experience`, `/api/dashboard`, `/api/learning/status`,
+`/api/learning/toggle`, `/api/learning/feedback`, `/api/run` and
+`/api/caido/push`. `/api/run` is fail-closed: scope must be enabled and the
+target must pass the same allowlist and local resolution checks as any other
+dial. Missing action backends return `501`, never a fake success.
+
+## Verification
 
 ```bash
-go run ./cmd/omnislashd -config examples/daemon/daemon-cache-tunnel.json -once
-```
-
-Результат прогона: `statuses: [200, 200]`, findings `h2_tunnel_confirmed` и
-`cache_poisoned`, в теле закэшированного ответа — `Content-Type: text/html` и
-`<script>alert(1)</script>`. Лаба была доведена до `Solved`; так как инстанс
-одноразовый, для новой лабы замените хост в обоих JSON-файлах.
-
-## Эшелоны пайплайна
-
-Поверх транспортного ядра работают четыре эшелона. Каждый следующий использует
-результаты предыдущего, но не ослабляет safety-инварианты: fail-closed scope,
-глобальный лимит, stop statuses, карантин `unverified` и прямой выход `probe/`
-в обход Caido MITM.
-
-```text
-targets_verified.json ──> planner ──> MatrixScheduler (Targets × Proxies)
-                                            │
-              InfantryTier ─────────────────┤──── SniperTier
-              OSINT/calibration                   Last-Byte Sync
-              layer/WAF profiles                  cross-proxy verifier
-                    │                                  │
-                    └──────> ChainSynthesizer <────────┘
-                                     │
-                              ddmin + minimal artifact
-                                     │
-                         Caido Replay + Telegram + audit
-```
-
-| Эшелон | Задача | Ключевые модули | Запуск |
-|---|---|---|---|
-| 1 | Meta-controller, дифференциальная проверка, radar изменений периметра | `research/oracle.py`, `research/meta_controller.py`, `research/verifier.py`, `osint/diff_scanner.py`, `lab/run-radar.sh` | `make radar TARGET=example.com RADAR_ARGS="--skip-notify"` |
-| 2 | Локальный 0-day инкубатор, WAF grammar, Universal Keys, глобальная проекция | `research/knowledge_base.py`, `research/waf_inference.py`, `sandbox/`, `lab/run-incubator.sh`, `osint/global_projector.py` | `make incubate INCUBATE_ARGS="--skip-docker"`, `make project TECH="nginx+python+h1.1"` |
-| 3 | Двухлиговый пул, `N×M` планировщик, дифференциальный анализ прослоек | `proxy.go`, `pool.go`, `dialer.go`, `daemon/matrix_scheduler.go`, `research/layer_analyzer.py` | встроено в `omnislashd` и `research/`; проверка — `go test ./... -count=1` |
-| 4 | Реконструкция состояний, синтез цепочек, игровой арбитраж, минимальные артефакты | `research/state_and_chains.py`, `research/game_arbitrage.py`, `osint/caido_bridge.py`, `osint/notifier.py` | встроено в post-processing; проверка — `python3 -m unittest discover -s research -p "test_*.py"` |
-
-Ключевые инварианты эшелонов 3/4:
-
-- `SniperTier` — только `http_parsing` admission, `IQR < 20ms`, минимум три
-  замера и отсутствие бана за последний час. Фоновые OSINT-задачи в этот резерв
-  не допускаются; `AcquireSniper` не откатывается на Infantry.
-- Matrix scheduler держит `per_host_min_interval = 3s + jitter`; на `429` или
-  аномалию окно хоста уменьшается вдвое, хост уходит в кулдаун, суммарный RPS
-  распределяется по разным целям, а не по одной.
-- `ChainSynthesizer` принимает только подтверждённые находки; `unverified`
-  попадают в `skipped` и не участвуют в достижимости. `z3` опционален —
-  без него работает детерминированный BFS.
-- Любая находка перед отправкой в Caido/Telegram сжимается `ddmin` до
-  1-минимального запроса; отчёт `omnislash.minimal-artifact/v1` содержит
-  sha256, diff ответа, атрибуцию прокси и шаги Replay, но не генеративный текст.
-
-## Ротация, здоровье и кулдауны
-
-- Health-check открывает туннель и делает `GET probe_url`. Успех — прокси
-  живой, ошибка/таймаут — кулдаун `initial * multiplier^(n-1)` с потолком `max`.
-- Успешный dial или health-check сбрасывает серию ошибок и возвращает прокси в
-  ротацию.
-- `ban_statuses` дополнительно отправляет прокси в `ban_cooldown`.
-- Кулдаун не блокирует health-check: прокси может восстановиться раньше.
-- `stats`: `available`, `in_cooldown`, `successes`, `failures`, `bans`,
-  `inflight`, `latency_ms`, `egress_ip`, `validation_latency_ms`,
-  `last_error`, `cooldown_until`, плюс блок `scraper` с итогами последнего
-  обновления.
-
-## Ограничения и безопасность
-
-- **Не включайте `allow_direct`,** если не хотите, чтобы при исчерпании пула
-  запросы ушли с реального IP. По умолчанию это выключено, а в strict-режиме
-  запрещено на уровне конфига.
-- HTTP/1.1 keep-alive означает, что несколько запросов могут переиспользовать
-  одно TCP-соединение и один IP. Для smuggling-тестов обычно нужно новое
-  соединение на пробу — это и даёт ротацию.
-- TLS-параметры цели (SNI, ALPN, проверка сертификата) полностью на стороне
-  сканера; для проверки desync часто нужен `NextProtos: ["http/1.1"]`.
-- SOCKS5 резолвит домен на стороне прокси; CONNECT передаёт прокси имя хоста.
-  Так меньше DNS-утечек, но проверка адреса ложится на прокси. Для
-  безопасности включайте `scope` (см. выше): тогда адрес проверяется локально
-  до открытия туннеля, а `resolve_locally` пинует IP.
-- Health-check ходит на `probe_url` через каждый прокси. Убедитесь, что это
-  разрешено правилами провайдера/тестового стенда.
-- Прокси-провайдеры и целевые системы могут логировать трафик. Используйте
-  только свои прокси/стенды и только с письменного разрешения на тестирование.
-- `403` в `ban_statuses` может приводить к ложным срабатываниям и сжиганию
-  пула. Настройте список под свою задачу.
-- Для HTTP-целей (не HTTPS) CONNECT на порт 80 работает, но некоторые
-  прокси-провайдеры разрешают только 443. Проверяйте `check`/`fetch`.
-- Модуль не реализует HTTP/2 framing, priority-трюки и т.п. — это задача
-  сканера. Здесь только транспорт с ротацией IP.
-
-## Тесты
-
-```bash
-make test
-make race
-make vet
-make lint
-
-# Python-контуры (OSINT + research/Echelon 1-4)
-python3 -m unittest discover -s osint -p "test_*.py"
-python3 -m unittest discover -s research -p "test_*.py"
-
-# Adaptive probing: compact O(log2 N) diagnostic -> telemetry strike
-python3 osint/planner.py --in targets_verified.json --out jobs.json --adaptive --adaptive-plan-out adaptive-plan.json
-# после запуска omnislashd:
-python3 osint/planner.py --in targets_verified.json --out jobs.strike.json --adaptive --adaptive-telemetry omnislashd-audit.jsonl
-
-# Локальный E2E smoke без интернета
+go vet ./...
+env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy \
+  go test -race ./... -count=1
+python3 -m unittest discover -s research -p 'test_*.py'
+python3 -m unittest discover -s osint -p 'test_*.py'
 bash lab/e2e_smoke_test.sh
-
-# Чистота патча
+make release
 git diff --check
 ```
 
-Тесты поднимают локальные fake SOCKS5/CONNECT/TLS-серверы и проверяют
-handshake, ротацию, auth, health-check, баны, gateway, replay тела запроса,
-scope/SSRF-правила, scrape с hot-swap и валидацию через tls-client. Отдельно
-есть негативные admission-фикстуры: прокси-буфер, переписчик framing,
-обрыватель и MITM с подменённым сертификатом; тесты сессий проверяют, что один
-эксперимент не меняет exit-IP и не делает direct fallback при смерти прокси.
+The suite covers handshake rotation through one CONNECT proxy, exit attribution
+after TLS, dead-proxy silence, strict fingerprint parsing, baseline-before-probe,
+tarpit detection, epsilon roll sharing, outcome classification, proxy-failure
+exclusion, weak-signal scaling and the two-exit strike gate. All lab fixtures
+are loopback; no external network is needed for tests or calibration.
 
-## Лицензия
+## Further reading
 
-MIT. Полный текст — в [LICENSE](LICENSE).
+- [MANIFESTO.md](MANIFESTO.md) — what this project is and will not be.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — invariants mapped to code and tests.
+- [lab/README.md](lab/README.md) — authorized local labs and smoke checks.
 
-Модуль использует `gocolly/colly/v2`, `projectdiscovery/networkpolicy`,
-`bogdanfinn/tls-client` и его `fhttp`. Их лицензии действуют и на бинарник;
-проверьте их перед распространением.
+MIT licensed; see [LICENSE](LICENSE). Use only on systems you own or have
+written authorization to test.

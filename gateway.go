@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -156,6 +157,15 @@ func (g *Gateway) handleConnect(ctx context.Context, conn net.Conn, br *bufio.Re
 		target = net.JoinHostPort(strings.Trim(target, "[]"), "443")
 	}
 
+	if df := g.dialer.pool.Deception(); df != nil && df.Enabled() {
+		host, _, _ := net.SplitHostPort(target)
+		if _, block := df.ShouldBlock(host, "/"); block {
+			g.audit(AuditEvent{Kind: "connect", Target: target, Reason: "deception_target_banned"})
+			writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target banned by deception filter")
+			return
+		}
+	}
+
 	// Reject out-of-scope targets with a distinct status. Otherwise a policy
 	// violation and a dead proxy both surface as 502 and are impossible to tell
 	// apart from the client side. The dialer checks again; this is not a
@@ -249,11 +259,30 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 		target = net.JoinHostPort(strings.Trim(target, "[]"), "80")
 	}
 
+	if df := g.dialer.pool.Deception(); df != nil && df.Enabled() {
+		if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
+			g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_target_banned"})
+			writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target banned by deception filter")
+			return
+		}
+	}
+
 	if _, err := g.dialer.pool.scope.CheckTarget(ctx, target); err != nil {
 		g.log.Debug("gateway target rejected by scope", "target", target, "error", err)
 		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "scope_rejected"})
 		writeHTTPError(conn, http.StatusForbidden, "Forbidden", "target is outside the configured scope")
 		return
+	}
+
+	// Calibrate against nonexistent paths before the first real request. The
+	// control requests use the same scope-checked pool path but bypass this
+	// handler so they cannot recurse into EnsureBaseline.
+	if df := g.dialer.pool.Deception(); df != nil && df.Enabled() {
+		if _, err := df.EnsureBaseline(ctx, "http://"+req.URL.Host, pathPrefix(req.URL.Path), g.baselineDoRequest); err != nil {
+			g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_baseline_failed"})
+			writeHTTPError(conn, http.StatusServiceUnavailable, "Service Unavailable", "deception baseline unavailable")
+			return
+		}
 	}
 
 	ctx, waitErr := g.dialer.pool.WaitGlobal(ctx)
@@ -354,6 +383,55 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 	if err := resp.Write(conn); err != nil {
 		g.log.Debug("gateway response write failed", "target", target, "error", err)
 	}
+}
+
+// baselineDoRequest is the gateway's non-recursive control path for deception
+// calibration. It reuses the pool's scope checks, rate limit and circuit, but
+// never re-enters handleHTTP or InspectHTTPResponse.
+func (g *Gateway) baselineDoRequest(ctx context.Context, rawURL string) (*http.Response, time.Duration, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	target := u.Host
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		target = net.JoinHostPort(strings.Trim(target, "[]"), "80")
+	}
+	if _, err := g.dialer.pool.scope.CheckTarget(ctx, target); err != nil {
+		return nil, 0, err
+	}
+	if _, err := g.dialer.pool.WaitGlobal(ctx); err != nil {
+		return nil, 0, err
+	}
+	if err := g.dialer.pool.Allow(); err != nil {
+		return nil, 0, err
+	}
+	pr, pickErr := g.dialer.pool.pick(nil, target)
+	var upstream net.Conn
+	if pickErr == nil {
+		upstream, err = g.dialer.dialProxy(ctx, pr, target)
+	} else if g.dialer.pool.cfg.AllowDirect {
+		upstream, err = g.dialer.directDialContext(ctx, "tcp", target)
+	} else {
+		return nil, 0, pickErr
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer upstream.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.RequestURI = ""
+	req.Close = true
+	start := time.Now()
+	if err := req.Write(upstream); err != nil {
+		return nil, time.Since(start), err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), req)
+	return resp, time.Since(start), err
 }
 
 func (g *Gateway) authorized(header string) bool {

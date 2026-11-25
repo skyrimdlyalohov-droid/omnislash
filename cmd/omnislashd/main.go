@@ -125,6 +125,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if transport.Safety.Deception.Enabled && transport.Safety.Deception.SemanticService && *jobName == "" && !*once {
+		if _, err := omnislash.StartSemanticService(ctx, transport.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
+		} else {
+			logger.Info("semantic skeleton service started", "addr", transport.Safety.Deception.SemanticAddr)
+		}
+	}
+
 	if *jobName != "" || *once {
 		var outcomes []daemon.Outcome
 		if *jobName != "" {

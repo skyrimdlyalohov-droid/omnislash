@@ -9,6 +9,11 @@ weights as a weak signal but are only ever written to the ``candidates`` array:
 the daemon refuses to execute them until the same path/framing was confirmed
 from two independently attributed proxy exits.
 
+Attempts are labelled ``Proxy Failed`` / ``WAF Blocked`` / ``Target Rejected`` /
+``Target Response``. Only real target responses train; proxy failures are counted
+but never used as evidence. WAF pages and application rejections are weak
+negative signals.
+
 Stdlib only; no network, Docker or Node.js is used.
 """
 
@@ -46,6 +51,13 @@ try:
         feature_key,
         load_weights,
         normalize_tech,
+        outcome_label,
+        OUTCOME_PROXY_FAILED,
+        OUTCOME_SLUGS,
+        OUTCOME_TARGET_REJECTED,
+        OUTCOME_TARGET_RESPONSE,
+        OUTCOME_WAF_BLOCKED,
+        trainable_outcome,
     )
     from research.semantic_analyzer import (
         ResponseShape,
@@ -68,6 +80,13 @@ except ImportError:  # pragma: no cover - direct script execution
         feature_key,
         load_weights,
         normalize_tech,
+        outcome_label,
+        OUTCOME_PROXY_FAILED,
+        OUTCOME_SLUGS,
+        OUTCOME_TARGET_REJECTED,
+        OUTCOME_TARGET_RESPONSE,
+        OUTCOME_WAF_BLOCKED,
+        trainable_outcome,
     )
     from semantic_analyzer import (  # type: ignore
         ResponseShape,
@@ -80,6 +99,9 @@ JOBS_SCHEMA = "omnislash.jobs-online/v1"
 OFFSET_SCHEMA = "omnislash.online-offset/v1"
 STATUS_SCHEMA = "omnislash.online-status/v1"
 MIN_CROSS_PROXY_IDENTITIES = 2
+# Unverified events, WAF pages and application rejections are weak signals:
+# they can nudge a cell but can never become a verified strike job.
+WEAK_SIGNAL_STRENGTH = 0.25
 
 CONFIRMED_FINDINGS = frozenset({
     "h2_cl_confirmed",
@@ -319,10 +341,20 @@ class OnlineLoop:
         else:
             dominant = ResponseShape.CLEAN_BASELINE
 
+        outcome = outcome_label(rec)
+        trainable = trainable_outcome(outcome)
+        attribution = rec.get("attribution")
+        attribution = attribution if isinstance(attribution, dict) else {}
+        verified = bool(attribution.get("verified"))
+        # A hypothesis is publishable only when a verified proxy exit observed
+        # a real target response. WAF pages, parser rejections and unverified
+        # events remain weak ranking signals, never strike evidence.
+        confirmed = bool(confirmed and verified and outcome == OUTCOME_TARGET_RESPONSE)
         features: Dict[str, str] = {
             "probe": str(rec.get("probe") or ""),
             "tls": str(rec.get("tls") or ""),
             "shape": dominant.value,
+            "outcome:" + OUTCOME_SLUGS[outcome]: "1",
         }
         if cl:
             features[feature_key("cl", cl)] = "1"
@@ -349,14 +381,18 @@ class OnlineLoop:
                 features["negative_reason"] = "+".join(reasons)
 
         labels = [str(tag).lower().replace("_", "-") for tag in (rec.get("tags") or [])]
-        example = TrainingExample(
-            host=host,
-            tech=tech,
-            features=features,
-            label=1.0 if confirmed else 0.0,
-            source="online-audit",
-        )
-        enforce_negative_tags(example, labels)
+        if outcome in {OUTCOME_WAF_BLOCKED, OUTCOME_TARGET_REJECTED}:
+            labels.append(OUTCOME_SLUGS[outcome])
+        example: Optional[TrainingExample] = None
+        if trainable:
+            example = TrainingExample(
+                host=host,
+                tech=tech,
+                features=features,
+                label=1.0 if confirmed else 0.0,
+                source="online-audit",
+            )
+            enforce_negative_tags(example, labels)
         return {
             "host": host,
             "tech": tech,
@@ -364,7 +400,10 @@ class OnlineLoop:
             "path": path,
             "dial_addr": dial_addr,
             "finding": next((k for k in findings if k in CONFIRMED_FINDINGS), ""),
-            "confirmed": confirmed and example.label > 0.0,
+            "confirmed": bool(example is not None and confirmed and example.label > 0.0),
+            "outcome": outcome,
+            "trainable": trainable,
+            "verified": verified,
             "shapes": [shape.value for shape in shapes],
             "features": features,
             "example": example,
@@ -374,8 +413,27 @@ class OnlineLoop:
 
     def process_record(self, rec: Dict[str, Any]) -> Dict[str, Any]:
         analysis = self._analyse(rec)
-        example: TrainingExample = analysis["example"]
         weights = load_weights(self.weights_path)
+        meta = weights.setdefault("online", {})
+        outcome = analysis["outcome"]
+        outcomes = meta.setdefault("outcomes", {})
+        slug = OUTCOME_SLUGS[outcome]
+        outcomes[slug] = int(outcomes.get(slug, 0)) + 1
+
+        example: Optional[TrainingExample] = analysis["example"]
+        if example is None:
+            # Proxy failure: log the class, never train on it and never publish
+            # a candidate from it. Transport health is not attack evidence.
+            atomic_write_json(self.weights_path, weights)
+            self.write_status(weights)
+            return {
+                "key": "%s:%s:%s" % (rec.get("job", ""), rec.get("attempt", 0), rec.get("time", "")),
+                "applied": False,
+                "outcome": outcome,
+                "confirmed": False,
+                "reason": "proxy-failed-no-target-response",
+            }
+
         learner = ExperienceLearner(
             alpha=self.alpha if self.alpha is not None else float(weights.get("alpha", 0.3)),
             exact_weight=float(weights.get("exact_weight", 0.8)),
@@ -383,11 +441,20 @@ class OnlineLoop:
         )
         rank_features = _ranking_features(example)
         before = learner.score(weights, rank_features, example.host, example.tech)
+        # A real, cross-proxy-verified target response is full evidence. Every
+        # other class (unverified attribution, WAF page, parser rejection)
+        # only weakly nudges weights and can never become a strike job.
+        strength = 1.0
+        if (
+            not analysis["verified"]
+            or outcome in {OUTCOME_WAF_BLOCKED, OUTCOME_TARGET_REJECTED}
+            or not analysis["confirmed"]
+        ):
+            strength = WEAK_SIGNAL_STRENGTH
         result = apply_online_example(
-            weights, example, alpha=self.alpha, weight=1.0
+            weights, example, alpha=self.alpha, weight=1.0, strength=strength
         )
 
-        meta = weights.setdefault("online", {})
         if result.get("applied"):
             key = "%s|%s|%s" % (
                 example.host, analysis["path"] or "*", analysis["cl"] or 0
@@ -412,6 +479,8 @@ class OnlineLoop:
             "key": "%s:%s:%s" % (rec.get("job", ""), rec.get("attempt", 0), rec.get("time", "")),
             "applied": bool(result.get("applied")),
             "confirmed": analysis["confirmed"],
+            "outcome": outcome,
+            "strength": strength,
             "shapes": analysis["shapes"],
             "score_before": before,
             "score_after": result.get("score_after", before),
@@ -555,6 +624,7 @@ class OnlineLoop:
                 "strike": len(jobs.get("jobs") or []),
                 "candidates": len(jobs.get("candidates") or []),
             },
+            "outcomes": dict(meta.get("outcomes") or {}),
             "last_error": self._last_error,
             "updated_at": _now(),
         }

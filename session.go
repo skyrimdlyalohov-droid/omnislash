@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // Session pins one proxy, and therefore one exit IP, for the lifetime of one
@@ -22,6 +24,12 @@ type Session struct {
 	proxy   *Proxy
 	expires time.Time
 	now     func() time.Time
+
+	// fingerprint is chosen once at session creation, so every connection in
+	// one experiment presents the same ClientHello profile. Empty means plain
+	// crypto/tls (explicit tls_fingerprints: [] configuration).
+	fingerprint     utls.ClientHelloID
+	fingerprintName string
 
 	mu      sync.Mutex
 	isClose bool
@@ -52,17 +60,33 @@ func (d *Dialer) NewSession(ttl time.Duration) (*Session, error) {
 		pr = nil
 	}
 	now := d.pool.now()
-	return &Session{
+	s := &Session{
 		dialer:  d,
 		proxy:   pr,
 		expires: now.Add(ttl),
 		now:     d.pool.now,
-	}, nil
+	}
+	if len(d.fingerprints) > 0 {
+		seq := d.fpSeq.Add(1) - 1
+		id := d.fingerprints[int(seq%uint64(len(d.fingerprints)))]
+		s.fingerprint = id
+		s.fingerprintName = fingerprintName(id)
+	}
+	return s, nil
 }
 
 // Proxy returns the pinned proxy, or nil for a direct-egress session. Its
 // Label is safe to log.
 func (s *Session) Proxy() *Proxy { return s.proxy }
+
+// Fingerprint returns the ClientHello profile pinned for this session, or ""
+// when the session uses crypto/tls. It is safe to log.
+func (s *Session) Fingerprint() string {
+	if s == nil {
+		return ""
+	}
+	return s.fingerprintName
+}
 
 // ExpiresAt returns the explicit session deadline.
 func (s *Session) ExpiresAt() time.Time { return s.expires }
@@ -135,6 +159,11 @@ func (s *Session) DialTLSContext(ctx context.Context, network, addr string, cfg 
 		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
 			cfg.ServerName = host
 		}
+	}
+	if s.fingerprintName != "" {
+		// raw already came from s.DialContext: it passed scope checks and is
+		// pinned to s.proxy. uTLS only wraps it; it never opens a socket.
+		return dialTLSWithFingerprint(ctx, raw, addr, cfg, s.fingerprint)
 	}
 	tc := tls.Client(raw, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {

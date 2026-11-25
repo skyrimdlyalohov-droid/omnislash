@@ -29,6 +29,7 @@ type OnlineStatus struct {
 	AccuracyHistory []OnlineAccuracyPoint `json:"accuracy_history,omitempty"`
 	Examples        int                   `json:"examples"`
 	Jobs            OnlineJobCounts       `json:"jobs"`
+	Outcomes        map[string]int        `json:"outcomes,omitempty"`
 	LastError       string                `json:"last_error,omitempty"`
 	UpdatedAt       string                `json:"updated_at,omitempty"`
 }
@@ -270,6 +271,12 @@ func OnlineSnapshot(opts OnlineLoopOptions, process *OnlineProcess) OnlineStatus
 		status.Examples = intField(raw, "examples")
 		status.Accuracy = floatField(raw, "accuracy")
 		status.AccuracyDelta = floatField(raw, "accuracy_delta")
+		if counts, ok := raw["outcomes"].(map[string]any); ok {
+			status.Outcomes = make(map[string]int, len(counts))
+			for name, value := range counts {
+				status.Outcomes[name] = intField(map[string]any{name: value}, name)
+			}
+		}
 		if value, ok := raw["last_error"].(string); ok {
 			status.LastError = value
 		}

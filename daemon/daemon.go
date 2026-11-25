@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -63,6 +64,13 @@ type Daemon struct {
 	// nil when cfg.OnlineLearning is false.
 	online *onlineRuntime
 
+	// observations counts real attempts and drives exponential epsilon decay.
+	observations atomic.Int64
+	// rollFn and shuffleFn are injectable so exploration can be tested without
+	// depending on the global random source.
+	rollFn    func() float64
+	shuffleFn func(n int, swap func(i, j int))
+
 	slots  chan struct{}
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
@@ -92,14 +100,16 @@ func New(cfg *Config, exec Executor, logger *slog.Logger, audit io.Writer) (*Dae
 		conc = 1
 	}
 	d := &Daemon{
-		cfg:      *cfg,
-		exec:     exec,
-		log:      logger,
-		audit:    audit,
-		now:      time.Now,
-		slots:    make(chan struct{}, conc),
-		states:   make(map[string]*JobState, len(cfg.Jobs)),
-		learning: NewExperienceStore(""),
+		cfg:       *cfg,
+		exec:      exec,
+		log:       logger,
+		audit:     audit,
+		now:       time.Now,
+		slots:     make(chan struct{}, conc),
+		states:    make(map[string]*JobState, len(cfg.Jobs)),
+		learning:  NewExperienceStore(""),
+		rollFn:    rand.Float64,
+		shuffleFn: rand.Shuffle,
 	}
 	if cfg.IsLearningEnabled() {
 		d.learning = NewExperienceStore(cfg.LogFile)
@@ -468,18 +478,21 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 		if err := ctx.Err(); err != nil {
 			return Outcome{Job: j.Name, Result: last, Err: err}
 		}
+		// One epsilon decision for the whole attempt: all ranking stages either
+		// explore or exploit. It is taken before any probe bytes are written.
+		roll := d.exploration()
 		// Learning changes the *attempt*, not the declared job: the original
 		// config stays as the operator wrote it, while each attempt uses the
 		// currently best-ranked variant or mutation.
-		attemptJob := d.applyLearning(j)
+		attemptJob := d.applyLearningWithRoll(j, roll)
 		p, err := buildProbe(&attemptJob)
 		if err != nil {
-			d.record(&attemptJob, attempt, nil, err, false)
+			d.recordAttempt(&attemptJob, attempt, nil, err, false, roll)
 			return Outcome{Job: j.Name, Result: last, Err: err}
 		}
 		res, err := d.exec.Run(ctx, target, p, attemptJob.tlsMode())
 		success := jobSucceeded(&attemptJob, res, err)
-		d.record(&attemptJob, attempt, res, err, success)
+		d.recordAttempt(&attemptJob, attempt, res, err, success, roll)
 		last, lastErr = res, err
 		if success {
 			d.log.Info("job succeeded", "job", j.Name, "attempt", attempt)
@@ -495,10 +508,58 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 	return Outcome{Job: j.Name, Result: last, Err: lastErr}
 }
 
-// applyLearning returns a per-attempt copy of the job with learned choices
-// applied. The stored config is never mutated, so a human can always reproduce
-// the exact declared experiment from the JSON file.
+// explorationRoll is decided once per attempt. Both ranking stages consume the
+// same decision: either all of them explore, or all of them exploit. Taking an
+// independent roll per stage would produce a ~22.5% exploration rate with
+// epsilon=0.12 instead of the configured 10-15%.
+type explorationRoll struct {
+	explore bool
+	epsilon float64
+}
+
+func (d *Daemon) epsilon() float64 {
+	if d == nil || !d.cfg.IsLearningEnabled() {
+		return 0
+	}
+	return d.cfg.LearningPolicy.epsilonAt(d.observations.Load())
+}
+
+func (d *Daemon) exploration() explorationRoll {
+	epsilon := d.epsilon()
+	if d == nil || d.rollFn == nil || epsilon <= 0 {
+		return explorationRoll{}
+	}
+	return explorationRoll{explore: d.rollFn() < epsilon, epsilon: epsilon}
+}
+
+func (d *Daemon) exploreStrings(candidates []string) []string {
+	out := append([]string(nil), candidates...)
+	if d == nil || d.shuffleFn == nil || len(out) < 2 {
+		return out
+	}
+	d.shuffleFn(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
+
+func (d *Daemon) exploreInts(candidates []int) []int {
+	out := append([]int(nil), candidates...)
+	if d == nil || d.shuffleFn == nil || len(out) < 2 {
+		return out
+	}
+	d.shuffleFn(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
+
+// applyLearning returns a per-attempt copy with learned choices applied and no
+// exploration. Tests and one-shot UI runs use the deterministic path.
 func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
+	return d.applyLearningWithRoll(j, explorationRoll{})
+}
+
+// applyLearningWithRoll applies the single exploration decision to every
+// ranking stage. The stored config is never mutated, so a human can always
+// reproduce the exact declared experiment from the JSON file.
+func (d *Daemon) applyLearningWithRoll(j *JobConfig, roll explorationRoll) JobConfig {
 	c := *j
 	if d == nil || d.learning == nil || !d.cfg.IsLearningEnabled() {
 		return c
@@ -516,6 +577,40 @@ func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
 		TLS:       c.tlsMode(),
 		Probe:     c.Probe,
 		TechStack: tech,
+	}
+
+	// Exploration bypasses every prior in every ranking stage. It is a single
+	// decision for the whole attempt, so the effective rate stays at epsilon.
+	if roll.explore {
+		if len(c.DeclaredLengths) > 1 {
+			c.DeclaredLengths = d.exploreInts(c.DeclaredLengths)
+		}
+		if c.Probe == "differential-fuzz" {
+			candidates := c.Mutations
+			if len(candidates) == 0 {
+				mutator := probe.Mutator{TechStack: c.TechStack}
+				for _, m := range mutator.Mutations() {
+					candidates = append(candidates, m.Name)
+				}
+			}
+			c.Mutations = d.exploreStrings(candidates)
+		}
+		if c.Variant == "auto" {
+			var candidates []string
+			switch c.Probe {
+			case "smuggle":
+				candidates = []string{string(probe.VariantCLTE), string(probe.VariantTECL), string(probe.VariantTETE)}
+				if c.tlsMode() == "h2" {
+					candidates = append(candidates, string(probe.VariantH2Downgrade))
+				}
+			case "smuggle-chain":
+				candidates = []string{string(probe.VariantCLTE), string(probe.VariantTECL)}
+			}
+			if len(candidates) > 0 {
+				c.Variant = d.exploreStrings(candidates)[0]
+			}
+		}
+		return c
 	}
 
 	// The streaming loop hot-reloads weights between attempts. Its priors only
@@ -639,10 +734,19 @@ type Record struct {
 	Findings    []probe.Finding   `json:"findings,omitempty"`
 	Statuses    []int             `json:"statuses,omitempty"`
 	Learning    LearningMeta      `json:"learning,omitempty"`
-	Result      *probe.Result     `json:"result,omitempty"`
+	// Outcome separates proxy failures from real target responses. It is the
+	// only field the learning loop may use to decide whether to train.
+	Outcome string        `json:"outcome,omitempty"`
+	Explore bool          `json:"explore,omitempty"`
+	Result  *probe.Result `json:"result,omitempty"`
 }
 
 func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error, success bool) {
+	d.recordAttempt(j, attempt, res, err, success, explorationRoll{})
+}
+
+func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err error, success bool, roll explorationRoll) {
+	label := classifyOutcome(res, err)
 	rec := Record{
 		Time:     d.now(),
 		Job:      j.Name,
@@ -652,6 +756,8 @@ func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error,
 		TLS:      j.tlsMode(),
 		Success:  success,
 		Learning: learningMeta(j, res),
+		Outcome:  string(label),
+		Explore:  roll.explore,
 	}
 	if err != nil {
 		rec.Error = err.Error()
@@ -675,6 +781,13 @@ func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error,
 	}
 	if d.learning != nil && d.cfg.IsLearningEnabled() {
 		d.learning.Observe(rec)
+	}
+	// Decay is driven by observed attempts, not by wall clock: a quiet lab does
+	// not keep exploring forever and a busy one settles faster.
+	d.observations.Add(1)
+	if d.log != nil {
+		d.log.Debug("probe outcome", "job", j.Name, "attempt", attempt,
+			"outcome", string(label), "trainable", label.Trainable(), "explore", roll.explore)
 	}
 }
 

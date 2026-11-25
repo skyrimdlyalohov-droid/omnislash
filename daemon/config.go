@@ -7,6 +7,7 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -41,6 +42,10 @@ type Config struct {
 	// the daemon reads its own JSONL audit log at startup and uses observed
 	// success rates to rank variants and mutations on subsequent attempts.
 	LearningEnabled *bool `json:"learning_enabled,omitempty"`
+	// LearningPolicy controls epsilon-greedy exploration. One roll is taken per
+	// attempt and shared by every ranking stage, so exploration never stacks to
+	// ~22.5%. Epsilon decays exponentially until it reaches EpsilonMin.
+	LearningPolicy LearningPolicy `json:"learning_policy,omitempty"`
 	// LearningSources are additional audit JSONL files to replay at startup.
 	// Paths are resolved against the daemon config directory. The daemon's own
 	// log_file is always included in addition to these.
@@ -54,6 +59,44 @@ type Config struct {
 	OnlinePaths OnlineLearningPaths `json:"online_paths,omitempty"`
 
 	Jobs []JobConfig `json:"jobs"`
+}
+
+// LearningPolicy is the exploration schedule for learned rankings.
+// Epsilon starts at 0.12 (inside the 10-15% band), decays per observed attempt
+// and never drops below EpsilonMin. Explicit zeros mean "use the defaults".
+type LearningPolicy struct {
+	Epsilon      float64 `json:"epsilon,omitempty"`
+	EpsilonMin   float64 `json:"epsilon_min,omitempty"`
+	EpsilonDecay float64 `json:"epsilon_decay,omitempty"`
+}
+
+func (p LearningPolicy) withDefaults() LearningPolicy {
+	if p.Epsilon <= 0 {
+		p.Epsilon = 0.12
+	}
+	if p.EpsilonMin <= 0 {
+		p.EpsilonMin = 0.02
+	}
+	if p.EpsilonDecay <= 0 {
+		p.EpsilonDecay = 0.995
+	}
+	return p
+}
+
+// epsilonAt returns the exploration probability after n observed attempts.
+func (p LearningPolicy) epsilonAt(n int64) float64 {
+	p = p.withDefaults()
+	if n < 0 {
+		n = 0
+	}
+	value := p.EpsilonMin + (p.Epsilon-p.EpsilonMin)*math.Pow(p.EpsilonDecay, float64(n))
+	if value < p.EpsilonMin {
+		return p.EpsilonMin
+	}
+	if value > p.Epsilon {
+		return p.Epsilon
+	}
+	return value
 }
 
 // OnlineLearningPaths names the files owned by the streaming feedback loop.
@@ -195,6 +238,16 @@ func resolvePath(base, p string) string {
 func (c *Config) Validate() error {
 	if c.OmnislashConfig == "" {
 		return fmt.Errorf("daemon: omnislash_config is required")
+	}
+	policy := c.LearningPolicy.withDefaults()
+	if policy.Epsilon < 0 || policy.Epsilon > 1 {
+		return fmt.Errorf("daemon: learning_policy.epsilon must be in [0,1]")
+	}
+	if policy.EpsilonMin < 0 || policy.EpsilonMin > policy.Epsilon {
+		return fmt.Errorf("daemon: learning_policy.epsilon_min must be in [0,epsilon]")
+	}
+	if policy.EpsilonDecay <= 0 || policy.EpsilonDecay > 1 {
+		return fmt.Errorf("daemon: learning_policy.epsilon_decay must be in (0,1]")
 	}
 	if c.PollInterval.Std() < 0 {
 		return fmt.Errorf("daemon: poll_interval must not be negative")

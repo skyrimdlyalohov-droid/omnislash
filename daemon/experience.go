@@ -49,6 +49,12 @@ type ExperienceStat struct {
 	SeedSuccesses int           `json:"seed_successes,omitempty"`
 	SeedSources   []string      `json:"seed_sources,omitempty"`
 	LastSuccess   time.Time     `json:"last_success,omitempty"`
+	// Outcome counters keep the three failure classes separate. Proxy failures
+	// never contribute to Attempts: the target was never reached.
+	ProxyFailures   int `json:"proxy_failures,omitempty"`
+	WAFBlocks       int `json:"waf_blocks,omitempty"`
+	TargetRejects   int `json:"target_rejects,omitempty"`
+	TargetResponses int `json:"target_responses,omitempty"`
 }
 
 // Score is a Laplace-smoothed success probability. Curated seeds are counted,
@@ -206,25 +212,56 @@ func (s *ExperienceStore) addSeed(key ExperienceKey, attempts, successes int, se
 }
 
 func (s *ExperienceStore) observe(rec Record) {
+	label := outcomeOf(rec)
 	key := keyFromRecord(rec)
-	s.observeKey(key, rec)
-	// A second, host-independent cell lets techniques proven on previous labs
-	// seed the prior for a fresh instance of the same technique. Exact-host
-	// evidence always wins once it exists.
-	s.observeKey(globalKey(key), rec)
+	// A dead proxy is not negative evidence against a probe variant: it is
+	// counted in its own class and never enters Attempts. A second,
+	// host-independent cell lets techniques proven on previous labs seed the
+	// prior for a fresh instance of the same technique.
+	s.observeKey(key, label, rec.Success, rec.Time)
+	s.observeKey(globalKey(key), label, rec.Success, rec.Time)
 }
 
-func (s *ExperienceStore) observeKey(key ExperienceKey, rec Record) {
+func outcomeOf(rec Record) OutcomeLabel {
+	if label, ok := ParseOutcomeLabel(rec.Outcome); ok {
+		return label
+	}
+	if rec.Result == nil {
+		if rec.Error != "" {
+			return OutcomeProxyFailed
+		}
+		// Legacy in-memory/playbook records carry no result bytes. They are
+		// retained as target responses so old audit logs stay readable, while
+		// new records always carry an explicit outcome label.
+		return OutcomeTargetResponse
+	}
+	return classifyOutcome(rec.Result, nil)
+}
+
+func (s *ExperienceStore) observeKey(key ExperienceKey, label OutcomeLabel, success bool, when time.Time) {
 	id := key.id()
 	st, ok := s.stats[id]
 	if !ok {
 		st = &ExperienceStat{Key: key}
 		s.stats[id] = st
 	}
+	switch label {
+	case OutcomeProxyFailed:
+		st.ProxyFailures++
+		return
+	case OutcomeWAFBlocked:
+		st.WAFBlocks++
+	case OutcomeTargetRejected:
+		st.TargetRejects++
+	case OutcomeTargetResponse:
+		st.TargetResponses++
+	}
 	st.Attempts++
-	if rec.Success {
+	// Only a genuine target response can turn into a success. A WAF page or a
+	// parser rejection is negative evidence at best, never proof of a finding.
+	if success && label == OutcomeTargetResponse {
 		st.Successes++
-		st.LastSuccess = rec.Time
+		st.LastSuccess = when
 	}
 }
 

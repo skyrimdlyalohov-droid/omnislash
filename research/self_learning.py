@@ -61,7 +61,36 @@ SOLUTION_DERIVED_MARKERS = ("solution-derived", "playbook:")
 FORCED_NEGATIVE_TAGS = frozenset({
     "waf-stub", "waf_stub", "false-positive", "false_positive",
     "negative-template", "negative_template", "not-finding", "not_finding",
+    "waf-blocked", "waf_blocked", "target-rejected", "target_rejected",
 })
+
+# Outcome classes mirror daemon/outcome.go. Proxy failures are never evidence:
+# the target was not reached, so nothing was learned about the technique.
+OUTCOME_PROXY_FAILED = "Proxy Failed"
+OUTCOME_WAF_BLOCKED = "WAF Blocked"
+OUTCOME_TARGET_REJECTED = "Target Rejected"
+OUTCOME_TARGET_RESPONSE = "Target Response"
+OUTCOME_SLUGS = {
+    OUTCOME_PROXY_FAILED: "proxy-failed",
+    OUTCOME_WAF_BLOCKED: "waf-blocked",
+    OUTCOME_TARGET_REJECTED: "target-rejected",
+    OUTCOME_TARGET_RESPONSE: "target-response",
+}
+_OUTCOME_ALIASES = {
+    "proxy failed": OUTCOME_PROXY_FAILED,
+    "proxy-failed": OUTCOME_PROXY_FAILED,
+    "proxy_failed": OUTCOME_PROXY_FAILED,
+    "waf blocked": OUTCOME_WAF_BLOCKED,
+    "waf-blocked": OUTCOME_WAF_BLOCKED,
+    "waf_blocked": OUTCOME_WAF_BLOCKED,
+    "target rejected": OUTCOME_TARGET_REJECTED,
+    "target-rejected": OUTCOME_TARGET_REJECTED,
+    "target_rejected": OUTCOME_TARGET_REJECTED,
+    "target response": OUTCOME_TARGET_RESPONSE,
+    "target-response": OUTCOME_TARGET_RESPONSE,
+    "target_response": OUTCOME_TARGET_RESPONSE,
+}
+_WAF_BODY_MARKERS = ("captcha", "access denied", "request blocked", "blocked by", "waf")
 
 _CL_RE = re.compile(r"content-length\s*:\s*(\d+)", re.I)
 _PATH_RE = re.compile(r"\b(?:GET|POST|PUT|HEAD|PATCH|DELETE)\s+(\S+)\s+HTTP/", re.I)
@@ -159,6 +188,43 @@ def _audit_identity(rec: Dict[str, Any], fallback_host: str = "*") -> Tuple[str,
     return host, tech
 
 
+def outcome_label(rec: Dict[str, Any]) -> str:
+    """Return the canonical outcome of one daemon audit record.
+
+    New records carry the Go-side label. Older records are classified from
+    their responses so historical audits remain usable, but a record with no
+    response at all is always a proxy failure and never training evidence.
+    """
+    explicit = str(rec.get("outcome") or rec.get("outcome_label") or "").strip()
+    if explicit:
+        label = _OUTCOME_ALIASES.get(explicit.lower())
+        if label:
+            return label
+    result = rec.get("result") or {}
+    responses = [
+        r for r in (result.get("responses") or [])
+        if isinstance(r, dict) and int(r.get("status") or 0) > 0
+    ]
+    if not responses:
+        for status in rec.get("statuses") or []:
+            responses.append({"status": int(status), "body": ""})
+    if not responses:
+        return OUTCOME_PROXY_FAILED
+    for response in responses:
+        status = int(response.get("status") or 0)
+        body = str(response.get("body") or "").lower()
+        if status in {403, 406, 429, 503} and any(m in body for m in _WAF_BODY_MARKERS):
+            return OUTCOME_WAF_BLOCKED
+    last = responses[-1]
+    if int(last.get("status") or 0) in {400, 404, 405, 411, 413, 414, 431, 501}:
+        return OUTCOME_TARGET_REJECTED
+    return OUTCOME_TARGET_RESPONSE
+
+
+def trainable_outcome(label: str) -> bool:
+    return label != OUTCOME_PROXY_FAILED
+
+
 def _raw_request_text(rec: Dict[str, Any]) -> str:
     result = rec.get("result") or {}
     chunks: List[str] = []
@@ -178,6 +244,9 @@ def examples_from_audit(path: str, fallback_host: str = "*") -> List[TrainingExa
     """
     out: List[TrainingExample] = []
     for rec in _read_jsonish(path):
+        outcome = outcome_label(rec)
+        if not trainable_outcome(outcome):
+            continue
         result = rec.get("result") or {}
         responses = result.get("responses") or []
         host, tech = _audit_identity(rec, fallback_host)
@@ -219,6 +288,7 @@ def examples_from_audit(path: str, fallback_host: str = "*") -> List[TrainingExa
                 "probe": str(rec.get("probe") or ""),
                 "tls": str(rec.get("tls") or ""),
                 "shape": shape.shape.value,
+                "outcome:" + OUTCOME_SLUGS[outcome]: "1",
             }
             if cl:
                 features[feature_key("cl", cl)] = "1"
@@ -229,13 +299,16 @@ def examples_from_audit(path: str, fallback_host: str = "*") -> List[TrainingExa
             label = 1.0 if (independently_confirmed or tracker.has_confirmed()) else 0.0
             if label <= 0.0 and cl in {1, 2, 3}:
                 features["negative_reason"] = "cl_too_short"
-            out.append(TrainingExample(
+            example = TrainingExample(
                 host=host,
                 tech=tech,
                 features=features,
                 label=label,
                 source="audit:" + os.path.basename(path),
-            ))
+            )
+            if outcome in {OUTCOME_WAF_BLOCKED, OUTCOME_TARGET_REJECTED}:
+                enforce_negative_tags(example, [OUTCOME_SLUGS[outcome]])
+            out.append(example)
     return out
 
 
@@ -936,6 +1009,7 @@ def apply_online_example(
     *,
     alpha: Optional[float] = None,
     weight: float = 1.0,
+    strength: float = 1.0,
     allow_holdout: bool = False,
 ) -> Dict[str, Any]:
     """Fold one streamed/feedback example into existing weights in place.
@@ -944,7 +1018,10 @@ def apply_online_example(
     without replaying the entire corpus. Holdout hosts are never used for
     training cells; they are counted separately so a held-out lab cannot leak
     into the online prior. ``weight=2.0`` means two identical observations,
-    which is how the UI's +/-2.0 quick labels are implemented.
+    which is how the UI's +/-2.0 quick labels are implemented. ``strength``
+    scales the label contribution without faking extra observations: 0.25 is
+    used for unverified events, WAF blocks and application rejections. Such
+    events may nudge a weight but can never become a strike on their own.
     """
     host = example.host or "*"
     tech = example.tech or ""
@@ -958,7 +1035,9 @@ def apply_online_example(
 
     a = float(alpha if alpha is not None else weights.get("alpha", 0.3))
     a = min(1.0, max(0.0, a))
+    strength = min(1.0, max(0.0, float(strength)))
     label = 1.0 if example.label >= 0.5 else 0.0
+    effective_label = label * strength
     source = (example.source or "online").split(":")[0]
     features = dict(example.features)
     rank_features = _ranking_features(features)
@@ -989,8 +1068,8 @@ def apply_online_example(
             cell["sources"] = sources
             for _ in range(repeats):
                 cell["attempts"] = int(cell.get("attempts", 0)) + 1
-                cell["successes"] = float(cell.get("successes", 0.0)) + label
-                cell["ema"] = round(a * label + (1.0 - a) * float(cell.get("ema", 0.0)), 6)
+                cell["successes"] = float(cell.get("successes", 0.0)) + effective_label
+                cell["ema"] = round(a * effective_label + (1.0 - a) * float(cell.get("ema", 0.0)), 6)
             scope[feature] = cell
 
     negative = weights.setdefault("negative", {})
@@ -1020,7 +1099,7 @@ def apply_online_example(
     weights["examples"] = int(weights.get("examples", 0)) + repeats
     weights["updated_at"] = _now()
     previous_accuracy = float(meta.get("accuracy", 0.5))
-    accuracy = round(a * label + (1.0 - a) * previous_accuracy, 6)
+    accuracy = round(a * effective_label + (1.0 - a) * previous_accuracy, 6)
     meta["accuracy"] = accuracy
     meta["accuracy_delta"] = round(accuracy - previous_accuracy, 6)
     history = list(meta.get("accuracy_history") or [])
@@ -1032,6 +1111,7 @@ def apply_online_example(
     else:
         meta["negative"] = int(meta.get("negative", 0)) + repeats
     meta["last_label"] = label
+    meta["last_strength"] = strength
     meta["last_source"] = source
     meta["last_host"] = host
     meta["updated_at"] = _now()
@@ -1040,6 +1120,7 @@ def apply_online_example(
         "host": host,
         "tech": tech,
         "label": label,
+        "strength": strength,
         "repeats": repeats,
         "score_before": score_before,
         "score_after": score_after,
