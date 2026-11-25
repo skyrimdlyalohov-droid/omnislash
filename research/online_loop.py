@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -43,6 +44,7 @@ try:
         TrainingExample,
         _audit_identity,
         _now,
+        apply_beta_reward,
         apply_online_example,
         atomic_write_json,
         enforce_negative_tags,
@@ -72,6 +74,7 @@ except ImportError:  # pragma: no cover - direct script execution
         TrainingExample,
         _audit_identity,
         _now,
+        apply_beta_reward,
         apply_online_example,
         atomic_write_json,
         enforce_negative_tags,
@@ -113,6 +116,53 @@ CONFIRMED_FINDINGS = frozenset({
 _CL_MUTATION_RE = re.compile(r"cl[:=](\d+)", re.I)
 _PATH_MUTATION_RE = re.compile(r"path[:=](/\S*)", re.I)
 _SEEN_LIMIT = 2048
+
+
+def parse_fsm_reward(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Extract the single Go FSM reward event from an audit JSONL line.
+
+    Only the feedback transition carries a non-zero ``reward``/``alpha_delta``/
+    ``beta_delta``. Plain phase transitions and ordinary probe records have no
+    reward and are deliberately ignored, so one attempt cannot be counted
+    twice in the cross-session posterior.
+    """
+    if not isinstance(rec, dict):
+        return None
+
+    def numeric(value: Any) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return result if math.isfinite(result) else 0.0
+
+    alpha_delta = numeric(rec.get("alpha_delta"))
+    beta_delta = numeric(rec.get("beta_delta"))
+    reward = numeric(rec.get("reward"))
+    if alpha_delta == 0.0 and beta_delta == 0.0 and reward == 0.0:
+        return None
+    learning = rec.get("learning") or {}
+    if not isinstance(learning, dict):
+        learning = {}
+    key = str(rec.get("posterior_key") or "").strip()
+    phase = str(rec.get("fsm_phase") or rec.get("orchestrator_state") or "").strip()
+    tech = str(learning.get("tech_stack") or "").strip()
+    family = str(rec.get("chosen_mutation") or learning.get("mutation") or "").strip()
+    if not key:
+        if not phase and not family:
+            return None
+        key = "tech:%s|state:%s|family:%s" % (
+            tech or "*", phase or "MUTATE_FRAMING", family or "*"
+        )
+    return {
+        "key": key,
+        "alpha_delta": alpha_delta,
+        "beta_delta": beta_delta,
+        "reward": reward,
+        "source": "orchestrator-fsm",
+        "host": str(learning.get("host") or "*"),
+        "tech": tech,
+    }
 
 
 def _read_json(path: str, default: Any) -> Any:
@@ -367,6 +417,15 @@ class OnlineLoop:
             features[feature_key("variant", variant)] = "1"
         if mutation:
             features[feature_key("mutation", mutation)] = "1"
+        # Structured Go FSM fields become first-class ranking features. The
+        # posterior key itself is intentionally not expanded into features: it
+        # is stored in the compact "beta" table instead.
+        family = str(rec.get("chosen_mutation") or "")
+        if family:
+            features[feature_key("mutation_family", family)] = "1"
+        fsm_phase = str(rec.get("fsm_phase") or rec.get("orchestrator_state") or "")
+        if fsm_phase:
+            features[feature_key("fsm", fsm_phase)] = "1"
         if not confirmed:
             reasons: List[str] = []
             if cl in {1, 2, 3}:
@@ -415,6 +474,8 @@ class OnlineLoop:
         analysis = self._analyse(rec)
         weights = load_weights(self.weights_path)
         meta = weights.setdefault("online", {})
+        fsm_reward = parse_fsm_reward(rec)
+        fsm_result = apply_beta_reward(weights, **fsm_reward) if fsm_reward else None
         outcome = analysis["outcome"]
         outcomes = meta.setdefault("outcomes", {})
         slug = OUTCOME_SLUGS[outcome]
@@ -432,6 +493,7 @@ class OnlineLoop:
                 "outcome": outcome,
                 "confirmed": False,
                 "reason": "proxy-failed-no-target-response",
+                "fsm_reward": fsm_result,
             }
 
         learner = ExperienceLearner(
@@ -470,9 +532,14 @@ class OnlineLoop:
                 # Re-evaluate verification even if the hypothesis already
                 # existed: a second proxy identity can promote it to a strike.
                 self._emit_jobs(weights)
-        if result.get("applied") or result.get("reason") == "holdout-isolation":
+        if (
+            result.get("applied")
+            or result.get("reason") == "holdout-isolation"
+            or (fsm_result or {}).get("applied")
+        ):
             # A held-out event is counted but never folded into training cells;
-            # persist that counter too so the dashboard sees the isolation.
+            # an FSM reward, however, must reach learned_weights.json even when
+            # the ordinary probe example was not trainable.
             atomic_write_json(self.weights_path, weights)
         self.write_status(weights)
         return {
@@ -485,6 +552,7 @@ class OnlineLoop:
             "score_before": before,
             "score_after": result.get("score_after", before),
             "reason": result.get("reason", ""),
+            "fsm_reward": fsm_result,
         }
 
     def _add_hypothesis(
@@ -625,6 +693,7 @@ class OnlineLoop:
                 "candidates": len(jobs.get("candidates") or []),
             },
             "outcomes": dict(meta.get("outcomes") or {}),
+            "fsm_rewards": int(meta.get("fsm_rewards") or 0),
             "last_error": self._last_error,
             "updated_at": _now(),
         }

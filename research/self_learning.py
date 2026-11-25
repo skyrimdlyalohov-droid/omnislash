@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import tempfile
 import time
@@ -963,7 +964,9 @@ def build_calibration_examples(
 
 
 ONLINE_META_KEY = "online"
-_ONLINE_RANK_PREFIXES = ("path:", "cl:", "variant:", "mutation:", "probe:", "tls:", "shape:")
+BETA_KEY = "beta"
+BETA_CELL_LIMIT = 4096
+_ONLINE_RANK_PREFIXES = ("path:", "cl:", "variant:", "mutation:", "probe:", "tls:", "shape:", "fsm:")
 
 
 def _now() -> str:
@@ -1016,6 +1019,104 @@ def _online_meta(weights: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ranking_features(features: Dict[str, str]) -> List[str]:
     return [key for key in sorted(features) if key.startswith(_ONLINE_RANK_PREFIXES)]
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _blank_beta_cell() -> Dict[str, Any]:
+    return {
+        "alpha": 1.0,
+        "beta": 1.0,
+        "attempts": 0,
+        "last_reward": 0.0,
+        "last_seen": _now(),
+        "sources": [],
+    }
+
+
+def _prune_beta_cells(cells: Dict[str, Any]) -> None:
+    """Keep the cross-session posterior table bounded (O(1) per live cell)."""
+    if len(cells) <= BETA_CELL_LIMIT:
+        return
+    ordered = sorted(cells.items(), key=lambda item: str(item[1].get("last_seen") or ""))
+    for key, _ in ordered[: len(cells) - BETA_CELL_LIMIT]:
+        cells.pop(key, None)
+
+
+def apply_beta_reward(
+    weights: Dict[str, Any],
+    key: str,
+    *,
+    alpha_delta: float = 0.0,
+    beta_delta: float = 0.0,
+    reward: float = 0.0,
+    source: str = "fsm",
+    host: str = "*",
+    tech: str = "",
+) -> Dict[str, Any]:
+    """Fold one Go FSM reward into a Beta posterior in ``weights`` in place.
+
+    The key format is ``tech:<hash>|state:<phase>|family:<mutation>`` and is
+    produced by the orchestrator. WAF blocks add to beta, confirmed anomalies
+    add to alpha; both are clamped away from zero so Thompson sampling can
+    never divide by zero. The saved file is the single source of truth: Go
+    reloads these cells on the next hot-reload cycle.
+    """
+    key = str(key or "").strip()
+    if not key:
+        return {"applied": False, "reason": "missing-posterior-key"}
+    cells = weights.setdefault(BETA_KEY, {})
+    if not isinstance(cells, dict):
+        cells = {}
+        weights[BETA_KEY] = cells
+    cell = dict(cells.get(key) or _blank_beta_cell())
+    alpha = _finite(cell.get("alpha"), 1.0)
+    beta = _finite(cell.get("beta"), 1.0)
+    cell["alpha"] = round(min(1e6, max(0.1, alpha + _finite(alpha_delta))), 6)
+    cell["beta"] = round(min(1e6, max(0.1, beta + _finite(beta_delta))), 6)
+    cell["attempts"] = int(cell.get("attempts", 0)) + 1
+    cell["last_reward"] = round(_finite(reward), 6)
+    cell["last_seen"] = _now()
+    sources = [str(item) for item in (cell.get("sources") or [])]
+    label = str(source or "fsm").split(":")[0]
+    if label not in sources:
+        sources.append(label)
+    cell["sources"] = sources[-16:]
+    cells[key] = cell
+    _prune_beta_cells(cells)
+
+    meta = _online_meta(weights)
+    meta["fsm_rewards"] = int(meta.get("fsm_rewards", 0)) + 1
+    meta["last_fsm_reward"] = cell["last_reward"]
+    meta["last_fsm_key"] = key
+    meta["last_fsm_host"] = str(host or "*")
+    meta["last_fsm_tech"] = str(tech or "")
+    meta["updated_at"] = _now()
+    weights["updated_at"] = _now()
+    return {
+        "applied": True,
+        "key": key,
+        "alpha": cell["alpha"],
+        "beta": cell["beta"],
+        "reward": cell["last_reward"],
+    }
+
+
+def sample_beta(weights: Dict[str, Any], key: str, rng: Optional[Any] = None) -> float:
+    """Sample theta ~ Beta(alpha, beta) from a saved cell (stdlib random)."""
+    cell = (weights.get(BETA_KEY) or {}).get(str(key) or "") or {}
+    alpha = _finite(cell.get("alpha"), 1.0)
+    beta = _finite(cell.get("beta"), 1.0)
+    if alpha <= 0 or beta <= 0:
+        alpha, beta = 1.0, 1.0
+    source = rng or random
+    return float(source.betavariate(alpha, beta))
 
 
 def apply_online_example(

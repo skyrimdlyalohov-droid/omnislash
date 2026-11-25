@@ -699,32 +699,56 @@ func (p *Pool) pickThompson(proxies []*Proxy, now time.Time, exclude map[*Proxy]
 }
 
 func sampleBeta(alpha, beta float64) float64 {
-	x := sampleGamma(alpha)
-	y := sampleGamma(beta)
-	if x+y == 0 {
+	return SampleBeta(alpha, beta, nil)
+}
+
+// betaRandom is the small part of math/rand needed by the shared Thompson
+// sampler. *rand.Rand and the package-level math/rand functions both satisfy
+// it, so the pool and the orchestrator use one implementation of the Beta law.
+type betaRandom interface {
+	Float64() float64
+	NormFloat64() float64
+}
+
+type globalBetaRandom struct{}
+
+func (globalBetaRandom) Float64() float64     { return rand.Float64() }
+func (globalBetaRandom) NormFloat64() float64 { return rand.NormFloat64() }
+
+// SampleBeta draws theta ~ Beta(alpha, beta) with Marsaglia and Tsang's gamma
+// sampler. A nil rng uses math/rand's concurrency-safe global source; passing a
+// seeded *rand.Rand makes a decision loop reproducible in tests and audits.
+func SampleBeta(alpha, beta float64, rng *rand.Rand) float64 {
+	var source betaRandom = globalBetaRandom{}
+	if rng != nil {
+		source = rng
+	}
+	x := sampleGammaWith(alpha, source)
+	y := sampleGammaWith(beta, source)
+	if x+y == 0 || math.IsNaN(x+y) {
 		return 0
 	}
 	return x / (x + y)
 }
 
-func sampleGamma(alpha float64) float64 {
-	if alpha <= 0 {
+func sampleGammaWith(alpha float64, source betaRandom) float64 {
+	if alpha <= 0 || math.IsNaN(alpha) || math.IsInf(alpha, 0) {
 		return 0
 	}
 	// Marsaglia and Tsang's method for alpha >= 1, boost for alpha < 1.
 	if alpha < 1 {
-		return sampleGamma(alpha+1) * math.Pow(rand.Float64(), 1/alpha)
+		return sampleGammaWith(alpha+1, source) * math.Pow(source.Float64(), 1/alpha)
 	}
 	d := alpha - 1.0/3.0
 	c := 1.0 / math.Sqrt(9*d)
 	for {
-		x := rand.NormFloat64()
+		x := source.NormFloat64()
 		v := 1 + c*x
 		if v <= 0 {
 			continue
 		}
 		v = v * v * v
-		u := rand.Float64()
+		u := source.Float64()
 		if u < 1-0.0331*(x*x)*(x*x) {
 			return d * v
 		}

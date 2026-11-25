@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -169,6 +170,11 @@ const (
 	MutationHeaderFolding   MutationMode = "header_folding"
 	MutationChunkExtensions MutationMode = "chunk_extensions"
 	MutationCaseMixing      MutationMode = "case_mixing"
+	// Directed modes are chosen by the orchestrator's FSM, never by the
+	// mutator's own rotation. They are intentionally absent from
+	// mutationModeOrder so legacy differential-fuzz behaviour is unchanged.
+	MutationBoundaryShift  MutationMode = "boundary_shift"
+	MutationEliteCrossover MutationMode = "elite_crossover"
 )
 
 var mutationModeOrder = []MutationMode{
@@ -209,6 +215,12 @@ type PayloadMutator struct {
 	Target string
 	Mode   MutationMode
 	Ctx    context.Context
+	// Fitness is the normalized reward supplied by the orchestrator's FSM.
+	// A negative value shifts a framing boundary down, a positive one up.
+	Fitness float64
+	// Elite holds up to two confirmed patterns for crossover. It is data
+	// supplied by the caller; the mutator never runs an evolution loop.
+	Elite [][]byte
 	// Pool is optional. It must return *[]byte.
 	Pool BufferPool
 }
@@ -267,6 +279,10 @@ func (m *PayloadMutator) Mutate(basePayload []byte, seed int64) ([]byte, error) 
 		buf = rewriteRequestHeaders(buf, caseRewrite(rng))
 	case MutationChunkExtensions:
 		buf = appendChunkExtension(buf, rng)
+	case MutationBoundaryShift:
+		buf = shiftRequestBoundary(buf, rng, m.Fitness)
+	case MutationEliteCrossover:
+		buf = crossoverEliteFraming(buf, rng, m.Elite)
 	default:
 		return nil, fmt.Errorf("probe: unknown mutation mode %q", mode)
 	}
@@ -413,6 +429,145 @@ func caseRewrite(rng *rand.Rand) func([]byte, []byte) ([]byte, []byte) {
 		}
 		return out, value
 	}
+}
+
+// shiftRequestBoundary performs one fitness-directed edit of a framing
+// boundary: Content-Length moves by one in the reward's direction and
+// Transfer-Encoding gains a one-token parameter. Both edits stay inside an
+// existing header line, so every CRLF boundary is preserved.
+func shiftRequestBoundary(raw []byte, rng *rand.Rand, fitness float64) []byte {
+	delta := 1
+	if fitness < 0 {
+		delta = -1
+	}
+	out := rewriteRequestHeaders(raw, func(key, value []byte) ([]byte, []byte) {
+		switch {
+		case asciiEqualFold(key, []byte("content-length")):
+			n, err := strconv.Atoi(string(bytes.TrimSpace(value)))
+			if err != nil {
+				return key, value
+			}
+			n += delta
+			if n < 0 {
+				n = 0
+			}
+			if n > 99999 {
+				n = 99999
+			}
+			out := append(leadingOWS(value), []byte(strconv.Itoa(n))...)
+			return key, out
+		case asciiEqualFold(key, []byte("transfer-encoding")):
+			const hexChars = "0123456789abcdef"
+			param := []byte(";omni=")
+			param = append(param, hexChars[rng.Intn(len(hexChars))])
+			// Copy before appending: value aliases the scratch buffer and an
+			// in-place append could overwrite the following header line.
+			out := append(leadingOWS(value), bytes.TrimSpace(value)...)
+			return key, append(out, param...)
+		default:
+			return key, value
+		}
+	})
+	if asciiContainsFold(out, "content-length") || asciiContainsFold(out, "transfer-encoding") {
+		return out
+	}
+	return insertHeader(out, "X-Omni-Boundary", "shift")
+}
+
+// leadingOWS preserves the optional space/tab that followed the original
+// colon, so a directed edit stays visually and syntactically inside the line.
+func leadingOWS(value []byte) []byte {
+	end := 0
+	for end < len(value) && (value[end] == ' ' || value[end] == '\t') {
+		end++
+	}
+	return append([]byte(nil), value[:end]...)
+}
+
+// insertHeader adds one header without changing any existing line boundary.
+func insertHeader(raw []byte, key, value string) []byte {
+	at := bytes.Index(raw, requestSeparator)
+	if at < 0 {
+		return raw
+	}
+	line := append([]byte(key+": "+value), requestSeparator...)
+	out := make([]byte, 0, len(raw)+len(line))
+	out = append(out, raw[:at]...)
+	out = append(out, line...)
+	return append(out, raw[at:]...)
+}
+
+// crossoverEliteFraming combines framing values from two elite patterns onto
+// the current request. It never invents new framing bytes and copies only the
+// header values that were actually confirmed in earlier attempts.
+func crossoverEliteFraming(raw []byte, rng *rand.Rand, elite [][]byte) []byte {
+	patterns := make([][]byte, 0, 2)
+	for _, pattern := range elite {
+		if len(pattern) == 0 || len(pattern) > maxMutationPayload || !validCRLF(pattern) {
+			continue
+		}
+		patterns = append(patterns, pattern)
+		if len(patterns) == 2 {
+			break
+		}
+	}
+	if len(patterns) == 0 {
+		return raw
+	}
+	first := framingHeaderValues(patterns[0])
+	preferFirst := rng.Intn(2) == 0
+	if len(patterns) == 1 {
+		return replaceFramingHeaders(raw, first, first)
+	}
+	second := framingHeaderValues(patterns[1])
+	if preferFirst {
+		return replaceFramingHeaders(raw, first, second)
+	}
+	return replaceFramingHeaders(raw, second, first)
+}
+
+func framingHeaderValues(raw []byte) map[string][]byte {
+	values := make(map[string][]byte, 2)
+	at := bytes.Index(raw, requestSeparator)
+	if at < 0 {
+		return values
+	}
+	for _, line := range bytes.Split(raw[:at], []byte("\r\n"))[1:] {
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			continue
+		}
+		key := bytes.ToLower(bytes.TrimSpace(line[:colon]))
+		if isFramingHeader(key) {
+			values[string(key)] = append([]byte(nil), bytes.TrimSpace(line[colon+1:])...)
+		}
+	}
+	return values
+}
+
+func replaceFramingHeaders(raw []byte, primary, secondary map[string][]byte) []byte {
+	out := rewriteRequestHeaders(raw, func(key, value []byte) ([]byte, []byte) {
+		lower := bytes.ToLower(key)
+		if found, ok := primary[string(lower)]; ok {
+			return key, append(leadingOWS(value), found...)
+		}
+		if found, ok := secondary[string(lower)]; ok {
+			return key, append(leadingOWS(value), found...)
+		}
+		return key, value
+	})
+	if asciiContainsFold(out, "content-length") || asciiContainsFold(out, "transfer-encoding") {
+		return out
+	}
+	for _, key := range []string{"content-length", "transfer-encoding"} {
+		if value, ok := primary[key]; ok {
+			return insertHeader(out, key, string(value))
+		}
+		if value, ok := secondary[key]; ok {
+			return insertHeader(out, key, string(value))
+		}
+	}
+	return out
 }
 
 // Chunk Extensions: add a junk hex extension to the first chunk-size line when

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -92,6 +93,13 @@ type LearningProvider interface {
 	CooldownProxy(label, reason string, cooldown time.Duration) bool
 }
 
+// BetaProvider is the optional bridge to the cross-session (alpha, beta)
+// table. Providers without it keep the legacy experience ranking; a provider
+// with it enables Thompson Sampling over declared mutation families.
+type BetaProvider interface {
+	BetaFor(feature, host, tech string) (float64, float64, bool)
+}
+
 // ExperienceProvider binds the orchestrator to the same table the daemon's
 // audit loop uses. Online is optional and only refines the store's ordering.
 type ExperienceProvider struct {
@@ -172,6 +180,16 @@ func (p *ExperienceProvider) CooldownProxy(label, reason string, cooldown time.D
 	return true
 }
 
+// BetaFor reads the (alpha, beta) cell loaded from learned_weights.json. It is
+// additive to the experience ranking and never invents a prior for an untried
+// family: ok=false makes the orchestrator keep the caller's order.
+func (p *ExperienceProvider) BetaFor(feature, host, tech string) (float64, float64, bool) {
+	if p == nil || p.Online == nil {
+		return 0, 0, false
+	}
+	return p.Online.betaFor(feature, host, tech)
+}
+
 // OrchestratorEvent is one JSONL line per FSM transition. The field names are
 // part of the audit contract ("orchestrator_state", "chosen_mutation").
 type OrchestratorEvent struct {
@@ -185,6 +203,16 @@ type OrchestratorEvent struct {
 	ChosenMutation   string            `json:"chosen_mutation,omitempty"`
 	ParserDivergence probe.ParserState `json:"parser_divergence,omitempty"`
 	Reason           string            `json:"reason,omitempty"`
+	// The structured fields below are consumed by research/online_loop.py to
+	// update the cross-session Beta posteriors.
+	FSMPhase   OrchestratorPhase `json:"fsm_phase,omitempty"`
+	Reward     float64           `json:"reward,omitempty"`
+	AlphaDelta float64           `json:"alpha_delta,omitempty"`
+	BetaDelta  float64           `json:"beta_delta,omitempty"`
+	Posterior  string            `json:"posterior_key,omitempty"`
+	NCD        float64           `json:"ncd,omitempty"`
+	Entropy    float64           `json:"entropy,omitempty"`
+	ZScore     float64           `json:"zscore,omitempty"`
 }
 
 // CaidoPushFunc has the same shape as UIOptions.CaidoPush.
@@ -210,11 +238,13 @@ type OrchestratorReport struct {
 type Orchestrator struct {
 	mu       sync.Mutex
 	auditMu  sync.Mutex
+	rngMu    sync.Mutex // guards a caller-supplied *rand.Rand across concurrent jobs
 	provider LearningProvider
 	audit    io.Writer
 	now      func() time.Time
 
 	state       OrchestratorState
+	phase       OrchestratorPhase
 	profile     TargetProfile
 	lastAction  AttackAction
 	finding     probe.Finding
@@ -226,6 +256,22 @@ type Orchestrator struct {
 	maxFailures int
 	panicOnFSM  bool
 	caidoPush   CaidoPushFunc
+
+	// Operational loop: O(1) telemetry and posterior state. No network call and
+	// no unbounded sample history is owned here.
+	sonar          probe.Welford
+	signal         probe.SignalQuality
+	baseline       []byte
+	baselineSet    bool
+	baselineStatus int
+	// observed distinguishes the wired daemon path from legacy callers. Only an
+	// observed attempt is subject to strict sonar gating.
+	observed    bool
+	rng         *rand.Rand
+	posterior   map[string]*BetaCell
+	elite       probe.ElitePool
+	basePayload []byte
+	lastFeature string
 }
 
 // NewOrchestrator attaches the FSM to a learning provider. A nil provider is
@@ -236,9 +282,156 @@ func NewOrchestrator(provider LearningProvider, audit io.Writer) *Orchestrator {
 		audit:       audit,
 		now:         time.Now,
 		state:       StateRecon,
+		phase:       PhaseInit,
 		cooldown:    time.Minute,
 		maxFailures: 3,
+		// A nil rng uses the global concurrency-safe source. SetRNG installs a
+		// seeded source for reproducible tests and audits.
+		posterior: make(map[string]*BetaCell),
 	}
+}
+
+// SetRNG replaces the Thompson sampler's source. A seeded *rand.Rand makes a
+// decision sequence reproducible; a nil value falls back to a fresh seeded
+// source so an orchestrator is never nondeterministically uninitialized.
+func (o *Orchestrator) SetRNG(rng *rand.Rand) {
+	if o == nil || rng == nil {
+		return
+	}
+	o.rngMu.Lock()
+	defer o.rngMu.Unlock()
+	o.rng = rng
+}
+
+// Phase returns the current strict FSM phase.
+func (o *Orchestrator) Phase() OrchestratorPhase {
+	if o == nil {
+		return ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.phase
+}
+
+// advance enforces INIT -> PROBE_BOUNDARY -> MUTATE_FRAMING -> VERIFY_VICTIM
+// -> CONFIRMED. Returning to MUTATE_FRAMING after a folded branch is allowed;
+// jumping forward without evidence is not.
+func (o *Orchestrator) advance(to OrchestratorPhase) error {
+	from := o.phase
+	if from == to {
+		return nil
+	}
+	if !validPhaseTransition(from, to) {
+		return fmt.Errorf("%w: %s -> %s", ErrOrchestratorState, from, to)
+	}
+	o.phase = to
+	return nil
+}
+
+// ObserveExchange folds one attempt's scalar evidence into the streaming sonar
+// without retaining the response. It is the only way the FSM learns latency,
+// NCD, entropy and status shift.
+func (o *Orchestrator) ObserveExchange(signal probe.SignalQuality) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.observed = true
+	if signal.LatencyMS > 0 {
+		if signal.ZScore == 0 {
+			signal.ZScore = o.sonar.ZScore(signal.LatencyMS, probe.DefaultMinSigmaMS)
+		}
+		o.sonar.Observe(signal.LatencyMS)
+	}
+	if !o.baselineSet && signal.Status > 0 {
+		o.baselineStatus = signal.Status
+		o.baselineSet = true
+	}
+	o.signal = signal
+}
+
+// ObserveResult derives the scalar sonar signal from one probe result. It is
+// deliberately the only bridge from raw response bytes into the FSM: the body
+// itself is never retained here, only NCD, entropy, status and latency.
+func (o *Orchestrator) ObserveResult(res *probe.Result) {
+	if o == nil {
+		return
+	}
+	// Even an empty result is an observed attempt: without this marker a legacy
+	// caller could smuggle a FE_Closed_BE_Waiting past the sonar by supplying no
+	// evidence at all.
+	if res == nil || len(res.Responses) == 0 {
+		o.mu.Lock()
+		o.observed = true
+		o.mu.Unlock()
+		return
+	}
+	last := res.Responses[len(res.Responses)-1]
+	o.mu.Lock()
+	baselineStatus := o.baselineStatus
+	o.mu.Unlock()
+	signal := probe.SignalQuality{
+		Status:      last.Status,
+		LatencyMS:   float64(res.Duration.Microseconds()) / 1000,
+		NCD:         o.Distance([]byte(last.Raw)),
+		Entropy:     probe.NormalizedEntropy([]byte(last.Body)),
+		BodyBytes:   len(last.Body),
+		StatusShift: baselineStatus > 0 && last.Status != baselineStatus,
+	}
+	o.ObserveExchange(signal)
+}
+
+// Distance computes NCD against the calibrated raw baseline. With no baseline
+// it returns 1: an uncalibrated attempt must never be promoted by NCD alone.
+func (o *Orchestrator) Distance(raw []byte) float64 {
+	if o == nil {
+		return 1
+	}
+	o.mu.Lock()
+	baseline := append([]byte(nil), o.baseline...)
+	o.mu.Unlock()
+	if len(baseline) == 0 || len(raw) == 0 {
+		return 1
+	}
+	return omnislash.NormalizedCompressionDistance(baseline, raw)
+}
+
+// ApplyReward updates one Beta cell and promotes confirmed payloads into the
+// elite pool. It is called by RecordOutcome, never by the mutator itself.
+func (o *Orchestrator) ApplyReward(reward Reward) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	key := o.lastFeature
+	if key == "" {
+		key = featureKey("", string(o.phase), o.lastAction.Mutation)
+	}
+	cell := o.posterior[key]
+	if cell == nil {
+		prior := NewBetaCell()
+		cell = &prior
+		o.posterior[key] = cell
+	}
+	cell.Apply(reward)
+	if reward.Elite && len(o.basePayload) > 0 {
+		o.elite.Add(o.basePayload, reward.Value)
+	}
+	o.mu.Unlock()
+}
+
+// BetaFor exposes the in-session posterior to tests and to the Python bridge.
+func (o *Orchestrator) BetaFor(key string) BetaCell {
+	if o == nil {
+		return NewBetaCell()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if cell := o.posterior[key]; cell != nil {
+		return *cell
+	}
+	return NewBetaCell()
 }
 
 // SetCooldown overrides the proxy cooldown applied after an engine fault.
@@ -350,13 +543,19 @@ func (o *Orchestrator) StartRecon(profile TargetProfile) error {
 	}
 	o.mu.Lock()
 	o.profile = profile
+	o.phase = PhaseProbeBoundary
 	o.failures = 0
 	o.finding = probe.Finding{}
 	o.lastAction = AttackAction{}
 	o.minimal = nil
 	o.evidence = nil
+	o.lastFeature = ""
+	o.signal = probe.SignalQuality{}
+	o.observed = false
 	o.mu.Unlock()
-	o.transition(StateRecon, OrchestratorEvent{Host: profile.Host, Probe: profile.Probe, Reason: "recon"})
+	o.transition(StateRecon, OrchestratorEvent{
+		Host: profile.Host, Probe: profile.Probe, Reason: "recon", FSMPhase: PhaseProbeBoundary,
+	})
 	return nil
 }
 
@@ -380,7 +579,10 @@ func (o *Orchestrator) Calibrate(ncd float64, honeypot bool) error {
 	host, probeName := o.profile.Host, o.profile.Probe
 	o.profile.BaselineOK = true
 	o.mu.Unlock()
-	o.transition(StateBaseline, OrchestratorEvent{Host: host, Probe: probeName, Reason: fmt.Sprintf("ncd=%.3f", ncd)})
+	o.transition(StateBaseline, OrchestratorEvent{
+		Host: host, Probe: probeName, Reason: fmt.Sprintf("ncd=%.3f", ncd),
+		FSMPhase: PhaseProbeBoundary, NCD: ncd,
+	})
 	return nil
 }
 
@@ -400,7 +602,19 @@ func (o *Orchestrator) CalibrateWithSemantic(client *omnislash.SemanticClient, b
 		return err
 	}
 	distance := omnislash.NormalizedCompressionDistance([]byte(baseSkeleton), []byte(sampleSkeleton))
-	return o.Calibrate(distance, honeypot)
+	if err := o.Calibrate(distance, honeypot); err != nil {
+		return err
+	}
+	// The semantic skeletons decide whether the baseline is trustworthy; the
+	// raw baseline is kept for per-attempt NCD against raw responses. Capping it
+	// keeps the O(1) memory guarantee for a long-lived daemon.
+	o.mu.Lock()
+	o.baseline = append([]byte(nil), baseline...)
+	if len(o.baseline) > 64<<10 {
+		o.baseline = o.baseline[:64<<10]
+	}
+	o.mu.Unlock()
+	return nil
 }
 
 // GetBestAction asks the brain for the best declared TLS fingerprint and
@@ -429,6 +643,12 @@ func (o *Orchestrator) GetBestAction(profile TargetProfile) (AttackAction, error
 	mutationProfile.TLSHint = tls
 	mutationRanked := o.provider.RankMutations(mutationProfile, profile.MutationCandidates)
 	mutation := firstAllowed(mutationRanked, profile.MutationCandidates)
+	tech := probe.TechStackHash(profile.TechStack)
+	if bp, ok := o.provider.(BetaProvider); ok {
+		if sampled, ok := o.thompsonMutation(bp, profile, tech, mutationRanked); ok {
+			mutation = sampled
+		}
+	}
 	if tls == "" || mutation == "" {
 		return AttackAction{}, ErrOrchestratorCandidates
 	}
@@ -441,11 +661,29 @@ func (o *Orchestrator) GetBestAction(profile TargetProfile) (AttackAction, error
 		Variant:        profile.Variant,
 		Seed:           1,
 	}
+	feature := featureKey(tech, string(PhaseMutateFraming), mutation)
 	o.mu.Lock()
+	// A new attempt starts a new strict cycle. CONFIRMED closes the previous
+	// cycle; it must not freeze every later job in an unreachable phase.
+	if phaseIndex(o.phase) >= phaseIndex(PhaseVerifyVictim) {
+		o.phase = PhaseInit
+	}
+	if o.phase == PhaseInit {
+		// A caller that did not run recon explicitly still enters through the
+		// boundary phase; no later phase can be skipped this way.
+		o.phase = PhaseProbeBoundary
+	}
+	o.observed = false
+	if err := o.advance(PhaseMutateFraming); err != nil {
+		o.mu.Unlock()
+		return AttackAction{}, err
+	}
 	o.profile = profile
 	o.attempts++
 	action.Attempt = o.attempts
 	o.lastAction = action
+	o.lastFeature = feature
+	o.basePayload = nil
 	o.mu.Unlock()
 	o.transition(StateAttack, OrchestratorEvent{
 		Host:           profile.Host,
@@ -453,8 +691,54 @@ func (o *Orchestrator) GetBestAction(profile TargetProfile) (AttackAction, error
 		Attempt:        action.Attempt,
 		ChosenTLS:      action.TLSFingerprint,
 		ChosenMutation: action.Mutation,
+		FSMPhase:       PhaseMutateFraming,
+		Posterior:      feature,
 	})
 	return action, nil
+}
+
+// thompsonMutation samples theta ~ Beta(alpha, beta) once per declared family
+// for (tech_stack, fsm_state, mutation_family). It only chooses among the
+// candidates supplied by the caller and falls back to the ranking when no cell
+// has evidence, so an untried family is never starved by a missing prior.
+func (o *Orchestrator) thompsonMutation(provider BetaProvider, profile TargetProfile, tech string, ranked []string) (string, bool) {
+	if provider == nil || len(profile.MutationCandidates) == 0 {
+		return "", false
+	}
+	candidates := profile.MutationCandidates
+	host := profile.Host
+	var best string
+	bestSample := -1.0
+	evidence := false
+	for _, family := range candidates {
+		key := featureKey(tech, string(PhaseMutateFraming), family)
+		alpha, beta, ok := provider.BetaFor(key, host, tech)
+		o.mu.Lock()
+		if cell := o.posterior[key]; cell != nil {
+			alpha = math.Max(0.1, alpha+cell.Alpha-1)
+			beta = math.Max(0.1, beta+cell.Beta-1)
+			ok = true
+		}
+		o.mu.Unlock()
+		if !ok || alpha <= 0 || beta <= 0 {
+			continue
+		}
+		evidence = true
+		// A seeded *rand.Rand is not goroutine-safe. Hold rngMu for the whole
+		// draw so concurrent jobs in a daemon cannot race on the same source.
+		o.rngMu.Lock()
+		sample := omnislash.SampleBeta(alpha, beta, o.rng)
+		o.rngMu.Unlock()
+		if sample > bestSample {
+			bestSample = sample
+			best = family
+		}
+	}
+	if evidence && best != "" {
+		return best, true
+	}
+	// Thompson found no cell: keep the caller's deterministic ranking.
+	return firstAllowed(ranked, candidates), len(ranked) > 0
 }
 
 func firstAllowed(ranked, allowed []string) string {
@@ -472,7 +756,8 @@ func firstAllowed(ranked, allowed []string) string {
 
 func mutationModeOf(name string) probe.MutationMode {
 	switch probe.MutationMode(name) {
-	case probe.MutationHeaderFolding, probe.MutationChunkExtensions, probe.MutationCaseMixing:
+	case probe.MutationHeaderFolding, probe.MutationChunkExtensions, probe.MutationCaseMixing,
+		probe.MutationBoundaryShift, probe.MutationEliteCrossover:
 		return probe.MutationMode(name)
 	default:
 		return probe.MutationAuto
@@ -510,11 +795,22 @@ func (o *Orchestrator) Analyze(raw []byte, ferr error, requestHadTE bool) probe.
 // mutator. Missing scope is refused before any byte is changed; a panic is
 // converted to a precision loss.
 func (o *Orchestrator) Mutate(ctx context.Context, action AttackAction, base []byte, scope probe.ScopeGuard, target string) ([]byte, error) {
+	var fitness float64
+	var elite [][]byte
+	if o != nil {
+		o.mu.Lock()
+		fitness = rewardFitness(o.signal)
+		elite = o.elite.Patterns()
+		o.basePayload = append([]byte(nil), base...)
+		o.mu.Unlock()
+	}
 	m := &probe.PayloadMutator{
-		Scope:  scope,
-		Target: target,
-		Mode:   action.MutationMode,
-		Ctx:    ctx,
+		Scope:   scope,
+		Target:  target,
+		Mode:    action.MutationMode,
+		Ctx:     ctx,
+		Fitness: fitness,
+		Elite:   elite,
 	}
 	var (
 		out []byte
@@ -543,6 +839,14 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 	profile := o.profile
 	cooldown := o.cooldown
 	maxFailures := o.maxFailures
+	signal := o.signal
+	signalProvided := o.observed
+	feature := o.lastFeature
+	if phaseIndex(o.phase) < phaseIndex(PhaseMutateFraming) {
+		// A direct caller that skipped GetBestAction still has a mutation cell;
+		// later phases remain strictly gated.
+		o.phase = PhaseMutateFraming
+	}
 	o.mu.Unlock()
 
 	host := profile.Host
@@ -553,7 +857,12 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 	if len(profile.TechStack) > 0 {
 		tech = probe.TechStackHash(profile.TechStack)
 	}
-	label, success := outcomeForParserState(state)
+	// Each attempt is observed exactly once: a second RecordOutcome without a
+	// new GetBestAction must not inherit a stale sonar verdict.
+	o.mu.Lock()
+	o.observed = false
+	o.mu.Unlock()
+	label, success := outcomeForSignal(state, signal)
 	rec := Record{
 		Time:             time.Now(),
 		Target:           profile.Addr,
@@ -574,12 +883,22 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 	}
 	o.provider.Observe(rec)
 
+	reward := RewardFor(state, signal)
+	o.ApplyReward(reward)
+
+	// A strong signal is mandatory for promotion once the sonar is wired. The
+	// zero signal is only accepted by legacy callers that never observed an
+	// exchange; the daemon's opt-in path always supplies it.
+	promote := state == probe.FEClosedBEWaiting && (!signalProvided || signal.Strong())
 	next := StateAttack
-	reason := "no confirmed desync"
-	if state == probe.FEClosedBEWaiting {
+	reason := reward.Reason
+	phase := PhaseMutateFraming
+	if promote {
 		next = StateVerify
-		reason = "FE_Closed_BE_Waiting confirmed"
+		phase = PhaseVerifyVictim
+		reason = "FE_Closed_BE_Waiting confirmed by sonar"
 		o.mu.Lock()
+		advanceErr := o.advance(phase)
 		o.failures = 0
 		o.finding = probe.Finding{
 			Kind:       "desync_confirmed",
@@ -587,6 +906,9 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 			Detail:     "FSM classified the exchange as frontend closed / backend waiting",
 		}
 		o.mu.Unlock()
+		if advanceErr != nil {
+			return advanceErr
+		}
 	} else {
 		o.mu.Lock()
 		o.failures++
@@ -595,6 +917,9 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 		if state == probe.ParserEngineFault {
 			reason = "engine fault: proxy cooldown"
 			o.provider.CooldownProxy(action.Proxy, "orchestrator engine fault", cooldown)
+		}
+		if signalProvided && state == probe.FEClosedBEWaiting && !signal.Strong() {
+			reason += "; weak signal folded the branch"
 		}
 		if failures >= maxFailures {
 			next = StateEscalate
@@ -610,10 +935,35 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 		ChosenMutation:   action.Mutation,
 		ParserDivergence: state,
 		Reason:           reason,
+		FSMPhase:         phase,
+		Reward:           reward.Value,
+		AlphaDelta:       reward.AlphaDelta,
+		BetaDelta:        reward.BetaDelta,
+		Posterior:        feature,
+		NCD:              signal.NCD,
+		Entropy:          signal.Entropy,
+		ZScore:           signal.ZScore,
 	}
 	o.transition(StateFeedback, feedback)
-	o.transition(next, feedback)
+	// Only the feedback line carries the reward. Reusing it on the following
+	// transition would apply the same alpha/beta delta twice in python.
+	followup := feedback
+	followup.Reward = 0
+	followup.AlphaDelta = 0
+	followup.BetaDelta = 0
+	followup.Posterior = ""
+	followup.NCD = 0
+	followup.Entropy = 0
+	followup.ZScore = 0
+	o.transition(next, followup)
 	return nil
+}
+
+func outcomeForSignal(state probe.ParserState, signal probe.SignalQuality) (OutcomeLabel, bool) {
+	if signal.Status == 400 {
+		return OutcomeTargetRejected, false
+	}
+	return outcomeForParserState(state)
 }
 
 func outcomeForParserState(state probe.ParserState) (OutcomeLabel, bool) {
@@ -645,19 +995,30 @@ func (o *Orchestrator) Verify(ok bool, reason string) error {
 	host, probeName, action := o.profile.Host, o.profile.Probe, o.lastAction
 	o.mu.Unlock()
 	if !ok {
+		o.mu.Lock()
+		// A failed confirmation folds back to the mutation phase; it is a
+		// deliberate back edge, not a skipped forward transition.
+		o.phase = PhaseMutateFraming
+		o.mu.Unlock()
 		o.transition(StateEscalate, OrchestratorEvent{
 			Host: host, Probe: probeName, Attempt: action.Attempt,
 			ChosenMutation: action.Mutation, Reason: reason,
+			FSMPhase: PhaseMutateFraming,
 		})
 		return nil
 	}
 	o.mu.Lock()
+	if o.phase != PhaseVerifyVictim {
+		o.mu.Unlock()
+		return ErrOrchestratorState
+	}
+	o.phase = PhaseConfirmed
 	o.failures = 0
 	o.mu.Unlock()
 	o.transition(StateAttack, OrchestratorEvent{
 		Host: host, Probe: probeName, Attempt: action.Attempt,
 		ChosenTLS: action.TLSFingerprint, ChosenMutation: action.Mutation,
-		Reason: "verified",
+		Reason: "verified", FSMPhase: PhaseConfirmed,
 	})
 	return nil
 }

@@ -86,7 +86,9 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 	}
 
 	kalman := NewKalmanFilter1D(1, 25)
-	var cleanTTFBs, mutTTFBs []float64
+	// Streaming O(1) telemetry: only a count/mean/M2 is kept per side, never an
+	// array of residuals that grows with the number of pairs.
+	var cleanSonar, mutSonar Welford
 	var baselineCleanStatus int
 	var baselineCleanBody []byte
 	pairs := p.pairs()
@@ -161,14 +163,12 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 					return e.finish(), nil
 				}
 			}
-			est, resid := kalman.Update(float64(cleanTTFB.Microseconds()) / 1000.0)
-			_ = est
-			cleanTTFBs = append(cleanTTFBs, resid)
+			_, resid := kalman.Update(float64(cleanTTFB.Microseconds()) / 1000.0)
+			cleanSonar.Observe(resid)
 		}
 		if mutResp != nil {
-			est, resid := kalman.Update(float64(mutTTFB.Microseconds()) / 1000.0)
-			_ = est
-			mutTTFBs = append(mutTTFBs, resid)
+			_, resid := kalman.Update(float64(mutTTFB.Microseconds()) / 1000.0)
+			mutSonar.Observe(resid)
 			// Simple differential signal: status change or large TTFB residual gap.
 			if cleanResp != nil && cleanResp.Status != mutResp.Status {
 				e.addFinding(Finding{Kind: "differential_status", Confidence: ConfidenceMedium, Detail: fmt.Sprintf("mutation=%s clean=%d mutated=%d", mutationName, cleanResp.Status, mutResp.Status), Response: mutResp.Seq})
@@ -179,8 +179,10 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 		_ = mutation
 	}
 
-	if len(cleanTTFBs) > 0 && len(mutTTFBs) > 0 {
-		e.addFinding(Finding{Kind: "differential_ttfb", Confidence: ConfidenceLow, Detail: fmt.Sprintf("clean_residual_ms=%v mutated_residual_ms=%v", mean(cleanTTFBs), mean(mutTTFBs))})
+	if cleanSonar.Count() > 0 && mutSonar.Count() > 0 {
+		z := (mutSonar.Mean() - cleanSonar.Mean()) / mutSonar.StdDev(DefaultMinSigmaMS)
+		e.addFinding(Finding{Kind: "differential_ttfb", Confidence: ConfidenceLow,
+			Detail: fmt.Sprintf("clean_residual_ms=%.3f mutated_residual_ms=%.3f z=%.3f", cleanSonar.Mean(), mutSonar.Mean(), z)})
 	}
 	if len(e.res.Findings) == 0 {
 		e.addFinding(Finding{Kind: "differential_no_signal", Confidence: ConfidenceLow, Detail: "no status/neighbor shift detected"})
@@ -192,17 +194,6 @@ func buildCleanRequest(target Target) []byte {
 	p := AppendCacheBuster(target.RequestPath())
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: omnislash-probe/1\r\nAccept: */*\r\nConnection: close\r\n\r\n", p, target.HostHeader())
 	return []byte(req)
-}
-
-func mean(v []float64) float64 {
-	if len(v) == 0 {
-		return 0
-	}
-	var s float64
-	for _, x := range v {
-		s += x
-	}
-	return s / float64(len(v))
 }
 
 // Ensure interfaces.

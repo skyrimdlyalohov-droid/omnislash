@@ -182,6 +182,20 @@ func (d *Daemon) SetOrchestrator(o *Orchestrator) {
 	}
 }
 
+// EnableOrchestrator installs the top-level FSM with the daemon's existing
+// experience store, online beta priors and transport pool. It stays explicit so
+// legacy deployments keep their audit format verbatim; omnislashd exposes it
+// as -orchestrator. No second learning table or socket is created here.
+func (d *Daemon) EnableOrchestrator() *Orchestrator {
+	if d == nil {
+		return nil
+	}
+	provider := &ExperienceProvider{Store: d.learning, Online: d.online, Pool: d.ui.Pool}
+	o := NewOrchestrator(provider, d.audit)
+	d.SetOrchestrator(o)
+	return o
+}
+
 // configureMutation is the daemon-side integration point: the transport config
 // decides whether the mutation pass is on, and the already-loaded Scope is the
 // only guard allowed to authorize it. A missing scope disables mutations
@@ -902,6 +916,12 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 		for _, r := range res.Responses {
 			rec.Statuses = append(rec.Statuses, r.Status)
 		}
+	}
+	// The orchestrator's sonar sees the same result the audit log records. No
+	// extra dial happens here: latency, NCD and entropy are derived from bytes
+	// already captured by the probe.
+	if d.orchestrator != nil {
+		d.orchestrator.ObserveResult(res)
 	}
 	if d.audit != nil {
 		line, marshalErr := json.Marshal(rec)

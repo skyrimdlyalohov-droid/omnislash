@@ -46,6 +46,7 @@ func run() error {
 		logLevel      = flag.String("log-level", "info", "debug|info|warn|error")
 		versionOut    = flag.Bool("version", false, "print version")
 		onlineFlag    = flag.String("online-learning", "", "override config online_learning (true|false)")
+		orchestrator  = flag.Bool("orchestrator", false, "enable the top-level Go FSM / Thompson orchestrator")
 		playbookPaths []string
 	)
 	flag.Func("playbook", "curated playbook case JSON; seeds experience with a provenance-tagged prior (repeatable)", func(path string) error {
@@ -114,6 +115,10 @@ func run() error {
 		ui.AuditPaths = []string{cfg.LogFile}
 	}
 	d.SetUI(ui)
+	if *orchestrator {
+		d.EnableOrchestrator()
+		logger.Info("top-level orchestrator enabled", "beta_source", cfg.OnlinePaths.WeightsPath)
+	}
 	for _, path := range playbookPaths {
 		caseFile, err := playbook.Load(path)
 		if err != nil {

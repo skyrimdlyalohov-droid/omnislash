@@ -20,6 +20,10 @@ type onlineCell struct {
 	Successes float64  `json:"successes"`
 	EMA       float64  `json:"ema"`
 	Sources   []string `json:"sources"`
+	// Alpha/Beta are the Thompson posterior written by the python learner.
+	// Older weight files do not carry them and fall back to Laplace counts.
+	Alpha float64 `json:"alpha,omitempty"`
+	Beta  float64 `json:"beta,omitempty"`
 }
 
 type onlinePrior struct {
@@ -28,6 +32,7 @@ type onlinePrior struct {
 	Global      map[string]onlineCell
 	Hosts       map[string]map[string]onlineCell
 	Tech        map[string]map[string]onlineCell
+	Beta        map[string]onlineCell
 	NegativeCL  map[int]bool
 }
 
@@ -37,6 +42,7 @@ type onlineWeightsFile struct {
 	Global           map[string]onlineCell            `json:"global"`
 	Hosts            map[string]map[string]onlineCell `json:"hosts"`
 	Tech             map[string]map[string]onlineCell `json:"tech"`
+	Beta             map[string]onlineCell            `json:"beta"`
 	Negative         struct {
 		CL []int `json:"cl"`
 	} `json:"negative"`
@@ -57,6 +63,7 @@ func loadOnlinePrior(path string) (*onlinePrior, error) {
 		Global:      raw.Global,
 		Hosts:       raw.Hosts,
 		Tech:        raw.Tech,
+		Beta:        raw.Beta,
 		NegativeCL:  make(map[int]bool),
 	}
 	if p.ExactWeight <= 0 || p.ExactWeight > 1 {
@@ -97,6 +104,65 @@ func cellScore(cell onlineCell) float64 {
 	}
 	rate := cell.Successes / float64(cell.Attempts)
 	return 0.5*cell.EMA + 0.5*rate
+}
+
+// cellBeta converts one learned cell into a Beta posterior. Explicit alpha/beta
+// values written by python win; legacy cells fall back to Laplace-smoothed
+// success counts so an older weights file keeps working.
+func cellBeta(cell onlineCell) (float64, float64, bool) {
+	if cell.Alpha > 0 && cell.Beta > 0 {
+		return cell.Alpha, cell.Beta, true
+	}
+	if cell.Attempts <= 0 {
+		return 0, 0, false
+	}
+	failures := float64(cell.Attempts) - cell.Successes
+	if failures < 0 {
+		failures = 0
+	}
+	return 1 + cell.Successes, 1 + failures, true
+}
+
+// betaFor loads (alpha, beta) for (tech_stack, fsm_state, mutation_family).
+// Exact tech/host cells refine the global posterior with the configured weight;
+// ok=false means no cell has evidence and the caller keeps its own ordering.
+func (p *onlinePrior) betaFor(feature, host, tech string) (float64, float64, bool) {
+	if p == nil {
+		return 0, 0, false
+	}
+	var alpha, beta float64
+	found := false
+	blend := func(cell onlineCell) {
+		a, b, ok := cellBeta(cell)
+		if !ok {
+			return
+		}
+		if !found {
+			alpha, beta, found = a, b, true
+			return
+		}
+		weight := p.ExactWeight
+		if weight <= 0 || weight > 1 {
+			weight = 0.8
+		}
+		alpha = weight*a + (1-weight)*alpha
+		beta = weight*b + (1-weight)*beta
+	}
+	blend(p.Global[feature])
+	blend(p.Beta[feature])
+	blend(p.Tech[tech][feature])
+	blend(p.Hosts[host][feature])
+	return alpha, beta, found
+}
+
+func (r *onlineRuntime) betaFor(feature, host, tech string) (float64, float64, bool) {
+	if r == nil {
+		return 0, 0, false
+	}
+	r.mu.Lock()
+	prior := r.prior
+	r.mu.Unlock()
+	return prior.betaFor(feature, host, tech)
 }
 
 func solutionDerived(cell onlineCell) bool {
