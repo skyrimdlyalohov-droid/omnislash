@@ -70,6 +70,7 @@ type Config struct {
 	Cooldown           CooldownConfig  `json:"cooldown"`
 	Health             HealthConfig    `json:"health"`
 	HTTP               HTTPConfig      `json:"http"`
+	Probe              ProbeConfig     `json:"probe"`
 	Stats              StatsConfig     `json:"stats"`
 	Gateway            GatewayConfig   `json:"gateway"`
 	RateLimit          RateLimitConfig `json:"rate_limit"`
@@ -127,6 +128,18 @@ type HTTPConfig struct {
 	TLSSkipVerify       bool     `json:"tls_skip_verify"`
 }
 
+// ProbeConfig bounds the byte-exact probe engine. The limits are enforced by
+// probe.Runner on every raw connection, independently of net/http.
+//
+// RaceReadTimeout is deliberately separate: race probes measure scheduling
+// windows, so their per-read deadline must not change between runs. It is fixed
+// at 1500 ms by default and must not be derived from a per-job timeout.
+type ProbeConfig struct {
+	MaxResponseBytes int64    `json:"max_response_bytes"`
+	ReadTimeout      Duration `json:"read_timeout"`
+	RaceReadTimeout  Duration `json:"race_read_timeout"`
+}
+
 // StatsConfig controls the optional JSON stats HTTP endpoint.
 type StatsConfig struct {
 	Listen string `json:"listen"`
@@ -156,13 +169,27 @@ type RateLimitConfig struct {
 // means unlimited. The breaker is fail-closed: while open, every dial and HTTP
 // request is refused instead of rotating to another proxy.
 type SafetyConfig struct {
-	Enabled      bool            `json:"enabled"`
-	StopStatuses []int           `json:"stop_statuses"`
-	Threshold    int             `json:"threshold"`
-	Window       Duration        `json:"window"`
-	Cooldown     Duration        `json:"cooldown"`
-	MaxRequests  int64           `json:"max_requests"`
-	Deception    DeceptionConfig `json:"deception"`
+	Enabled        bool                 `json:"enabled"`
+	StopStatuses   []int                `json:"stop_statuses"`
+	Threshold      int                  `json:"threshold"`
+	Window         Duration             `json:"window"`
+	Cooldown       Duration             `json:"cooldown"`
+	MaxRequests    int64                `json:"max_requests"`
+	TargetCooldown TargetCooldownConfig `json:"target_cooldown"`
+	Deception      DeceptionConfig      `json:"deception"`
+}
+
+// TargetCooldownConfig pauses one target after a burst of block responses that
+// arrived through independent exit IPs. A single 429 is normal rate limiting
+// and must never stop a scan; the threshold and the distinct-proxy requirement
+// are what separate a target-wide block from one noisy proxy.
+type TargetCooldownConfig struct {
+	Enabled            bool     `json:"enabled"`
+	Statuses           []int    `json:"statuses"`
+	Threshold          int      `json:"threshold"`
+	Window             Duration `json:"window"`
+	Cooldown           Duration `json:"cooldown"`
+	MinDistinctProxies int      `json:"min_distinct_proxies"`
 }
 
 // DeceptionConfig enables defensive response-side filtering for tarpit/deception
@@ -183,8 +210,12 @@ type DeceptionConfig struct {
 	// SemanticService uses the loopback Python skeleton service so NCD runs on
 	// value-free canonical skeletons instead of raw dynamic bodies. When it is
 	// unavailable the filter falls back to the sampled bytes.
-	SemanticService bool   `json:"semantic_service"`
-	SemanticAddr    string `json:"semantic_addr"` // loopback only, default 127.0.0.1:8000
+	SemanticService bool `json:"semantic_service"`
+	// SemanticRequired fails closed when the skeleton service is unavailable:
+	// the response is marked deception_uncertain and the probe is refused
+	// instead of running NCD on raw bytes that a honeypot may have chosen.
+	SemanticRequired bool   `json:"semantic_required"`
+	SemanticAddr     string `json:"semantic_addr"` // loopback only, default 127.0.0.1:8000
 	// TargetBanTTL bounds a session-level target ban created by "mark".
 	TargetBanTTL Duration `json:"target_ban_ttl"` // default 5m
 }
@@ -371,6 +402,11 @@ func DefaultConfig() Config {
 			TLSHandshakeTimeout: Duration(10 * time.Second),
 			MaxBodyBuffer:       4 << 20,
 		},
+		Probe: ProbeConfig{
+			MaxResponseBytes: 4 << 20,
+			ReadTimeout:      Duration(10 * time.Second),
+			RaceReadTimeout:  Duration(1500 * time.Millisecond),
+		},
 		Stats:     StatsConfig{Listen: "127.0.0.1:9090"},
 		Gateway:   GatewayConfig{Listen: "127.0.0.1:3128"},
 		RateLimit: RateLimitConfig{},
@@ -380,6 +416,14 @@ func DefaultConfig() Config {
 			Threshold:    5,
 			Window:       Duration(60 * time.Second),
 			Cooldown:     Duration(10 * time.Minute),
+			TargetCooldown: TargetCooldownConfig{
+				Enabled:            true,
+				Statuses:           []int{403, 429},
+				Threshold:          5,
+				Window:             Duration(60 * time.Second),
+				Cooldown:           Duration(2 * time.Minute),
+				MinDistinctProxies: 2,
+			},
 			Deception: DeceptionConfig{
 				Enabled:             false,
 				BaselineSamples:     2,
@@ -394,6 +438,7 @@ func DefaultConfig() Config {
 				QuarantineSecrets:   true,
 				Action:              "cooldown",
 				SemanticService:     true,
+				SemanticRequired:    false,
 				SemanticAddr:        "127.0.0.1:8000",
 				TargetBanTTL:        Duration(5 * time.Minute),
 			},
@@ -544,6 +589,15 @@ func (c *Config) normalize() {
 	if c.HTTP.MaxBodyBuffer == 0 {
 		c.HTTP.MaxBodyBuffer = d.HTTP.MaxBodyBuffer
 	}
+	if c.Probe.MaxResponseBytes == 0 {
+		c.Probe.MaxResponseBytes = d.Probe.MaxResponseBytes
+	}
+	if c.Probe.ReadTimeout == 0 {
+		c.Probe.ReadTimeout = d.Probe.ReadTimeout
+	}
+	if c.Probe.RaceReadTimeout == 0 {
+		c.Probe.RaceReadTimeout = d.Probe.RaceReadTimeout
+	}
 	if c.LogLevel == "" {
 		c.LogLevel = d.LogLevel
 	}
@@ -564,6 +618,21 @@ func (c *Config) normalize() {
 	}
 	if c.Safety.Cooldown == 0 {
 		c.Safety.Cooldown = d.Safety.Cooldown
+	}
+	if len(c.Safety.TargetCooldown.Statuses) == 0 {
+		c.Safety.TargetCooldown.Statuses = append([]int(nil), d.Safety.TargetCooldown.Statuses...)
+	}
+	if c.Safety.TargetCooldown.Threshold == 0 {
+		c.Safety.TargetCooldown.Threshold = d.Safety.TargetCooldown.Threshold
+	}
+	if c.Safety.TargetCooldown.Window == 0 {
+		c.Safety.TargetCooldown.Window = d.Safety.TargetCooldown.Window
+	}
+	if c.Safety.TargetCooldown.Cooldown == 0 {
+		c.Safety.TargetCooldown.Cooldown = d.Safety.TargetCooldown.Cooldown
+	}
+	if c.Safety.TargetCooldown.MinDistinctProxies == 0 {
+		c.Safety.TargetCooldown.MinDistinctProxies = d.Safety.TargetCooldown.MinDistinctProxies
 	}
 	if c.Safety.Deception.BaselineSamples == 0 {
 		c.Safety.Deception.BaselineSamples = d.Safety.Deception.BaselineSamples
@@ -776,6 +845,15 @@ func (c *Config) Validate() error {
 	if c.HTTP.MaxBodyBuffer < 0 {
 		add("http.max_body_buffer must be >= 0")
 	}
+	if c.Probe.MaxResponseBytes <= 0 {
+		add("probe.max_response_bytes must be > 0")
+	}
+	if c.Probe.ReadTimeout <= 0 {
+		add("probe.read_timeout must be > 0")
+	}
+	if c.Probe.RaceReadTimeout <= 0 {
+		add("probe.race_read_timeout must be > 0")
+	}
 	if c.RateLimit.PerProxyRPS < 0 {
 		add("rate_limit.per_proxy_rps must be >= 0")
 	}
@@ -804,6 +882,28 @@ func (c *Config) Validate() error {
 	}
 	if c.Safety.MaxRequests < 0 {
 		add("safety.max_requests must be >= 0")
+	}
+	if c.Safety.TargetCooldown.Enabled {
+		for _, code := range c.Safety.TargetCooldown.Statuses {
+			if code < 100 || code > 599 {
+				add("safety.target_cooldown.statuses: invalid status %d", code)
+			}
+		}
+		if c.Safety.TargetCooldown.Threshold < 1 {
+			add("safety.target_cooldown.threshold must be >= 1")
+		}
+		if c.Safety.TargetCooldown.Window <= 0 {
+			add("safety.target_cooldown.window must be > 0")
+		}
+		if c.Safety.TargetCooldown.Cooldown <= 0 {
+			add("safety.target_cooldown.cooldown must be > 0")
+		}
+		if c.Safety.TargetCooldown.MinDistinctProxies < 1 {
+			add("safety.target_cooldown.min_distinct_proxies must be >= 1")
+		}
+	}
+	if c.Safety.Deception.SemanticRequired && !c.Safety.Deception.SemanticService {
+		add("safety.deception.semantic_required requires semantic_service=true")
 	}
 	if c.Safety.Deception.BaselineSamples < 1 {
 		add("safety.deception.baseline_samples must be >= 1")

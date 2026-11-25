@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -108,18 +109,37 @@ func (c *SemanticClient) Skeleton(body []byte, contentType string) (string, erro
 	return out.Skeleton, nil
 }
 
-// SemanticProcess owns the single Python analyzer child. Starting one process
-// per response with os/exec would cost 50-100 ms each; this starts it once.
+// semanticRestartDelay is intentionally a code-level constant. A crashed
+// analyzer must not be restarted in a tight loop, and a restart must not race
+// the previous child's listening socket.
+const semanticRestartDelay = 2 * time.Second
+
+// SemanticProcess owns the single Python analyzer child and supervises it.
+// Starting one process per response with os/exec would cost 50-100 ms each;
+// this starts it once and restarts it after a crash.
 type SemanticProcess struct {
-	cmd  *exec.Cmd
-	done chan struct{}
+	addr    string
+	workDir string
+	script  string
+	log     *slog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	restarts int
 }
 
 // StartSemanticService launches research/semantic_service.py bound strictly to
-// addr. It is local only: no CDN, no virtualenv, no outbound socket.
+// addr and keeps it alive with a supervisor: Wait -> 2 s pause -> restart. It is
+// local only: no CDN, no virtualenv, no outbound socket.
 func StartSemanticService(ctx context.Context, addr, workDir string, logger *slog.Logger) (*SemanticProcess, error) {
 	if err := validateLoopbackAddr(addr); err != nil {
 		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if workDir == "" {
 		workDir = "."
@@ -128,58 +148,167 @@ func StartSemanticService(ctx context.Context, addr, workDir string, logger *slo
 	if _, err := os.Stat(script); err != nil {
 		return nil, fmt.Errorf("semantic service: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, "python3", script, "--addr", addr)
-	cmd.Dir = workDir
+	runCtx, cancel := context.WithCancel(ctx)
+	p := &SemanticProcess{
+		addr:    addr,
+		workDir: workDir,
+		script:  script,
+		log:     logger,
+		ctx:     runCtx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+	}
+	if err := p.start(); err != nil {
+		cancel()
+		return nil, err
+	}
+	go p.supervise()
+	if err := p.waitHealthy(runCtx, 2*time.Second); err != nil {
+		p.Close()
+		return nil, err
+	}
+	return p, nil
+}
+
+func (p *SemanticProcess) start() error {
+	cmd := exec.CommandContext(p.ctx, "python3", p.script, "--addr", p.addr)
+	cmd.Dir = p.workDir
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
 	sink := io.Writer(io.Discard)
-	if logger != nil {
-		sink = &onlineLogWriter{logger: logger}
+	if p.log != nil {
+		sink = &onlineLogWriter{logger: p.log}
 	}
 	cmd.Stdout = sink
 	cmd.Stderr = sink
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("semantic service: start python: %w", err)
+		return fmt.Errorf("semantic service: start python: %w", err)
 	}
-	p := &SemanticProcess{cmd: cmd, done: make(chan struct{})}
-	go func() {
-		err := cmd.Wait()
-		if logger != nil && err != nil && ctx.Err() == nil {
-			logger.Warn("semantic service exited", "error", err)
-		}
-		close(p.done)
-	}()
-	client, err := NewSemanticClient(addr)
-	if err != nil {
-		return p, err
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return p, ctx.Err()
-		case <-p.done:
-			return p, fmt.Errorf("semantic service: python exited during startup")
-		default:
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
-		req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+addr+"/healthz", nil)
-		resp, err := client.client.Do(req)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
-			_ = resp.Body.Close()
-			cancel()
-			return p, nil
-		}
-		cancel()
-		time.Sleep(20 * time.Millisecond)
-	}
-	return p, fmt.Errorf("semantic service: health check timed out")
+	p.mu.Lock()
+	p.cmd = cmd
+	p.mu.Unlock()
+	return nil
 }
 
-// Done is closed when the Python child exits.
+// supervise is the only goroutine that calls Wait. It restarts the child after
+// a fixed 2 s pause, so a crashing analyzer cannot spin or leave two children
+// competing for the loopback port.
+func (p *SemanticProcess) supervise() {
+	defer close(p.done)
+	for {
+		p.mu.Lock()
+		cmd := p.cmd
+		p.mu.Unlock()
+		if cmd == nil {
+			if err := p.start(); err != nil {
+				if p.log != nil {
+					p.log.Warn("semantic service restart failed", "error", err)
+				}
+				if !p.sleep(semanticRestartDelay) {
+					return
+				}
+			}
+			continue
+		}
+		err := cmd.Wait()
+		p.mu.Lock()
+		if p.cmd == cmd {
+			p.cmd = nil
+		}
+		p.mu.Unlock()
+		if p.ctx.Err() != nil {
+			return
+		}
+		p.mu.Lock()
+		p.restarts++
+		p.mu.Unlock()
+		if p.log != nil {
+			p.log.Warn("semantic service exited; restarting", "error", err, "delay", semanticRestartDelay)
+		}
+		if !p.sleep(semanticRestartDelay) {
+			return
+		}
+		if err := p.start(); err != nil {
+			if p.log != nil {
+				p.log.Warn("semantic service restart failed", "error", err)
+			}
+			if !p.sleep(semanticRestartDelay) {
+				return
+			}
+		}
+	}
+}
+
+func (p *SemanticProcess) sleep(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func (p *SemanticProcess) waitHealthy(ctx context.Context, timeout time.Duration) error {
+	client, err := NewSemanticClient(p.addr)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("semantic service: health check timed out")
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		req, reqErr := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+p.addr+"/healthz", nil)
+		if reqErr == nil {
+			resp, doErr := client.client.Do(req)
+			if doErr == nil {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+				_ = resp.Body.Close()
+				cancel()
+				return nil
+			}
+		}
+		cancel()
+		t := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// Close stops the supervisor and the child. It is safe to call more than once.
+func (p *SemanticProcess) Close() {
+	if p == nil {
+		return
+	}
+	if p.cancel != nil {
+		p.cancel()
+	}
+}
+
+// Done is closed when the supervisor stops, either because the context was
+// cancelled or because Close was called.
 func (p *SemanticProcess) Done() <-chan struct{} {
 	if p == nil {
 		return nil
 	}
 	return p.done
+}
+
+// Restarts reports how many times the child was restarted after a crash.
+func (p *SemanticProcess) Restarts() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.restarts
 }

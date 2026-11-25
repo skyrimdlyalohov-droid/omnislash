@@ -22,12 +22,28 @@ package probe
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"time"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
 )
+
+// tlsStateConn is the common surface of crypto/tls.Conn and utls.Conn. The
+// runner's guard wrapper exposes it too, so H2 probes still see the negotiated
+// ALPN after response limits are installed.
+type tlsStateConn interface {
+	ConnectionState() tls.ConnectionState
+}
+
+func connectionState(conn net.Conn) (tls.ConnectionState, bool) {
+	tc, ok := conn.(tlsStateConn)
+	if !ok {
+		return tls.ConnectionState{}, false
+	}
+	return tc.ConnectionState(), true
+}
 
 // Probe is one attack module. Execute must use only the provided conn: no
 // dialing, no pools, no background connections.

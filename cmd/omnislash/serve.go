@@ -51,6 +51,7 @@ func cmdServe(args []string) error {
 	// The control UI reuses the same pinned transport as the daemon. TLS is
 	// configured here so Quick Run can select h1/h2 without opening raw sockets.
 	runners := daemon.NewRunnerSet(dialer)
+	runners.SetLimits(cfg.Probe)
 	runners.H1.TLS = &tls.Config{NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12}
 	runners.H2.TLS = &tls.Config{NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12}
 
@@ -61,6 +62,14 @@ func cmdServe(args []string) error {
 	// started once; no os/exec happens per HTTP response.
 	if cfg.Safety.Deception.Enabled && cfg.Safety.Deception.SemanticService {
 		if _, err := omnislash.StartSemanticService(ctx, cfg.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+			if cfg.Safety.Deception.SemanticRequired {
+				pool.Audit().Log(omnislash.AuditEvent{
+					Kind:               "deception",
+					Reason:             "deception_uncertain",
+					DeceptionUncertain: true,
+				})
+				return fmt.Errorf("semantic skeleton service is required: %w", err)
+			}
 			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
 		} else {
 			logger.Info("semantic skeleton service started", "addr", cfg.Safety.Deception.SemanticAddr)

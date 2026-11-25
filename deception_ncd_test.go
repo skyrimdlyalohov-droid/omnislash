@@ -97,7 +97,7 @@ func TestNCDUsesCanonicalSkeletonInsteadOfRawValues(t *testing.T) {
 	// Same structure, different dynamic values: raw NCD would be high, but the
 	// canonical skeleton is identical, so this is not a structural anomaly.
 	jsonBody := []byte(`{"admin_panel":true,"token":"REAL_VALUE_ZZZ987654"}`)
-	d := f.InspectResponseWithContentType("127.0.0.1", "/api/users", 200,
+	d, _ := f.InspectResponseWithContentType("127.0.0.1", "/api/users", 200,
 		jsonBody, "application/json", time.Millisecond)
 	if d.Flagged {
 		t.Fatalf("canonical-equal body was flagged: %+v", d)
@@ -106,7 +106,7 @@ func TestNCDUsesCanonicalSkeletonInsteadOfRawValues(t *testing.T) {
 	// A genuinely different skeleton must still be flagged above the configured
 	// threshold (0.2), not the old hard-coded 0.6.
 	htmlBody := []byte(`<html><body><h1>admin panel</h1></body></html>`)
-	d = f.InspectResponseWithContentType("127.0.0.1", "/api/users", 200,
+	d, _ = f.InspectResponseWithContentType("127.0.0.1", "/api/users", 200,
 		htmlBody, "text/html", time.Millisecond)
 	if !d.Flagged || !strings.Contains(d.Reason, "skeleton NCD") {
 		t.Fatalf("structural shift was not flagged via skeleton NCD: %+v", d)
@@ -131,14 +131,14 @@ func TestRepeatStateUsesTimeWindow(t *testing.T) {
 	f.now = func() time.Time { return current }
 	body := []byte(`{"endpoints":["/api/a","/api/b","/api/c","/api/d"]}`)
 
-	if d := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
+	if d, _ := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
 		t.Fatalf("first response was flagged: %+v", d)
 	}
 	current = t0.Add(300 * time.Millisecond)
-	if d := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
+	if d, _ := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
 		t.Fatalf("response after repeat window was flagged: %+v", d)
 	}
-	if d := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); !d.Flagged {
+	if d, _ := f.InspectResponse("window.example", "/api/items", 200, body, time.Millisecond); !d.Flagged {
 		t.Fatal("two responses inside the window were not flagged")
 	}
 }
@@ -158,7 +158,7 @@ func TestIdenticalBodiesAreNotDynamicTarpit(t *testing.T) {
 	}, nil)
 	body := []byte(`{"admin_panel":true,"endpoints":["/api/a","/api/b"]}`)
 	for i := 0; i < 5; i++ {
-		if d := f.InspectResponse("stable.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
+		if d, _ := f.InspectResponse("stable.example", "/api/items", 200, body, time.Millisecond); d.Flagged {
 			t.Fatalf("identical legitimate body #%d was flagged as tarpit: %+v", i, d)
 		}
 	}

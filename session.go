@@ -163,7 +163,17 @@ func (s *Session) DialTLSContext(ctx context.Context, network, addr string, cfg 
 	if s.fingerprintName != "" {
 		// raw already came from s.DialContext: it passed scope checks and is
 		// pinned to s.proxy. uTLS only wraps it; it never opens a socket.
-		return dialTLSWithFingerprint(ctx, raw, addr, cfg, s.fingerprint)
+		//
+		// If the uTLS handshake fails there is no fallback to crypto/tls,
+		// another proxy, or a direct net.Dial. A retry would change both the
+		// exit IP and the ClientHello, invalidating the experiment. The raw
+		// connection is closed by dialTLSWithFingerprint and the error is
+		// returned as a precision-preserving transport failure.
+		conn, err := dialTLSWithFingerprint(ctx, raw, addr, cfg, s.fingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("omnislash: fingerprinted TLS failed without fallback: %w", err)
+		}
+		return conn, nil
 	}
 	tc := tls.Client(raw, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {

@@ -10,6 +10,16 @@ import (
 	"time"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
+	"github.com/skyrimdlyalohov-droid/omnislash/util"
+)
+
+const (
+	defaultMaxResponseBytes = 4 << 20
+	defaultProbeReadTimeout = 10 * time.Second
+	// RaceReadTimeout is deliberately a code-level default, not a per-job
+	// dynamic value. Race probes measure scheduling windows; changing the read
+	// deadline between runs would change the measured jitter.
+	RaceReadTimeout = 1500 * time.Millisecond
 )
 
 // Runner wires probes to omnislash sessions. It is the only place in this
@@ -22,11 +32,45 @@ type Runner struct {
 	// TLS, when set, makes the runner dial TLS with exactly this config
 	// (ALPN, SNI, verification). Nil dials plaintext.
 	TLS *tls.Config
+
+	// MaxResponseBytes bounds the bytes a probe may read from one connection.
+	// Exceeding it returns ErrResponseTooLarge; the response is never truncated
+	// and passed to NCD or framing analysis.
+	MaxResponseBytes int64
+	// ReadTimeout caps each read. Zero means defaultProbeReadTimeout.
+	ReadTimeout time.Duration
+	// RaceReadTimeout is the fixed per-read deadline for RaceProbe and
+	// H2RaceProbe. Zero means the 1500 ms default. It is intentionally not
+	// taken from the job's dynamic timeout.
+	RaceReadTimeout time.Duration
 }
 
 // NewRunner creates a runner for dialer.
 func NewRunner(d *omnislash.Dialer) *Runner {
-	return &Runner{Dialer: d, TTL: 2 * time.Minute}
+	return &Runner{
+		Dialer:           d,
+		TTL:              2 * time.Minute,
+		MaxResponseBytes: defaultMaxResponseBytes,
+		ReadTimeout:      defaultProbeReadTimeout,
+		RaceReadTimeout:  RaceReadTimeout,
+	}
+}
+
+// SetLimits applies the transport config's probe section. Non-positive values
+// keep the safe defaults instead of disabling the guard.
+func (r *Runner) SetLimits(maxResponseBytes int64, readTimeout, raceReadTimeout time.Duration) {
+	if r == nil {
+		return
+	}
+	if maxResponseBytes > 0 {
+		r.MaxResponseBytes = maxResponseBytes
+	}
+	if readTimeout > 0 {
+		r.ReadTimeout = readTimeout
+	}
+	if raceReadTimeout > 0 {
+		r.RaceReadTimeout = raceReadTimeout
+	}
 }
 
 // Outcome is one probe result together with the error that stopped it.
@@ -39,25 +83,54 @@ type Outcome struct {
 // Run executes one probe on one pinned session and closes the session and every
 // connection afterwards. Connections are never reused for another probe: a
 // desync or a half-consumed response would poison the next run.
+//
+// A panic inside a probe is contained here. It becomes ErrPrecisionLost, the
+// raw payload is appended to panic_audit.log, and the daemon keeps running.
+// The error is explicitly not a WAF/proxy verdict and is never trainable.
 func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, error) {
-	if mp, ok := p.(MultiConnProbe); ok {
-		session, err := r.newSession(target)
+	if p == nil {
+		return nil, errors.New("probe: nil probe")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sink := &payloadSink{}
+	ctx = withPayloadSink(ctx, sink)
+
+	var out *Result
+	err := util.SafeCallDynamic(sink.snapshot, func() error {
+		var runErr error
+		if mp, ok := p.(MultiConnProbe); ok {
+			session, err := r.newSession(target)
+			if err != nil {
+				return err
+			}
+			defer session.Close()
+			src := &sessionSource{
+				session: session,
+				tls:     r.TLS,
+				addr:    target.Addr,
+				race:    isRaceProbe(p),
+				runner:  r,
+			}
+			defer src.closeAll()
+			out, runErr = mp.ExecuteMulti(ctx, target, src)
+			return runErr
+		}
+		session, conn, err := r.dial(ctx, target)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer session.Close()
-		src := &sessionSource{session: session, tls: r.TLS, addr: target.Addr}
-		res, err := mp.ExecuteMulti(ctx, target, src)
-		src.closeAll()
-		return res, err
+		guarded := r.guardConn(conn, isRaceProbe(p))
+		defer guarded.Close()
+		out, runErr = p.Execute(ctx, target, guarded)
+		return runErr
+	})
+	if errors.Is(err, util.ErrPrecisionLost) {
+		return out, fmt.Errorf("probe %s: %w", p.Name(), err)
 	}
-	session, conn, err := r.dial(ctx, target)
-	if err != nil {
-		return nil, err
-	}
-	defer session.Close()
-	defer conn.Close()
-	return p.Execute(ctx, target, conn)
+	return out, err
 }
 
 // Rotate runs one probe per fresh session, so every probe uses a different exit
@@ -148,6 +221,40 @@ func (r *Runner) dialSession(ctx context.Context, session *omnislash.Session, ta
 	return conn, nil
 }
 
+func (r *Runner) guardConn(conn net.Conn, race bool) net.Conn {
+	maxRead := r.MaxResponseBytes
+	if maxRead <= 0 {
+		maxRead = defaultMaxResponseBytes
+	}
+	timeout := r.ReadTimeout
+	if timeout <= 0 {
+		timeout = defaultProbeReadTimeout
+	}
+	fixed := false
+	if race {
+		timeout = r.RaceReadTimeout
+		if timeout <= 0 {
+			timeout = RaceReadTimeout
+		}
+		fixed = true
+	}
+	return newGuardedConn(conn, maxRead, timeout, fixed)
+}
+
+// raceTimed is implemented only by probes whose timing analysis requires a
+// fixed read deadline.
+type raceTimed interface {
+	fixedReadTimeout()
+}
+
+func (p *RaceProbe) fixedReadTimeout()   {}
+func (p *H2RaceProbe) fixedReadTimeout() {}
+
+func isRaceProbe(p Probe) bool {
+	_, ok := p.(raceTimed)
+	return ok
+}
+
 // sessionSource hands out connections from one pinned session and remembers
 // them so Runner can close anything a probe forgot. All sockets therefore share
 // the same proxy and exit IP.
@@ -155,6 +262,8 @@ type sessionSource struct {
 	session *omnislash.Session
 	tls     *tls.Config
 	addr    string
+	race    bool
+	runner  *Runner
 
 	mu   sync.Mutex
 	conn []net.Conn
@@ -170,6 +279,9 @@ func (s *sessionSource) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("probe: dial %s: %w", s.addr, err)
+	}
+	if s.runner != nil {
+		conn = s.runner.guardConn(conn, s.race)
 	}
 	s.mu.Lock()
 	s.conn = append(s.conn, conn)

@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"time"
@@ -254,7 +253,7 @@ func join(payloads [][]byte) []byte {
 }
 
 func isTLS(conn net.Conn) bool {
-	_, ok := conn.(*tls.Conn)
+	_, ok := connectionState(conn)
 	return ok
 }
 

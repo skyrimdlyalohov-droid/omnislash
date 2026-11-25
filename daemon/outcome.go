@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"errors"
 	"strings"
 
+	"github.com/skyrimdlyalohov-droid/omnislash"
 	"github.com/skyrimdlyalohov-droid/omnislash/probe"
 )
 
@@ -16,6 +18,10 @@ const (
 	OutcomeWAFBlocked     OutcomeLabel = "WAF Blocked"
 	OutcomeTargetRejected OutcomeLabel = "Target Rejected"
 	OutcomeTargetResponse OutcomeLabel = "Target Response"
+	// OutcomeEngineFault is a local correctness failure: a recovered panic or
+	// a mandatory deception check that could not run. It is never a target
+	// verdict and is never trainable.
+	OutcomeEngineFault OutcomeLabel = "Engine Fault"
 )
 
 var outcomeSlugs = map[OutcomeLabel]string{
@@ -23,6 +29,7 @@ var outcomeSlugs = map[OutcomeLabel]string{
 	OutcomeWAFBlocked:     "waf-blocked",
 	OutcomeTargetRejected: "target-rejected",
 	OutcomeTargetResponse: "target-response",
+	OutcomeEngineFault:    "engine-fault",
 }
 
 var outcomeLabels = map[string]OutcomeLabel{
@@ -38,6 +45,9 @@ var outcomeLabels = map[string]OutcomeLabel{
 	"target response": OutcomeTargetResponse,
 	"target-response": OutcomeTargetResponse,
 	"target_response": OutcomeTargetResponse,
+	"engine fault":    OutcomeEngineFault,
+	"engine-fault":    OutcomeEngineFault,
+	"engine_fault":    OutcomeEngineFault,
 }
 
 // ParseOutcomeLabel accepts the canonical label or its slug from an audit line.
@@ -54,8 +64,8 @@ func (l OutcomeLabel) slug() string {
 }
 
 // Trainable reports whether this outcome is a real target response. Proxy
-// failures are excluded absolutely; WAF/rejection responses are weak negative
-// evidence, never positive proof.
+// failures and engine faults are excluded absolutely; WAF/rejection responses
+// are weak negative evidence, never positive proof.
 func (l OutcomeLabel) Trainable() bool {
 	switch l {
 	case OutcomeWAFBlocked, OutcomeTargetRejected, OutcomeTargetResponse:
@@ -85,7 +95,12 @@ var rejectBodyMarkers = []string{
 // a proxy/transport failure even when an error string is absent: there is no
 // target response to learn from, only an absent observation.
 func classifyOutcome(res *probe.Result, err error) OutcomeLabel {
-	_ = err
+	// A recovered panic or a mandatory semantic failure is an engine fault,
+	// even if a partial response was parsed before the fault. It must never
+	// become WAF or target evidence.
+	if errors.Is(err, omnislash.ErrPrecisionLost) || errors.Is(err, omnislash.ErrDeceptionUncertain) {
+		return OutcomeEngineFault
+	}
 	if res == nil || len(res.Responses) == 0 {
 		return OutcomeProxyFailed
 	}

@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -381,11 +380,11 @@ func (p *H2CLProbe) buildSmuggled(target Target) ([]byte, error) {
 }
 
 func requireALPNh2(conn net.Conn) error {
-	tc, ok := conn.(*tls.Conn)
+	state, ok := connectionState(conn)
 	if !ok {
 		return fmt.Errorf("probe: h2-cl requires a TLS connection")
 	}
-	if proto := tc.ConnectionState().NegotiatedProtocol; proto != "h2" {
+	if proto := state.NegotiatedProtocol; proto != "h2" {
 		return fmt.Errorf("probe: h2-cl requires ALPN h2, got %q", proto)
 	}
 	return nil

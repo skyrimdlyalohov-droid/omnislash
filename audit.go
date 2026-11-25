@@ -23,6 +23,10 @@ type AuditEvent struct {
 	Reason    string    `json:"reason,omitempty"`
 	RequestID string    `json:"request_id,omitempty"`
 	Duration  string    `json:"duration,omitempty"`
+	// DeceptionUncertain records that a mandatory semantic/NCD check could
+	// not run. The event is evidence of an engine limitation, never a clean
+	// response and never a target verdict.
+	DeceptionUncertain bool `json:"deception_uncertain,omitempty"`
 }
 
 // AuditLogger serializes audit events to one writer. A nil logger is a no-op,

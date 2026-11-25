@@ -49,7 +49,24 @@ type Pool struct {
 	audit         *AuditLogger
 	deception     *DeceptionFilter
 
+	// Target cooldown is independent of the global circuit. It pauses one host
+	// after a burst of blocks across independent proxies; other targets remain
+	// eligible and a single 429 never stops the scan.
+	cooldownMu sync.Mutex
+	targets    map[string]*targetCooldownState
+
 	now func() time.Time
+}
+
+type targetBlockEvent struct {
+	at    time.Time
+	proxy string
+}
+
+type targetCooldownState struct {
+	events []targetBlockEvent
+	until  time.Time
+	reason string
 }
 
 // NewPool creates a pool. The config is copied and normalized; proxies are
@@ -88,6 +105,7 @@ func NewPool(cfg *Config, proxies []*Proxy, logger *slog.Logger) (*Pool, error) 
 		scope:   scope,
 		log:     logger,
 		sticky:  make(map[string]stickyEntry),
+		targets: make(map[string]*targetCooldownState),
 		audit:   audit,
 		now:     time.Now,
 	}
@@ -230,12 +248,154 @@ func (p *Pool) Allow() error {
 	return p.circuit.Allow()
 }
 
-// RecordStatus feeds one target response into the safety breaker.
+// RecordStatus feeds one target response into the global safety breaker only.
+// Prefer RecordTargetStatus when the host and proxy are known.
 func (p *Pool) RecordStatus(status int) {
 	if p == nil {
 		return
 	}
 	p.circuit.RecordStatus(status)
+}
+
+// RecordTargetStatus feeds a response into the global breaker and into the
+// per-target cooldown. The target cooldown requires a consecutive burst of
+// configured block statuses across at least MinDistinctProxies independent
+// exits. A single 429 is ordinary rate limiting and does not stop anything.
+func (p *Pool) RecordTargetStatus(host string, pr *Proxy, status int) {
+	if p == nil {
+		return
+	}
+	p.circuit.RecordStatus(status)
+
+	cfg := p.cfg.Safety.TargetCooldown
+	host = strings.ToLower(strings.TrimSpace(host))
+	if !cfg.Enabled || host == "" {
+		return
+	}
+	block := false
+	for _, code := range cfg.Statuses {
+		if code == status {
+			block = true
+			break
+		}
+	}
+	now := p.now()
+	window := cfg.Window.Std()
+	if window <= 0 {
+		window = time.Minute
+	}
+
+	p.cooldownMu.Lock()
+	if p.targets == nil {
+		p.targets = make(map[string]*targetCooldownState)
+	}
+	st := p.targets[host]
+	if st == nil {
+		st = &targetCooldownState{}
+		p.targets[host] = st
+	}
+	// Already cooling: do not extend the pause on every blocked response.
+	if !st.until.IsZero() && now.Before(st.until) {
+		p.cooldownMu.Unlock()
+		return
+	}
+	if !block {
+		delete(p.targets, host)
+		p.cooldownMu.Unlock()
+		return
+	}
+
+	kept := st.events[:0]
+	for _, ev := range st.events {
+		if now.Sub(ev.at) <= window {
+			kept = append(kept, ev)
+		}
+	}
+	st.events = kept
+	proxyKey := "direct"
+	if pr != nil {
+		proxyKey = pr.key()
+	}
+	st.events = append(st.events, targetBlockEvent{at: now, proxy: proxyKey})
+
+	distinct := make(map[string]struct{}, len(st.events))
+	for _, ev := range st.events {
+		distinct[ev.proxy] = struct{}{}
+	}
+	if len(st.events) >= cfg.Threshold && len(distinct) >= cfg.MinDistinctProxies {
+		cooldown := cfg.Cooldown.Std()
+		if cooldown <= 0 {
+			cooldown = 2 * time.Minute
+		}
+		st.until = now.Add(cooldown)
+		st.reason = fmt.Sprintf("%d block responses across %d proxies within %s", len(st.events), len(distinct), window)
+		st.events = nil
+		if p.log != nil {
+			p.log.Warn("target cooling down after repeated blocks", "host", host, "until", st.until, "reason", st.reason)
+		}
+		if p.audit != nil {
+			p.audit.Log(AuditEvent{Kind: "target_cooldown", Target: host, Status: status, Reason: st.reason})
+		}
+	}
+	p.cooldownMu.Unlock()
+}
+
+// TargetCooling reports whether host is paused and until when. The returned
+// time is zero when the target is eligible.
+func (p *Pool) TargetCooling(host string) (time.Time, bool) {
+	if p == nil || !p.cfg.Safety.TargetCooldown.Enabled {
+		return time.Time{}, false
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return time.Time{}, false
+	}
+	now := p.now()
+	p.cooldownMu.Lock()
+	defer p.cooldownMu.Unlock()
+	st := p.targets[host]
+	if st == nil || st.until.IsZero() {
+		return time.Time{}, false
+	}
+	if !now.Before(st.until) {
+		delete(p.targets, host)
+		return time.Time{}, false
+	}
+	return st.until, true
+}
+
+// WaitForProxy blocks until at least one proxy is usable or ctx is cancelled.
+// It is the daemon's graceful-degradation path for an empty/cooling pool: the
+// health checker and scraper keep running, and in-memory experience state is
+// never discarded while the daemon waits.
+func (p *Pool) WaitForProxy(ctx context.Context) error {
+	if p == nil || p.cfg.AllowDirect {
+		return nil
+	}
+	if p.closed.Load() {
+		return ErrPoolClosed
+	}
+	if p.Available() > 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if p.closed.Load() {
+				return ErrPoolClosed
+			}
+			if p.Available() > 0 {
+				return nil
+			}
+		}
+	}
 }
 
 // TripSafety opens the safety breaker immediately.

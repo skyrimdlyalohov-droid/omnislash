@@ -3,7 +3,6 @@ package probe
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -388,11 +387,11 @@ func isCorruptionStatus(code int) bool {
 }
 
 func checkH2Downgrade(conn net.Conn) error {
-	tc, ok := conn.(*tls.Conn)
+	state, ok := connectionState(conn)
 	if !ok {
 		return fmt.Errorf("probe: h2_downgrade requires a TLS connection")
 	}
-	if proto := tc.ConnectionState().NegotiatedProtocol; proto != "h2" {
+	if proto := state.NegotiatedProtocol; proto != "h2" {
 		return fmt.Errorf("probe: h2_downgrade requires an h2-negotiated connection, got %q", proto)
 	}
 	return nil

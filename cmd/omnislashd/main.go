@@ -90,6 +90,7 @@ func run() error {
 	}
 	dialer := omnislash.NewDialer(pool, logger)
 	runners := daemon.NewRunnerSet(dialer)
+	runners.SetLimits(transport.Probe)
 	runners.H1.TLS = &tls.Config{NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12}
 	runners.H2.TLS = &tls.Config{NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12}
 
@@ -125,8 +126,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if transport.Safety.Deception.Enabled && transport.Safety.Deception.SemanticService && *jobName == "" && !*once {
+	if transport.Safety.Deception.Enabled && transport.Safety.Deception.SemanticService {
 		if _, err := omnislash.StartSemanticService(ctx, transport.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+			if transport.Safety.Deception.SemanticRequired {
+				pool.Audit().Log(omnislash.AuditEvent{
+					Kind:               "deception",
+					Reason:             "deception_uncertain",
+					DeceptionUncertain: true,
+				})
+				return fmt.Errorf("semantic skeleton service is required: %w", err)
+			}
 			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
 		} else {
 			logger.Info("semantic skeleton service started", "addr", transport.Safety.Deception.SemanticAddr)

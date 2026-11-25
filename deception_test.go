@@ -51,7 +51,7 @@ func TestDeceptionFilterFlagsSynthetic200Baseline(t *testing.T) {
 func TestDeceptionFilterQuarantinesSecrets(t *testing.T) {
 	f := NewDeceptionFilter(DeceptionConfig{Enabled: true, QuarantineSecrets: true, Action: "mark", BaselineSamples: 2, MaxBodySample: 64 << 10, SimilarityThreshold: 0.92, RepeatStatus: 200, RepeatThreshold: 8, LatencySpikeFactor: 4}, nil)
 	body := []byte(`{"token":"api_key=ABCD1234EFGH5678","endpoint":"/api/internal/debug"}`)
-	d := f.InspectResponse("example.com", "/api/v1/users", 200, body, 50*time.Millisecond)
+	d, _ := f.InspectResponse("example.com", "/api/v1/users", 200, body, 50*time.Millisecond)
 	_ = d
 	q := f.Quarantined()
 	if len(q) == 0 {
@@ -69,7 +69,7 @@ func TestDeceptionFilterRepeatAnomaly(t *testing.T) {
 	body := []byte(`{"admin panel":true,"endpoints":["/api/v1/a","/api/v1/b","/api/v1/c","/api/v1/d"]}`)
 	var d DeceptionDecision
 	for i := 0; i < 4; i++ {
-		d = f.InspectResponse("example.com", "/api/v1/items", 200, body, 30*time.Millisecond)
+		d, _ = f.InspectResponse("example.com", "/api/v1/items", 200, body, 30*time.Millisecond)
 	}
 	if !d.Flagged {
 		d2, ok := f.IsFlagged("example.com", "/api/v1")

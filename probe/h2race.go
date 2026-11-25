@@ -3,7 +3,6 @@ package probe
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -44,11 +43,11 @@ func (p *H2RaceProbe) Name() string { return "race/h2-last-frame" }
 
 // Execute sends the synchronized batch and collects response statuses.
 func (p *H2RaceProbe) Execute(ctx context.Context, target Target, conn net.Conn) (*Result, error) {
-	tc, ok := conn.(*tls.Conn)
+	state, ok := connectionState(conn)
 	if !ok {
 		return nil, fmt.Errorf("probe: h2 race requires a TLS connection")
 	}
-	if proto := tc.ConnectionState().NegotiatedProtocol; proto != "h2" {
+	if proto := state.NegotiatedProtocol; proto != "h2" {
 		return nil, fmt.Errorf("probe: h2 race requires ALPN h2, got %q", proto)
 	}
 	count := p.Count
@@ -138,7 +137,7 @@ func (p *H2RaceProbe) Execute(ctx context.Context, target Target, conn net.Conn)
 	e.res.Burst.Writes = 2
 	e.res.Burst.Bytes = out.Len() + finals.Len()
 
-	statuses, bodies, err := p.readFrames(e, tc, count, orDuration(p.Idle, time.Second))
+	statuses, bodies, err := p.readFrames(e, conn, count, orDuration(p.Idle, time.Second))
 	if err != nil && !isTimeout(err) {
 		return e.finish(), err
 	}

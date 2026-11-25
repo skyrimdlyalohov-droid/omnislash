@@ -65,6 +65,7 @@ type exec struct {
 	timeout   time.Duration
 	maxHeader int64
 	maxBody   int64
+	sink      *payloadSink
 }
 
 func newExec(ctx context.Context, name string, target Target, conn net.Conn, timeout time.Duration, maxHeader, maxBody int64) *exec {
@@ -78,6 +79,7 @@ func newExec(ctx context.Context, name string, target Target, conn net.Conn, tim
 		timeout:   orDuration(timeout, defaultTimeout),
 		maxHeader: orInt64(maxHeader, defaultMaxHeader),
 		maxBody:   orInt64(maxBody, defaultMaxBody),
+		sink:      payloadSinkFrom(ctx),
 	}
 }
 
@@ -111,6 +113,7 @@ func (e *exec) write(payload []byte) error {
 	if n > 0 {
 		e.seq++
 		e.res.addWrite(e.seq, payload[:n], at, took)
+		e.sink.record(payload[:n])
 	}
 	if err != nil {
 		return err
@@ -234,7 +237,7 @@ func readResponse(br *bufio.Reader, at time.Duration, maxHeader, maxBody int64) 
 			resp.Truncated = true
 		}
 		if n > 0 {
-			if _, err := io.CopyN(io.MultiWriter(&raw, &body), br, n); err != nil {
+			if _, err := copyN(io.MultiWriter(&raw, &body), br, n); err != nil {
 				return resp, err
 			}
 		}
@@ -242,7 +245,7 @@ func readResponse(br *bufio.Reader, at time.Duration, maxHeader, maxBody int64) 
 		resp.Framing = "none"
 	default:
 		resp.Framing = "close"
-		n, err := io.CopyN(io.MultiWriter(&raw, &body), br, maxBody)
+		n, err := copyN(io.MultiWriter(&raw, &body), br, maxBody)
 		_ = n
 		if err != nil && err != io.EOF {
 			return resp, err
@@ -287,16 +290,16 @@ func readChunked(br *bufio.Reader, raw, body *bytes.Buffer, maxBody int64) (bool
 		if total+size > maxBody {
 			// Consume the rest of the chunk so the stream stays aligned, but do
 			// not grow the body beyond the limit.
-			if _, err := io.CopyN(io.Discard, br, size+2); err != nil {
+			if _, err := copyN(io.Discard, br, size+2); err != nil {
 				return true, err
 			}
 			return true, nil
 		}
-		if _, err := io.CopyN(io.MultiWriter(raw, body), br, size); err != nil {
+		if _, err := copyN(io.MultiWriter(raw, body), br, size); err != nil {
 			return false, err
 		}
 		total += size
-		if _, err := io.CopyN(raw, br, 2); err != nil {
+		if _, err := copyN(raw, br, 2); err != nil {
 			return false, err
 		}
 	}

@@ -3,7 +3,6 @@ package probe
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"strconv"
@@ -85,11 +84,11 @@ func (p *H2TunnelProbe) Execute(ctx context.Context, target Target, conn net.Con
 	if target.Addr == "" {
 		return nil, fmt.Errorf("probe: target address is required")
 	}
-	tc, ok := conn.(*tls.Conn)
+	state, ok := connectionState(conn)
 	if !ok {
 		return nil, fmt.Errorf("probe: h2 tunnel requires a TLS connection")
 	}
-	if proto := tc.ConnectionState().NegotiatedProtocol; proto != "h2" {
+	if proto := state.NegotiatedProtocol; proto != "h2" {
 		return nil, fmt.Errorf("probe: h2 tunnel requires ALPN h2, got %q", proto)
 	}
 

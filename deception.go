@@ -42,6 +42,10 @@ type DeceptionDecision struct {
 	Reason     string        `json:"reason,omitempty"`
 	Score      float64       `json:"score,omitempty"`
 	Quarantine []string      `json:"quarantine,omitempty"`
+	// Uncertain means the mandatory semantic/NCD check could not run. The
+	// decision is deliberately not a verdict: callers must fail closed and
+	// record deception_uncertain instead of treating raw bytes as clean.
+	Uncertain bool `json:"uncertain,omitempty"`
 }
 
 // QuarantinedSecret is a finding that must not be auto-reused until verified.
@@ -186,15 +190,21 @@ const maxNCDBytes = 8 << 10
 
 // bodySkeleton returns a canonical value-free form of a body sample. The Python
 // analyzer runs as one loopback child process owned by the caller; no os/exec
-// happens here. If it is unavailable we still compute NCD on the raw sample and
-// log once, so a missing optional service cannot stall a probe.
-func (f *DeceptionFilter) bodySkeleton(body []byte, contentType string) []byte {
+// happens here.
+//
+// When semantic_required is true, an unavailable analyzer is a hard error. The
+// caller must fail closed: using raw bytes for NCD in that mode could let a
+// honeypot's dynamic body look like a legitimate response.
+func (f *DeceptionFilter) bodySkeleton(body []byte, contentType string) ([]byte, error) {
 	body = append([]byte(nil), body...)
 	if len(body) > maxNCDBytes {
 		body = body[:maxNCDBytes]
 	}
 	if f.semantic == nil {
-		return body
+		if f.cfg.SemanticRequired {
+			return nil, fmt.Errorf("%w: semantic service is not configured", ErrDeceptionUncertain)
+		}
+		return body, nil
 	}
 	skeleton, err := f.semantic.Skeleton(body, contentType)
 	if err != nil {
@@ -203,14 +213,17 @@ func (f *DeceptionFilter) bodySkeleton(body []byte, contentType string) []byte {
 		f.semWarned = true
 		f.mu.Unlock()
 		if warn && f.log != nil {
-			f.log.Warn("semantic skeleton unavailable, using raw sample", "addr", f.cfg.SemanticAddr, "error", err)
+			f.log.Warn("semantic skeleton unavailable", "addr", f.cfg.SemanticAddr, "required", f.cfg.SemanticRequired, "error", err)
 		}
-		return body
+		if f.cfg.SemanticRequired {
+			return nil, fmt.Errorf("%w: %v", ErrDeceptionUncertain, err)
+		}
+		return body, nil
 	}
 	if len(skeleton) > maxNCDBytes {
 		skeleton = skeleton[:maxNCDBytes]
 	}
-	return []byte(skeleton)
+	return []byte(skeleton), nil
 }
 
 // EnsureBaseline runs CalibrateBaseline once per host/prefix before the first
@@ -364,7 +377,10 @@ func (f *DeceptionFilter) CalibrateBaseline(ctx context.Context, baseURL, prefix
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, f.cfg.MaxBodySample))
 		_ = resp.Body.Close()
-		skeleton := f.bodySkeleton(body, resp.Header.Get("Content-Type"))
+		skeleton, skErr := f.bodySkeleton(body, resp.Header.Get("Content-Type"))
+		if skErr != nil {
+			return nil, skErr
+		}
 		if prof.Skeleton == "" && len(skeleton) > 0 {
 			prof.Skeleton = string(skeleton)
 		}
@@ -464,23 +480,31 @@ func shannonEntropy(b []byte) float64 {
 
 // InspectResponse evaluates a response for deception/tarpit signals. It does not
 // close resp.Body; caller should pass a body sample and keep ownership.
-func (f *DeceptionFilter) InspectResponse(host, path string, status int, body []byte, latency time.Duration) DeceptionDecision {
+func (f *DeceptionFilter) InspectResponse(host, path string, status int, body []byte, latency time.Duration) (DeceptionDecision, error) {
 	return f.InspectResponseWithContentType(host, path, status, body, "", latency)
 }
 
 // InspectResponseWithContentType is InspectResponse with the response content
 // type, which the semantic analyzer uses to choose JSON vs HTML normalization.
-func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, status int, body []byte, contentType string, latency time.Duration) DeceptionDecision {
+//
+// The error is non-nil only when a mandatory semantic check could not run. The
+// returned decision then has Uncertain=true and Flagged=false; it is never a
+// false positive and never evidence that the response was clean.
+func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, status int, body []byte, contentType string, latency time.Duration) (DeceptionDecision, error) {
 	if f == nil || !f.Enabled() {
-		return DeceptionDecision{}
+		return DeceptionDecision{}, nil
 	}
 	host = strings.ToLower(strings.TrimSpace(host))
 	prefix := pathPrefix(path)
 	if d, ok := f.IsFlagged(host, prefix); ok {
-		return d
+		return d, nil
 	}
 	fp := fingerprintResponse(status, body)
-	skeleton := f.bodySkeleton(body, contentType)
+	skeleton, skErr := f.bodySkeleton(body, contentType)
+	if skErr != nil {
+		d := DeceptionDecision{Host: host, Prefix: prefix, Reason: skErr.Error(), Uncertain: true}
+		return d, skErr
+	}
 
 	// Quarantine secrets/tokens/paths from response (never auto-reuse).
 	f.quarantineFindings(host, path, fp, string(body))
@@ -492,13 +516,13 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 		if sim >= f.cfg.SimilarityThreshold && (fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 0) {
 			d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "response matches nonexistent-path baseline with sensitive hints", Score: sim}
 			f.flag(d)
-			return d
+			return d, nil
 		}
 	}
 	if status == 200 && (fp.hasAdmin || fp.tokenCount > 0) && looksRandomNotFoundPath(path) {
 		d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "random nonexistent path returned sensitive 200", Score: 1}
 		f.flag(d)
-		return d
+		return d, nil
 	}
 	if base != nil && len(body) > 0 {
 		a, b := base.Sample, body
@@ -510,7 +534,7 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 			if ncd > f.cfg.NCDStructural && status == 200 && (fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 0) {
 				d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "structural shift vs baseline (skeleton NCD)", Score: ncd}
 				f.flag(d)
-				return d
+				return d, nil
 			}
 		}
 	}
@@ -567,7 +591,7 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 	if repeatCount >= f.cfg.RepeatThreshold && (fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 2) {
 		d := DeceptionDecision{Flagged: true, Kind: DeceptionRepeat, Host: host, Prefix: prefix, Reason: fmt.Sprintf("repeated status %d with suspicious content", status), Score: float64(repeatCount)}
 		f.flag(d)
-		return d
+		return d, nil
 	}
 	// Identical "perfect" responses are a normal cache hit, not a dynamic
 	// tarpit. Require at least two different raw samples with a stable
@@ -575,17 +599,17 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 	if len(skeletons) >= 3 && hasDistinctSamples(samples) && IsDynamicTarpitTemplate(skeletonBytes(skeletons), f.cfg.NCDTarpit) && (fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 0) {
 		d := DeceptionDecision{Flagged: true, Kind: DeceptionTarpit, Host: host, Prefix: prefix, Reason: "dynamic tarpit template (low skeleton NCD)", Score: 1}
 		f.flag(d)
-		return d
+		return d, nil
 	}
 	if latency > 0 && base != nil && base.Samples > 0 {
 		// latency degradation heuristic: very slow 200 with synthetic hints.
 		if latency > time.Duration(f.cfg.LatencySpikeFactor*float64(time.Second)) && status == 200 && (fp.hasAdmin || fp.endpointHints > 0 || fp.tokenCount > 0) {
 			d := DeceptionDecision{Flagged: true, Kind: DeceptionTarpit, Host: host, Prefix: prefix, Reason: "latency spike with synthetic-looking response", Score: latency.Seconds()}
 			f.flag(d)
-			return d
+			return d, nil
 		}
 	}
-	return DeceptionDecision{}
+	return DeceptionDecision{}, nil
 }
 
 func pathPrefix(path string) string {
@@ -819,8 +843,7 @@ func (f *DeceptionFilter) InspectHTTPResponse(resp *http.Response, latency time.
 		rest := resp.Body
 		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(sample), rest))
 	}
-	d := f.InspectResponseWithContentType(host, path, resp.StatusCode, sample, resp.Header.Get("Content-Type"), latency)
-	return d, nil
+	return f.InspectResponseWithContentType(host, path, resp.StatusCode, sample, resp.Header.Get("Content-Type"), latency)
 }
 
 // NormalizedCompressionDistance computes NCD using zlib compression.

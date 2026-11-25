@@ -346,18 +346,32 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 	defer resp.Body.Close()
 	latency := time.Since(start)
 
-	g.dialer.pool.RecordStatus(resp.StatusCode)
 	pr, hasProxy := ProxyOf(upstream)
+	var pptr *Proxy
+	if hasProxy {
+		pptr = pr
+	}
+	g.dialer.pool.RecordTargetStatus(req.URL.Hostname(), pptr, resp.StatusCode)
 	if df := g.dialer.pool.Deception(); df != nil && df.Enabled() {
 		// Ensure request URL is absolute for inspection.
 		if resp.Request == nil {
 			resp.Request = req
 		}
-		if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
-			var pptr *Proxy
+		d, dErr := df.InspectHTTPResponse(resp, latency)
+		if dErr != nil {
+			ev := AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Reason: "deception_inspection_failed"}
 			if hasProxy {
-				pptr = pr
+				ev.Proxy = pr.Label()
 			}
+			if errors.Is(dErr, ErrDeceptionUncertain) {
+				ev.Reason = "deception_uncertain"
+				ev.DeceptionUncertain = true
+			}
+			g.audit(ev)
+			writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway", "deception analysis failed")
+			return
+		}
+		if d.Flagged {
 			g.dialer.pool.HandleDeception(pptr, d)
 			proxyLabel := ""
 			if hasProxy {

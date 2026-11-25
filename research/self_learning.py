@@ -70,11 +70,13 @@ OUTCOME_PROXY_FAILED = "Proxy Failed"
 OUTCOME_WAF_BLOCKED = "WAF Blocked"
 OUTCOME_TARGET_REJECTED = "Target Rejected"
 OUTCOME_TARGET_RESPONSE = "Target Response"
+OUTCOME_ENGINE_FAULT = "Engine Fault"
 OUTCOME_SLUGS = {
     OUTCOME_PROXY_FAILED: "proxy-failed",
     OUTCOME_WAF_BLOCKED: "waf-blocked",
     OUTCOME_TARGET_REJECTED: "target-rejected",
     OUTCOME_TARGET_RESPONSE: "target-response",
+    OUTCOME_ENGINE_FAULT: "engine-fault",
 }
 _OUTCOME_ALIASES = {
     "proxy failed": OUTCOME_PROXY_FAILED,
@@ -89,6 +91,9 @@ _OUTCOME_ALIASES = {
     "target response": OUTCOME_TARGET_RESPONSE,
     "target-response": OUTCOME_TARGET_RESPONSE,
     "target_response": OUTCOME_TARGET_RESPONSE,
+    "engine fault": OUTCOME_ENGINE_FAULT,
+    "engine-fault": OUTCOME_ENGINE_FAULT,
+    "engine_fault": OUTCOME_ENGINE_FAULT,
 }
 _WAF_BODY_MARKERS = ("captcha", "access denied", "request blocked", "blocked by", "waf")
 
@@ -222,7 +227,17 @@ def outcome_label(rec: Dict[str, Any]) -> str:
 
 
 def trainable_outcome(label: str) -> bool:
-    return label != OUTCOME_PROXY_FAILED
+    """Only real target responses may train.
+
+    Proxy failures mean the target was never reached; engine faults mean the
+    local probe or semantic analyzer failed. Neither is evidence about the
+    technique, and an unknown label must not silently become training data.
+    """
+    return label in {
+        OUTCOME_WAF_BLOCKED,
+        OUTCOME_TARGET_REJECTED,
+        OUTCOME_TARGET_RESPONSE,
+    }
 
 
 def _raw_request_text(rec: Dict[str, Any]) -> str:

@@ -29,6 +29,24 @@ type Dialer struct {
 	fpSeq        atomic.Uint64
 }
 
+// WaitForProxy blocks until the pool has a usable proxy. The daemon uses it to
+// enter a health-check wait instead of failing the whole run when every exit is
+// cooling down or the scraper has not populated the pool yet.
+func (d *Dialer) WaitForProxy(ctx context.Context) error {
+	if d == nil || d.pool == nil {
+		return nil
+	}
+	return d.pool.WaitForProxy(ctx)
+}
+
+// TargetCooling reports whether host is paused after a target-wide block burst.
+func (d *Dialer) TargetCooling(host string) (time.Time, bool) {
+	if d == nil || d.pool == nil {
+		return time.Time{}, false
+	}
+	return d.pool.TargetCooling(host)
+}
+
 // NewDialer creates a dialer for pool.
 func NewDialer(pool *Pool, logger *slog.Logger) *Dialer {
 	if logger == nil {

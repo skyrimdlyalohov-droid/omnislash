@@ -31,6 +31,11 @@ type RotatingTransport struct {
 	closed   atomic.Bool
 	ban      map[int]struct{}
 	gen      uint64
+
+	// maxResponseBytes is probe.max_response_bytes from the transport config.
+	// Exceeding it is an error, never a truncated body: NCD and framing
+	// analysis must never see a response that was silently cut in half.
+	maxResponseBytes int64
 }
 
 // NewRotatingTransport creates a transport for pool.
@@ -46,13 +51,14 @@ func NewRotatingTransport(pool *Pool, dialer *Dialer, cfg HTTPConfig, logger *sl
 		ban[code] = struct{}{}
 	}
 	return &RotatingTransport{
-		pool:     pool,
-		dialer:   dialer,
-		cfg:      normalized.HTTP,
-		log:      logger,
-		perProxy: make(map[*Proxy]*http.Transport),
-		ban:      ban,
-		gen:      pool.Generation(),
+		pool:             pool,
+		dialer:           dialer,
+		cfg:              normalized.HTTP,
+		log:              logger,
+		perProxy:         make(map[*Proxy]*http.Transport),
+		ban:              ban,
+		gen:              pool.Generation(),
+		maxResponseBytes: normalized.Probe.MaxResponseBytes,
 	}
 }
 
@@ -112,6 +118,10 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if df := t.pool.Deception(); df != nil && df.Enabled() {
 		baseURL := req.URL.Scheme + "://" + req.URL.Host
 		if _, err := df.EnsureBaseline(ctx, baseURL, pathPrefix(req.URL.Path), t.baselineDoRequest); err != nil {
+			if errors.Is(err, ErrDeceptionUncertain) {
+				t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_uncertain", DeceptionUncertain: true})
+				return nil, err
+			}
 			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_baseline_failed"})
 			return nil, fmt.Errorf("%w: %v", ErrDeceptionBaseline, err)
 		}
@@ -137,9 +147,16 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 				resp, rErr := t.directTransport().RoundTrip(directReq)
 				latency := t.pool.now().Sub(start)
 				if rErr == nil && resp != nil {
-					t.pool.RecordStatus(resp.StatusCode)
+					t.limitResponseBody(resp)
+					t.pool.RecordTargetStatus(req.URL.Hostname(), nil, resp.StatusCode)
 					if df := t.pool.Deception(); df != nil && df.Enabled() {
-						if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
+						d, dErr := df.InspectHTTPResponse(resp, latency)
+						if dErr != nil {
+							t.auditInspectionError(req, nil, dErr)
+							drainAndClose(resp.Body)
+							return nil, dErr
+						}
+						if d.Flagged {
 							t.pool.HandleDeception(nil, d)
 							t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Reason: "deception_" + string(d.Kind)})
 							if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
@@ -172,9 +189,16 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Proxy: pr.Label(), Reason: "proxy_error"})
 			continue
 		}
-		t.pool.RecordStatus(resp.StatusCode)
+		t.limitResponseBody(resp)
+		t.pool.RecordTargetStatus(req.URL.Hostname(), pr, resp.StatusCode)
 		if df := t.pool.Deception(); df != nil && df.Enabled() {
-			if d, dErr := df.InspectHTTPResponse(resp, latency); dErr == nil && d.Flagged {
+			d, dErr := df.InspectHTTPResponse(resp, latency)
+			if dErr != nil {
+				t.auditInspectionError(req, pr, dErr)
+				drainAndClose(resp.Body)
+				return nil, dErr
+			}
+			if d.Flagged {
 				t.pool.HandleDeception(pr, d)
 				t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Status: resp.StatusCode, Proxy: pr.Label(), Reason: "deception_" + string(d.Kind)})
 				if _, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
@@ -354,12 +378,78 @@ func prepareBody(req *http.Request, limit int64) (func() (io.ReadCloser, error),
 	}, true, nil
 }
 
+// transportBufferPool keeps the drain path allocation-free. Every byte is
+// cleared before Put: a pooled buffer must never carry bytes from a previous
+// response into the next request (payload bleeding).
+var transportBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32<<10)
+		return &buf
+	},
+}
+
 func drainAndClose(body io.ReadCloser) {
 	if body == nil {
 		return
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 32<<10))
+	bufp := transportBufferPool.Get().(*[]byte)
+	buf := (*bufp)[:32<<10]
+	_, _ = io.CopyBuffer(io.Discard, io.LimitReader(body, 32<<10), buf)
+	clear(buf)
+	transportBufferPool.Put(bufp)
 	_ = body.Close()
+}
+
+// limitResponseBody installs the configured response bound. The wrapper returns
+// ErrResponseTooLarge when the peer sends one byte past the bound; it never
+// silently truncates the body handed to NCD or framing analysis.
+func (t *RotatingTransport) limitResponseBody(resp *http.Response) {
+	if t == nil || resp == nil || resp.Body == nil || t.maxResponseBytes <= 0 {
+		return
+	}
+	resp.Body = &limitedResponseBody{ReadCloser: resp.Body, remaining: t.maxResponseBytes}
+}
+
+type limitedResponseBody struct {
+	io.ReadCloser
+	remaining int64
+	overflow  error
+}
+
+func (b *limitedResponseBody) Read(p []byte) (int, error) {
+	if b.overflow != nil {
+		return 0, b.overflow
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.remaining <= 0 {
+		var one [1]byte
+		n, err := b.ReadCloser.Read(one[:])
+		if n > 0 {
+			b.overflow = ErrResponseTooLarge
+			return 0, b.overflow
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+func (t *RotatingTransport) auditInspectionError(req *http.Request, pr *Proxy, err error) {
+	ev := AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "deception_inspection_failed"}
+	if errors.Is(err, ErrDeceptionUncertain) {
+		ev.Reason = "deception_uncertain"
+		ev.DeceptionUncertain = true
+	}
+	if pr != nil {
+		ev.Proxy = pr.Label()
+	}
+	t.audit(ev)
 }
 
 func (t *RotatingTransport) audit(ev AuditEvent) {

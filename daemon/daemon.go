@@ -26,6 +26,19 @@ type Executor interface {
 	Run(ctx context.Context, target probe.Target, p probe.Probe, tlsMode string) (*probe.Result, error)
 }
 
+// proxyWaiter is implemented by the production RunnerSet. It lets the daemon
+// wait for the health checker instead of failing when every exit is cooling
+// down. Test executors may omit it.
+type proxyWaiter interface {
+	WaitForProxy(ctx context.Context) error
+}
+
+// targetCooler is implemented by the production RunnerSet. It pauses only the
+// target that produced a block burst; other jobs keep scanning.
+type targetCooler interface {
+	TargetCooling(host string) (time.Time, bool)
+}
+
 // JobState is the runtime view of one job.
 type JobState struct {
 	Name        string    `json:"name"`
@@ -471,12 +484,42 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 	if err != nil {
 		return Outcome{Job: j.Name, Err: err}
 	}
+	host := target.Host
+	if host == "" {
+		host = hostFromAddr(target.Addr)
+	}
 	attempts := j.attempts()
 	var last *probe.Result
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return Outcome{Job: j.Name, Result: last, Err: err}
+		}
+		// Graceful degradation: an empty or fully cooling pool is a wait for
+		// the health checker, not a reason to stop the daemon or drop the
+		// in-memory experience store.
+		if waiter, ok := d.exec.(proxyWaiter); ok {
+			if err := waiter.WaitForProxy(ctx); err != nil {
+				return Outcome{Job: j.Name, Result: last, Err: err}
+			}
+		}
+		// A target-wide block burst pauses only this host. The loop re-checks
+		// because another concurrent job may have tripped it while we waited.
+		if cooler, ok := d.exec.(targetCooler); ok {
+			for {
+				until, cooling := cooler.TargetCooling(host)
+				if !cooling {
+					break
+				}
+				wait := until.Sub(d.now())
+				if wait <= 0 {
+					break
+				}
+				d.log.Info("target cooling down", "job", j.Name, "host", host, "wait", wait)
+				if err := sleepCtx(ctx, wait); err != nil {
+					return Outcome{Job: j.Name, Result: last, Err: err}
+				}
+			}
 		}
 		// One epsilon decision for the whole attempt: all ranking stages either
 		// explore or exploit. It is taken before any probe bytes are written.
@@ -734,6 +777,9 @@ type Record struct {
 	Findings    []probe.Finding   `json:"findings,omitempty"`
 	Statuses    []int             `json:"statuses,omitempty"`
 	Learning    LearningMeta      `json:"learning,omitempty"`
+	// DeceptionUncertain is true when a mandatory semantic/NCD check could not
+	// run. Such a record is an engine fault, never a clean target response.
+	DeceptionUncertain bool `json:"deception_uncertain,omitempty"`
 	// Outcome separates proxy failures from real target responses. It is the
 	// only field the learning loop may use to decide whether to train.
 	Outcome string        `json:"outcome,omitempty"`
@@ -761,6 +807,9 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 	}
 	if err != nil {
 		rec.Error = err.Error()
+		if errors.Is(err, omnislash.ErrDeceptionUncertain) {
+			rec.DeceptionUncertain = true
+		}
 	}
 	if res != nil {
 		rec.DurationMS = float64(res.Duration.Microseconds()) / 1000
@@ -997,14 +1046,45 @@ func (d *Daemon) serveControl(ctx context.Context) {
 // RunnerSet is the production Executor: one probe.Runner per TLS mode, all
 // sharing a single omnislash Dialer and therefore one pool.
 type RunnerSet struct {
-	None *probe.Runner
-	H1   *probe.Runner
-	H2   *probe.Runner
+	None   *probe.Runner
+	H1     *probe.Runner
+	H2     *probe.Runner
+	dialer *omnislash.Dialer
 }
 
 // NewRunnerSet builds the three runners from one dialer.
 func NewRunnerSet(d *omnislash.Dialer) *RunnerSet {
-	return &RunnerSet{None: probe.NewRunner(d), H1: probe.NewRunner(d), H2: probe.NewRunner(d)}
+	return &RunnerSet{None: probe.NewRunner(d), H1: probe.NewRunner(d), H2: probe.NewRunner(d), dialer: d}
+}
+
+// WaitForProxy implements the daemon's graceful-degradation hook.
+func (s *RunnerSet) WaitForProxy(ctx context.Context) error {
+	if s == nil || s.dialer == nil {
+		return nil
+	}
+	return s.dialer.WaitForProxy(ctx)
+}
+
+// TargetCooling implements the daemon's per-target pause hook.
+func (s *RunnerSet) TargetCooling(host string) (time.Time, bool) {
+	if s == nil || s.dialer == nil {
+		return time.Time{}, false
+	}
+	return s.dialer.TargetCooling(host)
+}
+
+// SetLimits applies the transport config's probe section to every TLS mode.
+// The fixed race deadline is passed separately and is never derived from a
+// per-job timeout.
+func (s *RunnerSet) SetLimits(cfg omnislash.ProbeConfig) {
+	if s == nil {
+		return
+	}
+	for _, r := range []*probe.Runner{s.None, s.H1, s.H2} {
+		if r != nil {
+			r.SetLimits(cfg.MaxResponseBytes, cfg.ReadTimeout.Std(), cfg.RaceReadTimeout.Std())
+		}
+	}
 }
 
 // Run implements Executor.
