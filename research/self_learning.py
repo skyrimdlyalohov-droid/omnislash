@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -53,6 +54,14 @@ TIMING_DEFAULTS = {
     "connection_mode": "fresh",
 }
 SOLUTION_DERIVED_MARKERS = ("solution-derived", "playbook:")
+
+# JSONL tags that force a record to remain negative. WAF stub templates and
+# manual false positives use these so they can never be promoted into a
+# confirmed finding by feature aggregation or a later audit merge.
+FORCED_NEGATIVE_TAGS = frozenset({
+    "waf-stub", "waf_stub", "false-positive", "false_positive",
+    "negative-template", "negative_template", "not-finding", "not_finding",
+})
 
 _CL_RE = re.compile(r"content-length\s*:\s*(\d+)", re.I)
 _PATH_RE = re.compile(r"\b(?:GET|POST|PUT|HEAD|PATCH|DELETE)\s+(\S+)\s+HTTP/", re.I)
@@ -272,6 +281,51 @@ def examples_from_feedback(path: str, confirmed: bool) -> List[TrainingExample]:
     return out
 
 
+def _normalise_tag(value: Any) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
+def enforce_negative_tags(example: TrainingExample, tags: Sequence[Any] = ()) -> TrainingExample:
+    """Force a tagged example to remain a negative, non-finding sample.
+
+    WAF stubs, clean-noise templates and human false positives are tagged at
+    generation time. This function is the ingestion-side guarantee: even a
+    positive label in the JSONL cannot survive these tags.
+    """
+    normalized = {_normalise_tag(tag) for tag in tags}
+    normalized.update(
+        _normalise_tag(key[4:]) for key in example.features if key.startswith("tag:")
+    )
+    waf_vendor = any(key.startswith("waf_vendor:") for key in example.features)
+    waf_stub = "waf-stub" in normalized or waf_vendor
+    forced = bool(normalized & FORCED_NEGATIVE_TAGS) or waf_stub
+    if not forced:
+        return example
+
+    example.label = 0.0
+    example.features["confirmed_finding"] = "0"
+    example.features["not_finding"] = "1"
+    example.features["enforced_negative"] = "1"
+    reasons = [r for r in str(example.features.get("negative_reason", "")).split("+") if r]
+    if waf_stub and "waf_stub" not in reasons:
+        reasons.append("waf_stub")
+    if not reasons:
+        reasons.append("forced_negative")
+    example.features["negative_reason"] = "+".join(reasons)
+    return example
+
+
+def examples_from_training_jsonl(path: str) -> List[TrainingExample]:
+    """Read TrainingExample-compatible JSONL emitted by native pair helpers."""
+    out: List[TrainingExample] = []
+    for obj in _read_jsonish(path):
+        if not isinstance(obj.get("features"), dict):
+            continue
+        example = TrainingExample.from_dict(obj)
+        out.append(enforce_negative_tags(example, obj.get("tags") or ()))
+    return out
+
+
 def local_simulations(hosts: Optional[Sequence[str]] = None) -> List[TrainingExample]:
     """Deterministic native cascade simulator: no sockets, no containers.
 
@@ -409,9 +463,16 @@ def split_by_host(examples: Sequence[TrainingExample], holdout_fraction: float =
     holdout = ranked[:count]
     train = [e for e in examples if e.host in {"*", ""} or e.host not in holdout]
     validation = [e for e in examples if e.host in holdout]
-    overlap = {e.host for e in train} & {e.host for e in validation}
-    if overlap:  # pragma: no cover - defensive invariant
-        raise RuntimeError("holdout leaked hosts: %s" % sorted(overlap))
+    train_hosts = {e.host for e in train if e.host and e.host != "*"}
+    validation_hosts = {e.host for e in validation if e.host and e.host != "*"}
+    overlap = train_hosts & validation_hosts
+    leaked_holdout = set(holdout) & train_hosts
+    uncovered = set(hosts) - (train_hosts | validation_hosts)
+    if overlap or leaked_holdout or uncovered:  # pragma: no cover - defensive invariant
+        raise RuntimeError(
+            "holdout leaked hosts: %s; leaked validation stands: %s; unassigned hosts: %s"
+            % (sorted(overlap), sorted(leaked_holdout), sorted(uncovered))
+        )
     return train, validation, holdout
 
 
@@ -488,6 +549,7 @@ class ExperienceLearner:
             "schema": WEIGHTS_SCHEMA,
             "version": 1,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "examples": len(train),
             "algorithm": "ema",
             "alpha": self.alpha,
             "exact_weight": self.exact_weight,
@@ -509,6 +571,9 @@ class ExperienceLearner:
                 ) if validation else None,
             },
         }
+        leaked = set(host_cells) & set(holdout_hosts)
+        if leaked:  # pragma: no cover - defensive invariant
+            raise RuntimeError("holdout leaked hosts into weights: %s" % sorted(leaked))
         return weights
 
     def score(self, weights: Dict[str, Any], features: Sequence[str], host: str = "*", tech: str = "") -> float:
@@ -783,6 +848,7 @@ def build_calibration_examples(
     feedback_confirmed: Sequence[str] = (),
     feedback_false_positive: Sequence[str] = (),
     simulate: bool = False,
+    training_jsonl: Sequence[str] = (),
 ) -> List[TrainingExample]:
     examples: List[TrainingExample] = []
     for path in audit_paths:
@@ -801,17 +867,184 @@ def build_calibration_examples(
         examples.extend(examples_from_feedback(path, True))
     for path in feedback_false_positive:
         examples.extend(examples_from_feedback(path, False))
+    for path in training_jsonl:
+        examples.extend(examples_from_training_jsonl(path))
     if simulate:
         examples.extend(local_simulations())
     return examples
 
 
-def save_weights(weights: Dict[str, Any], path: str) -> None:
-    parent = os.path.dirname(path) or "."
+ONLINE_META_KEY = "online"
+_ONLINE_RANK_PREFIXES = ("path:", "cl:", "variant:", "mutation:", "probe:", "tls:", "shape:")
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def atomic_write_json(path: str, value: Any) -> None:
+    """Write JSON through a same-directory temp file + os.replace.
+
+    Readers (daemon, dashboard, tailer) never observe a half-written weight or
+    status file. The temp file is fsynced before the rename so a crash cannot
+    leave a truncated state file behind.
+    """
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
     os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(weights, f, indent=2, ensure_ascii=False, sort_keys=True)
-        f.write("\n")
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-omnislash-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_weights(weights: Dict[str, Any], path: str) -> None:
+    atomic_write_json(path, weights)
+
+
+def _online_meta(weights: Dict[str, Any]) -> Dict[str, Any]:
+    meta = weights.setdefault(ONLINE_META_KEY, {})
+    meta.setdefault("processed", 0)
+    meta.setdefault("positive", 0)
+    meta.setdefault("negative", 0)
+    meta.setdefault("holdout_skipped", 0)
+    meta.setdefault("accuracy", 0.5)
+    meta.setdefault("accuracy_delta", 0.0)
+    meta.setdefault("accuracy_history", [])
+    meta.setdefault("confirmations", {})
+    meta.setdefault("hypotheses", [])
+    return meta
+
+
+def _ranking_features(features: Dict[str, str]) -> List[str]:
+    return [key for key in sorted(features) if key.startswith(_ONLINE_RANK_PREFIXES)]
+
+
+def apply_online_example(
+    weights: Dict[str, Any],
+    example: TrainingExample,
+    *,
+    alpha: Optional[float] = None,
+    weight: float = 1.0,
+    allow_holdout: bool = False,
+) -> Dict[str, Any]:
+    """Fold one streamed/feedback example into existing weights in place.
+
+    The update mirrors ``ExperienceLearner._aggregate`` (EMA + observed rate)
+    without replaying the entire corpus. Holdout hosts are never used for
+    training cells; they are counted separately so a held-out lab cannot leak
+    into the online prior. ``weight=2.0`` means two identical observations,
+    which is how the UI's +/-2.0 quick labels are implemented.
+    """
+    host = example.host or "*"
+    tech = example.tech or ""
+    holdouts = set((weights.get("holdout") or {}).get("hosts") or [])
+    repeats = max(1, int(round(float(weight))))
+    meta = _online_meta(weights)
+    if host != "*" and host in holdouts and not allow_holdout:
+        meta["holdout_skipped"] = int(meta.get("holdout_skipped", 0)) + repeats
+        meta["updated_at"] = _now()
+        return {"applied": False, "reason": "holdout-isolation", "host": host}
+
+    a = float(alpha if alpha is not None else weights.get("alpha", 0.3))
+    a = min(1.0, max(0.0, a))
+    label = 1.0 if example.label >= 0.5 else 0.0
+    source = (example.source or "online").split(":")[0]
+    features = dict(example.features)
+    rank_features = _ranking_features(features)
+    learner = ExperienceLearner(
+        alpha=a,
+        exact_weight=float(weights.get("exact_weight", 0.8)),
+        min_exact_attempts=int(weights.get("min_exact_attempts", 2)),
+    )
+    score_before = learner.score(weights, rank_features, host, tech) if rank_features else 0.5
+
+    global_cells = weights.setdefault("global", {})
+    tech_cells = weights.setdefault("tech", {}).setdefault(tech, {}) if tech else {}
+    host_cells = weights.setdefault("hosts", {}).setdefault(host, {}) if host != "*" else {}
+    scopes = [global_cells]
+    if tech_cells:
+        scopes.append(tech_cells)
+    if host_cells:
+        scopes.append(host_cells)
+
+    for feature in features:
+        for scope in scopes:
+            cell = dict(scope.get(feature) or {})
+            for key, value in _blank_cell().items():
+                cell.setdefault(key, value)
+            sources = list(cell.get("sources") or [])
+            if source not in sources:
+                sources.append(source)
+            cell["sources"] = sources
+            for _ in range(repeats):
+                cell["attempts"] = int(cell.get("attempts", 0)) + 1
+                cell["successes"] = float(cell.get("successes", 0.0)) + label
+                cell["ema"] = round(a * label + (1.0 - a) * float(cell.get("ema", 0.0)), 6)
+            scope[feature] = cell
+
+    negative = weights.setdefault("negative", {})
+    if not isinstance(negative, dict):
+        negative = {"cl": [], "features": [], "timing": []}
+        weights["negative"] = negative
+    if label <= 0.0:
+        cl_values = set(int(v) for v in (negative.get("cl") or []))
+        for key in features:
+            match = re.fullmatch(r"cl:(\d+)", key)
+            if match:
+                cl_values.add(int(match.group(1)))
+        negative["cl"] = sorted(cl_values)
+        recent = list(negative.get("features") or [])
+        recent.insert(0, dict(features))
+        negative["features"] = recent[:200]
+        reasons = [r for r in str(features.get("negative_reason", "")).split("+") if r]
+        timing = set(negative.get("timing") or [])
+        for key in features:
+            if key.startswith(("timing.", "timing_hold_", "connection_mode:")) or key == "duplicate_cl:1":
+                timing.add(key)
+        if reasons:
+            timing.add("negative_reason:" + "+".join(reasons))
+        negative["timing"] = sorted(timing)
+
+    score_after = learner.score(weights, rank_features, host, tech) if rank_features else 0.5
+    weights["examples"] = int(weights.get("examples", 0)) + repeats
+    weights["updated_at"] = _now()
+    previous_accuracy = float(meta.get("accuracy", 0.5))
+    accuracy = round(a * label + (1.0 - a) * previous_accuracy, 6)
+    meta["accuracy"] = accuracy
+    meta["accuracy_delta"] = round(accuracy - previous_accuracy, 6)
+    history = list(meta.get("accuracy_history") or [])
+    history.append({"time": _now(), "accuracy": accuracy, "label": label})
+    meta["accuracy_history"] = history[-120:]
+    meta["processed"] = int(meta.get("processed", 0)) + repeats
+    if label > 0.0:
+        meta["positive"] = int(meta.get("positive", 0)) + repeats
+    else:
+        meta["negative"] = int(meta.get("negative", 0)) + repeats
+    meta["last_label"] = label
+    meta["last_source"] = source
+    meta["last_host"] = host
+    meta["updated_at"] = _now()
+    return {
+        "applied": True,
+        "host": host,
+        "tech": tech,
+        "label": label,
+        "repeats": repeats,
+        "score_before": score_before,
+        "score_after": score_after,
+        "score_delta": round(score_after - score_before, 4),
+    }
 
 
 def load_weights(path: str) -> Dict[str, Any]:
@@ -839,6 +1072,10 @@ def main() -> None:  # pragma: no cover - CLI glue
     train.add_argument("--exploit-log", action="append", default=[])
     train.add_argument("--feedback-confirmed", action="append", default=[])
     train.add_argument("--feedback-false-positive", action="append", default=[])
+    train.add_argument(
+        "--training-jsonl", action="append", default=[],
+        help="TrainingExample-compatible JSONL (native pair/WAF negative corpora)",
+    )
     train.add_argument("--simulate", action="store_true", help="include native local cascade simulations")
     train.add_argument("--out", default=None)
     train.add_argument("--holdout", type=float, default=0.2)
@@ -851,6 +1088,19 @@ def main() -> None:  # pragma: no cover - CLI glue
     infer.add_argument("--out", default="")
     infer.add_argument("--max", type=int, default=3)
 
+    feedback = sub.add_parser("feedback", help="apply one manual +/- label to learned weights")
+    label_group = feedback.add_mutually_exclusive_group(required=True)
+    label_group.add_argument("--confirm", action="store_true", help="positive label (+2.0 by default)")
+    label_group.add_argument("--false-positive", action="store_true", help="negative label (-2.0 by default)")
+    feedback.add_argument("--host", default="*")
+    feedback.add_argument("--tech", default="")
+    feedback.add_argument("--cl", type=int, default=0)
+    feedback.add_argument("--path", default="")
+    feedback.add_argument("--finding", default="")
+    feedback.add_argument("--features", default="{}", help="JSON object of extra feature keys")
+    feedback.add_argument("--weight", type=float, default=2.0)
+    feedback.add_argument("--out", default=None)
+
     args = ap.parse_args()
     weights_path = args.out if args.cmd == "train" and args.out else args.weights
 
@@ -858,21 +1108,63 @@ def main() -> None:  # pragma: no cover - CLI glue
         audit_paths = list(args.audit)
         for pattern in args.audit_glob:
             audit_paths.extend(sorted(glob.glob(pattern, recursive=True)))
+        audit_paths = list(dict.fromkeys(audit_paths))
         examples = build_calibration_examples(
             audit_paths,
             args.exploit_log,
             args.feedback_confirmed,
             args.feedback_false_positive,
             simulate=args.simulate,
+            training_jsonl=args.training_jsonl,
         )
         learner = ExperienceLearner(alpha=args.alpha, exact_weight=args.exact_weight)
         weights = learner.fit(examples, holdout_fraction=args.holdout)
         save_weights(weights, weights_path)
         print(json.dumps({
             "examples": len(examples),
+            "train_examples": weights.get("examples"),
             "cells": len(weights.get("global") or {}),
             "holdout": weights.get("holdout") or {},
             "weights": weights_path,
+        }, indent=2, ensure_ascii=False))
+        return
+
+    if args.cmd == "feedback":
+        try:
+            extra = json.loads(args.features or "{}")
+        except ValueError as exc:
+            raise SystemExit("feedback: --features must be a JSON object: %s" % exc)
+        if not isinstance(extra, dict):
+            raise SystemExit("feedback: --features must be a JSON object")
+        features = {str(k): str(v) for k, v in extra.items()}
+        if args.cl:
+            features[feature_key("cl", args.cl)] = "1"
+        if args.path:
+            features[feature_key("path", args.path)] = "1"
+        if args.finding:
+            features[feature_key("finding", args.finding)] = "1"
+        if not features:
+            raise SystemExit("feedback: at least one of --cl, --path, --finding or --features is required")
+        confirmed = bool(args.confirm)
+        example = TrainingExample(
+            host=args.host or "*",
+            tech=args.tech or "",
+            features=features,
+            label=1.0 if confirmed else 0.0,
+            source="manual-confirm" if confirmed else "manual-false-positive",
+            confidence=abs(float(args.weight)),
+        )
+        if not confirmed:
+            enforce_negative_tags(example, ["false-positive"])
+        target = args.out or args.weights
+        weights = load_weights(target)
+        result = apply_online_example(weights, example, weight=args.weight)
+        if result.get("applied"):
+            save_weights(weights, target)
+        print(json.dumps({
+            "weights": target,
+            "action": "confirm" if confirmed else "false-positive",
+            **result,
         }, indent=2, ensure_ascii=False))
         return
 

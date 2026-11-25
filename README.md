@@ -59,7 +59,7 @@
   (curl, свой сканер, сторонний бинарь) ходит с ротацией IP. Обычные HTTP-запросы
   пересылаются по одному и отдают статус в safety-breaker; HTTPS/raw TCP идут
   через байт-прозрачный CONNECT.
-- **Stats endpoint**: JSON-снимок состояния пула, здоровья и scrape-цикла.
+- **Stats endpoint и встроенный Web UI**: JSON-снимок состояния пула, здоровья и scrape-цикла плюс автономный дашборд на том же локальном порту (см. [Встроенный Web UI](#встроенный-web-ui)).
 - **Ограничение скорости** (token bucket) на прокси и на весь пул, чтобы
   ротация не умножала эффективную частоту запросов.
 - **Safety-контур**: глобальный лимит на весь пул (не на прокси), fail-closed
@@ -108,6 +108,7 @@ make down        # остановить
 `make up` собирает образ `omnislash:1.0.0` и поднимает готовый пайплайн:
 
 - `127.0.0.1:3128` — HTTP-шлюз с ротацией (только loopback);
+- `127.0.0.1:9090/` — встроенный Web UI (старые JSON-пути сохраняются);
 - `127.0.0.1:9090/stats` — состояние пула, health и scrape;
 - `127.0.0.1:9090/readyz` — healthcheck контейнера;
 - внутри контейнера уже включён `scraper` из `config.example.json`, поэтому
@@ -164,6 +165,7 @@ go run ./cmd/gateway -config config.json -proxies proxies.txt -listen 127.0.0.1:
 `serve` поднимает:
 
 - `127.0.0.1:3128` — локальный CONNECT-прокси с ротацией;
+- `127.0.0.1:9090/` — встроенный дашборд; `/stats`, `/healthz`, `/readyz` — как раньше;
 - `127.0.0.1:9090/stats` — состояние пула, health и scrape;
 - фоновый health-check (если включён);
 - фоновый scrape/validation по `scraper.refresh_interval`.
@@ -206,6 +208,50 @@ omnislash healthcheck      проверить /readyz (для Docker healthcheck
 `fetch` — `-url`, `-n`, `-concurrency`, `-insecure`, `-show-body`;
 `serve` — `-listen`, `-stats`, `-token`, `-no-health`
 (`-listen off` / `-stats off` отключают компонент).
+
+## Встроенный Web UI
+
+`web/index.html` — автономная одностраничная страница на vanilla HTML/CSS/JS,
+без отдельного фронтенд-сборщика. Ассет встраивается в бинари через `//go:embed`
+(`web/web.go`), маршруты регистрируются в `ui.go` (`RegisterUI`). Дашборд
+открывается по `GET /` на том же локальном порту, что и статистика:
+`stats.listen` по умолчанию `127.0.0.1:9090`; демон регистрирует его на
+`control_addr`, если адрес задан. Legacy JSON-контуры `/stats`, `/readyz`,
+`/healthz`, `/status`, `/experience` сохраняются без изменений.
+
+| Виджет | Что показывает | Действие |
+|---|---|---|
+| Proxy pool | Sniper, Infantry, cooldown, средний IQR | `POST /api/scrape` — нативный scrape и hot-swap пула |
+| Analytic core & vault | holdout accuracy, число train examples, стек/vault keys | `POST /api/calibrate` — запуск нативной калибровки |
+| Online Feedback Loop | `ACTIVE`/`PAUSED`, счётчик episodes, online accuracy и Δ | `POST /api/learning/toggle`, `POST /api/learning/feedback` — пауза и метки ±2.0 без рестарта |
+| Finding journal | подтверждённые находки из JSONL-аудита с `confidence_score` и NCD | `POST /api/caido/push` — отправить выбранные записи в Caido Replay |
+| Quick Run | цель, проба, путь и результат | `POST /api/run` — один scoped-запуск |
+
+Журнал показывает только подтверждённые находки (`*_confirmed` и им подобные)
+и отбрасывает `unverified`; `confidence_score` выводится из уровня confidence,
+NCD — из аудита (или считается по двум ответам записи). Кнопка калибровки
+запускает `lab/calibrate-brain.sh`, а не «голый» `self_learning.py`, поэтому
+кнопка получает тот же расширенный корпус, что и `make calibrate`.
+
+Безопасность action API:
+
+- `/api/caido/push` вызывает `osint/caido_bridge.py`. URL по умолчанию
+  `http://127.0.0.1:8080/graphql`; разрешены только `localhost`, `127.0.0.1`,
+  `::1` (расширение — через `OMNISLASH_CAIDO_HOSTS`), без учётных данных в URL.
+  PAT передаётся дочернему процессу через окружение (`CAIDO_PAT`) и не
+  сохраняется дашбордом.
+- `/api/run` fail-closed: scope должен быть включён, `scope.allow_hosts` — не
+  пустым, хост цели — в allowlist (включая `*.domain`), а сама цель должна
+  пройти `Scope.CheckTarget` с локальным резолвом/пиннингом. Поддерживаются
+  `adaptive`, `h2-cl`, `smuggle-chain`, `raw-replay`; путь не содержит CRLF.
+  Отказ — `403` без запуска задачи; успешный запуск использует pinned-сессию.
+- Если в конкретном процессе нет скрапера/callback'а для действия, API
+  отвечает `501`, а не имитирует успех.
+
+Цель `make release` собирает `bin/omnislash` и `bin/omnislashd` со встроенным
+UI, поднимает `omnislash serve` на эфемерном loopback-порту, проверяет `GET /`,
+`/stats` и `/api/dashboard`, останавливает процесс и дополнительно делает
+`-h`-проверку `omnislashd`.
 
 ## Формат списка прокси
 
@@ -577,6 +623,51 @@ go run ./cmd/omnislashd -config examples/daemon/daemon.json -job lab-clte-gpost
 
 Просмотреть накопленные ячейки можно через `GET /experience` на `control_addr`
 или по полю `learning` в строках `log_file`.
+
+#### Непрерывный онлайн-цикл без рестарта
+
+`online_learning` включён по умолчанию и для `omnislashd`, и для `omnislash
+serve`. Долгоживущий процесс запускает `python3 research/online_loop.py`, который
+читает тот же JSONL-аудит с сохранённого байтового офсета
+(`state/online_loop_offset.json`), классифицирует каждую завершённую попытку
+через `classify_response_shape` + `TransitionTracker` и атомарно (temp file +
+`os.replace`) обновляет `state/learned_weights.json`. Перезапуск не переигрывает
+старые attempts; активные pinned-сессии не прерываются: daemon подхватывает новые
+веса и `state/jobs_online.json` по `mtime` (опрос каждые 500 мс), а каждый attempt
+работает с копией `JobConfig`. Для `omnislashd` поведение можно переопределить
+флагом `-online-learning=true|false`; однозапусковые режимы (`-once`, `-job`)
+воркер не стартуют.
+
+Важно: онлайн-приоры только переставляют уже объявленные `variant`, `mutation`
+и `cl` и никогда не изобретают probe или verdict. Хосты из `holdout.hosts`
+учитываются как `online.holdout_skipped`, но не попадают в training-ячейки.
+Непроверенные сигналы слабо двигают веса и попадают только в массив `candidates`
+`state/jobs_online.json`; в `jobs` (исполняемые strike) попадает запись только при
+`strike && verified && cross_proxy.verified`, двух независимых подтверждённых
+egress-идентификаторах и непустом `success_finding`. Один JSONL-attempt даёт не
+более одного идентификатора (приоритет `exit_ip`), поэтому непроверенный шум не
+может сам себя «подтвердить».
+
+Дашборд показывает карточку **Online Feedback Loop**: состояние, число
+обработанных episodes, online accuracy/Δ и историю. `GET /api/learning/status`
+возвращает тот же снимок, `POST /api/learning/toggle`
+меняет `state/online_loop_control.json` без сигналов и рестарта. Кнопки
+`Confirm +2.0` / `False Positive −2.0` вызывают `POST /api/learning/feedback` и
+`self_learning.py feedback`: метка `+2.0`/`−2.0` — это два повторения с label
+`1.0`/`0.0`, после чего веса сразу перезаписываются и следующий task
+переранжируется. Для выбранной находки journal в payload уходят host, tech,
+CL, path и finding.
+
+Цикл калибровки расширен и остаётся нативным (без Docker): `make calibrate` /
+`lab/calibrate-brain.sh` собирают примеры из **всех** аудитов `runs/*`, добавляют
+детерминированные локальные пары прокси+бэкенд на `127.0.0.1` (Go `net/http` +
+Python `http.server`: CL/TE, пробелы в заголовках, редиректы, 400/502),
+эталонные негативы WAF-stub (Cloudflare, Akamai, AWS WAF, QRATOR, Nginx) и
+чистый шум, а также симуляции каскадов H2→H1 / CL.TE. Разделение train/validation — строго по хосту или lab ID: один
+хост не может оказаться в обеих выборках. `state/learned_weights.json` теперь
+содержит верхнеуровневое поле `examples` с числом примеров (его показывает
+дашборд), а точность валидации — в `holdout.metrics.accuracy`. Curated
+`solution-derived` сиды в обучение не попадают.
 
 Один запуск задачи создаёт одну pinned-сессию: все соединения пробы (включая
 `smuggle-chain`, которой нужны два сокета) выходят через один прокси и один

@@ -19,6 +19,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
@@ -43,6 +45,7 @@ func run() error {
 		jobName       = flag.String("job", "", "run only this job once and exit")
 		logLevel      = flag.String("log-level", "info", "debug|info|warn|error")
 		versionOut    = flag.Bool("version", false, "print version")
+		onlineFlag    = flag.String("online-learning", "", "override config online_learning (true|false)")
 		playbookPaths []string
 	)
 	flag.Func("playbook", "curated playbook case JSON; seeds experience with a provenance-tagged prior (repeatable)", func(path string) error {
@@ -62,6 +65,13 @@ func run() error {
 	cfg, err := daemon.LoadConfig(*configPath)
 	if err != nil {
 		return err
+	}
+	if value := strings.TrimSpace(*onlineFlag); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("omnislashd: invalid -online-learning value %q: %w", value, err)
+		}
+		cfg.OnlineLearning = &enabled
 	}
 	transport, err := omnislash.LoadConfig(cfg.OmnislashConfig)
 	if err != nil {
@@ -93,6 +103,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	ui := omnislash.UIOptions{
+		Config:     transport,
+		Pool:       pool,
+		Scope:      pool.Scope(),
+		ConfigPath: cfg.OmnislashConfig,
+	}
+	if cfg.LogFile != "" {
+		ui.AuditPaths = []string{cfg.LogFile}
+	}
+	d.SetUI(ui)
 	for _, path := range playbookPaths {
 		caseFile, err := playbook.Load(path)
 		if err != nil {

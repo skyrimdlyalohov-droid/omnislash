@@ -106,6 +106,9 @@ func NewPool(cfg *Config, proxies []*Proxy, logger *slog.Logger) (*Pool, error) 
 // Config returns a copy of the pool configuration.
 func (p *Pool) Config() Config { return p.cfg }
 
+// Scope returns the compiled fail-closed target allowlist used by every dial.
+func (p *Pool) Scope() *Scope { return p.scope }
+
 // Proxies returns a shallow copy of the proxy slice.
 func (p *Pool) Proxies() []*Proxy {
 	proxies := p.snapshot()

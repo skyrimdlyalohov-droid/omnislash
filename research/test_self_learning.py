@@ -115,6 +115,13 @@ class TestExperienceLearning(unittest.TestCase):
         self.assertEqual(metrics["hosts"], holdout_hosts)
         self.assertGreaterEqual(metrics["accuracy"], 0.0)
 
+    def test_fit_reports_train_example_count_excluding_holdout(self):
+        examples = local_simulations()
+        train, validation, _holdout = split_by_host(examples, 0.2)
+        weights = ExperienceLearner().fit(examples, 0.2)
+        self.assertEqual(len(train), weights["examples"])
+        self.assertEqual(len(validation), weights["holdout"]["validation_examples"])
+
     def test_audit_ingestion_uses_confirmed_transition_and_negative_cl(self):
         record = {
             "job": "h2-cl-resources-cl5",

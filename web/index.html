@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OmniSlash Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1118;
+      --panel: #111b26;
+      --panel-2: #162435;
+      --line: #24354a;
+      --text: #e6edf6;
+      --muted: #8fa3b8;
+      --accent: #49d0b5;
+      --accent-2: #6aa9ff;
+      --warn: #ffb454;
+      --bad: #ff6b6b;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 600px at 20% -10%, #17314a 0%, var(--bg) 55%);
+      min-height: 100vh;
+    }
+    header {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px; padding: 20px 24px; border-bottom: 1px solid var(--line);
+      background: rgba(11,17,24,.82); backdrop-filter: blur(8px);
+      position: sticky; top: 0; z-index: 10;
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: .02em; }
+    h1 span { color: var(--accent); }
+    .sub { color: var(--muted); font-size: 12px; }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
+      border: 1px solid var(--line); border-radius: 99px; background: var(--panel);
+      color: var(--muted); font-size: 12px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+    .dot.ok { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+    .dot.err { background: var(--bad); }
+    main { padding: 24px; max-width: 1440px; margin: 0 auto; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card {
+      grid-column: span 6; background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--line); border-radius: var(--radius); padding: 18px;
+      box-shadow: 0 12px 30px rgba(0,0,0,.22);
+    }
+    .card.wide { grid-column: span 12; }
+    .card h2 { margin: 0 0 4px; font-size: 15px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-2); }
+    .card .hint { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+    .metric { background: rgba(8,14,21,.55); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+    .metric .value { font-size: 24px; font-weight: 700; }
+    .metric .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    input, select, textarea {
+      background: #0a121c; color: var(--text); border: 1px solid var(--line);
+      border-radius: 8px; padding: 9px 11px; font: inherit; min-width: 180px;
+    }
+    input:focus, select:focus { outline: 2px solid rgba(74,208,181,.35); border-color: var(--accent); }
+    button {
+      background: var(--accent); color: #05241f; border: 0; border-radius: 8px;
+      padding: 10px 14px; font: inherit; font-weight: 700; cursor: pointer;
+    }
+    button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-size: 10px; }
+    .tag { display: inline-block; padding: 2px 7px; border-radius: 99px; background: rgba(106,169,255,.12); color: var(--accent-2); font-size: 10px; }
+    .tag.good { background: rgba(73,208,181,.12); color: var(--accent); }
+    .tag.bad { background: rgba(255,107,107,.12); color: var(--bad); }
+    pre {
+      margin: 12px 0 0; max-height: 240px; overflow: auto; background: #071019;
+      border: 1px solid var(--line); border-radius: 8px; padding: 12px; color: #b9d4ee;
+      font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+    }
+    .toast {
+      position: fixed; right: 20px; bottom: 20px; z-index: 30; max-width: 420px;
+      background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+      border-radius: 8px; padding: 12px 14px; box-shadow: 0 12px 30px rgba(0,0,0,.4);
+      opacity: 0; transform: translateY(8px); pointer-events: none; transition: .18s ease;
+    }
+    .toast.show { opacity: 1; transform: none; }
+    .toast.err { border-left-color: var(--bad); }
+    .spark {
+      display: flex; align-items: flex-end; gap: 3px; height: 42px; margin-top: 12px;
+      padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: #071019;
+    }
+    .spark i { flex: 1; min-width: 3px; background: var(--accent); border-radius: 2px 2px 0 0; opacity: .85; }
+    .spark i.down { background: var(--bad); }
+    .spark.empty::after { content: "no online episodes yet"; color: var(--muted); font-size: 11px; margin: auto; }
+    @media (max-width: 900px) { .card { grid-column: span 12; } }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Omni<span>Slash</span> Control</h1>
+    <div class="sub">Embedded single-page dashboard · local control port only</div>
+  </div>
+  <div class="status-pill"><span id="statusDot" class="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+
+<main>
+  <div class="grid">
+    <section class="card">
+      <h2>Proxy pool &amp; leagues</h2>
+      <div class="hint">Sniper reserve, infantry tier and upstream parser quality.</div>
+      <div class="metrics" id="poolMetrics">
+        <div class="metric"><div class="value">–</div><div class="label">Sniper</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Infantry</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Cooldown</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Avg IQR</div></div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="scrapeBtn">Refresh pool</button>
+        <span class="sub" id="scrapeInfo">Native scrape, no containers.</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Analytic core &amp; vault</h2>
+      <div class="hint">Autonomous-inferred weights and curated key coverage.</div>
+      <div class="metrics" id="brainMetrics">
+        <div class="metric"><div class="value">–</div><div class="label">Holdout accuracy</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Train examples</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Vault stacks</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Vault keys</div></div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="calibrateBtn" class="secondary">Run calibration</button>
+        <span class="sub" id="calibrateInfo">Reads JSONL audits + local simulations.</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Online Feedback Loop</h2>
+      <div class="hint">Streamed audit labels update weights and next-task ranking in-process.</div>
+      <div class="metrics" id="onlineMetrics">
+        <div class="metric"><div class="value">–</div><div class="label">Status</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Episodes</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Online accuracy</div></div>
+        <div class="metric"><div class="value">–</div><div class="label">Δ accuracy</div></div>
+      </div>
+      <div class="spark empty" id="onlineSpark"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="onlineToggleBtn" class="secondary">Pause loop</button>
+        <button id="confirmBtn">Confirm +2.0</button>
+        <button id="falsePositiveBtn" class="secondary">False Positive −2.0</button>
+      </div>
+      <div class="sub" id="onlineInfo" style="margin-top:8px">Labels apply to the selected finding in the journal.</div>
+    </section>
+
+    <section class="card wide">
+      <h2>Finding journal</h2>
+      <div class="hint">Confirmed audit anomalies. Select rows to push to Caido Replay.</div>
+      <table>
+        <thead><tr><th></th><th>Host</th><th>Job</th><th>Finding</th><th>Confidence</th><th>NCD</th><th>Time</th></tr></thead>
+        <tbody id="findingsBody"><tr><td colspan="7" class="sub">Loading…</td></tr></tbody>
+      </table>
+      <div class="row" style="margin-top:14px">
+        <label>Caido URL <input id="caidoUrl" value="http://127.0.0.1:8080/graphql"></label>
+        <label>PAT <input id="caidoPat" type="password" placeholder="optional for local mock"></label>
+        <button id="caidoBtn" class="secondary">Push selected to Caido</button>
+        <span class="sub" id="caidoInfo"></span>
+      </div>
+    </section>
+
+    <section class="card wide">
+      <h2>Quick Run</h2>
+      <div class="hint">Scope is enforced server-side, fail-closed. Only allow-listed hosts may be probed.</div>
+      <div class="row">
+        <label>Target host:port <input id="runHost" placeholder="lab.example.com:80" autocomplete="off"></label>
+        <label>Probe
+          <select id="runProbe">
+            <option value="adaptive">adaptive (recommended)</option>
+            <option value="h2-cl">h2-cl</option>
+            <option value="smuggle-chain">smuggle-chain</option>
+            <option value="raw-replay">raw-replay</option>
+          </select>
+        </label>
+        <label>Path <input id="runPath" value="/"></label>
+        <button id="runBtn">Launch scoped job</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="tag" id="scopeTag">scope: loading</span>
+        <span class="sub" id="runInfo">No job queued yet.</span>
+      </div>
+      <pre id="output">Ready.</pre>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+  var state = { dashboard: null, selected: new Set() };
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function (c) {
+      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
+    });
+  }
+  function toast(message, isError) {
+    var el = document.getElementById("toast");
+    el.textContent = message;
+    el.className = "toast show" + (isError ? " err" : "");
+    setTimeout(function () { el.className = "toast"; }, 4200);
+  }
+  function api(path, options) {
+    options = options || {};
+    options.headers = Object.assign({"Content-Type": "application/json"}, options.headers || {});
+    return fetch(path, options).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+        return body;
+      });
+    });
+  }
+  function post(path, payload) {
+    return api(path, {method: "POST", body: JSON.stringify(payload || {})});
+  }
+  function metric(container, values) {
+    document.getElementById(container).innerHTML = values.map(function (v) {
+      return '<div class="metric"><div class="value">' + esc(v.value) + '</div><div class="label">' + esc(v.label) + '</div></div>';
+    }).join("");
+  }
+  function render(d) {
+    state.dashboard = d;
+    var pool = d.pool || {}, brain = d.brain || {}, vault = d.vault || {};
+    metric("poolMetrics", [
+      {label: "Sniper", value: pool.sniper || 0},
+      {label: "Infantry", value: pool.infantry || 0},
+      {label: "Cooldown", value: pool.cooldown || 0},
+      {label: "Avg IQR", value: pool.avg_iqr || "–"}
+    ]);
+    metric("brainMetrics", [
+      {label: "Holdout accuracy", value: brain.holdout_accuracy == null ? "–" : (Number(brain.holdout_accuracy) * 100).toFixed(1) + "%"},
+      {label: "Train examples", value: brain.examples == null ? "–" : brain.examples},
+      {label: "Vault stacks", value: (vault.tech_stacks || []).length},
+      {label: "Vault keys", value: vault.keys || 0}
+    ]);
+    var scope = d.scope || {};
+    var tag = document.getElementById("scopeTag");
+    tag.textContent = "scope: " + (scope.allow_hosts || []).length + " allow-listed host(s)";
+    tag.className = "tag " + ((scope.allow_hosts || []).length ? "good" : "bad");
+    renderFindings(d.findings || []);
+    renderOnline(d.online || {});
+    document.getElementById("output").textContent = JSON.stringify(d, null, 2);
+  }
+  function renderOnline(o) {
+    var active = o.state === "ACTIVE" && o.active !== false;
+    metric("onlineMetrics", [
+      {label: "Status", value: o.state || (o.available ? "PAUSED" : "UNAVAILABLE")},
+      {label: "Episodes", value: o.processed == null ? "–" : o.processed},
+      {label: "Online accuracy", value: o.accuracy == null ? "–" : (Number(o.accuracy) * 100).toFixed(1) + "%"},
+      {label: "Δ accuracy", value: o.accuracy_delta == null ? "–" :
+        ((Number(o.accuracy_delta) >= 0 ? "+" : "") + (Number(o.accuracy_delta) * 100).toFixed(1) + " pp")}
+    ]);
+    var spark = document.getElementById("onlineSpark");
+    var history = o.accuracy_history || [];
+    if (!history.length) {
+      spark.className = "spark empty";
+      spark.innerHTML = "";
+    } else {
+      spark.className = "spark";
+      spark.innerHTML = history.map(function (point) {
+        var value = Math.max(0, Math.min(1, Number(point.accuracy) || 0));
+        var cls = Number(point.label) > 0 ? "" : " class=\"down\"";
+        return "<i" + cls + " style=\"height:" + Math.max(6, value * 100).toFixed(0) + "%\"></i>";
+      }).join("");
+    }
+    document.getElementById("onlineToggleBtn").textContent = active ? "Pause loop" : "Resume loop";
+    var info = "strike jobs: " + ((o.jobs || {}).strike || 0) +
+      " · candidates: " + ((o.jobs || {}).candidates || 0) +
+      " · holdout-skipped: " + (o.holdout_skipped || 0);
+    if (o.last_error) info += " · last error: " + o.last_error;
+    document.getElementById("onlineInfo").textContent = info;
+  }
+  function selectedFeedbackPayload(kind) {
+    var findings = (state.dashboard && state.dashboard.findings) || [];
+    var indices = Array.from(state.selected);
+    if (!indices.length) { toast("Select a finding in the journal first", true); return null; }
+    var finding = findings[indices[0]] || {};
+    var record = finding.record || {};
+    var learning = record.learning || {};
+    var result = record.result || {};
+    var raw = (result.exchanges || []).map(function (e) { return e.raw || ""; }).join("\n");
+    var match = raw.match(/content-length:\s*(\d+)/i);
+    return {
+      kind: kind,
+      host: learning.host || finding.host || "*",
+      tech: learning.tech_stack || "",
+      cl: match ? parseInt(match[1], 10) : 0,
+      path: learning.mutation || finding.path || "",
+      finding: finding.kind || ""
+    };
+  }
+  function renderFindings(findings) {
+    var body = document.getElementById("findingsBody");
+    if (!findings.length) {
+      body.innerHTML = '<tr><td colspan="7" class="sub">No confirmed findings in recent audits.</td></tr>';
+      return;
+    }
+    body.innerHTML = findings.map(function (f, i) {
+      var checked = state.selected.has(i) ? "checked" : "";
+      var cls = f.confidence_score >= 70 ? "good" : (f.confidence_score < 40 ? "bad" : "");
+      return "<tr>" +
+        '<td><input type="checkbox" data-index="' + i + '" ' + checked + '></td>' +
+        "<td>" + esc(f.host || "–") + "</td>" +
+        "<td>" + esc(f.job || "–") + "</td>" +
+        "<td><span class='tag " + cls + "'>" + esc(f.kind || "finding") + "</span></td>" +
+        "<td>" + esc(f.confidence_score == null ? "–" : f.confidence_score) + "</td>" +
+        "<td>" + esc(f.ncd == null ? "–" : f.ncd) + "</td>" +
+        "<td>" + esc(f.time || "–") + "</td></tr>";
+    }).join("");
+    body.querySelectorAll("input[type=checkbox]").forEach(function (box) {
+      box.addEventListener("change", function () {
+        var idx = parseInt(box.dataset.index, 10);
+        if (box.checked) state.selected.add(idx); else state.selected.delete(idx);
+      });
+    });
+  }
+  function load() {
+    var dot = document.getElementById("statusDot"), text = document.getElementById("statusText");
+    api("/api/dashboard").then(function (d) {
+      render(d);
+      dot.className = "dot ok";
+      text.textContent = "control online";
+    }).catch(function (err) {
+      dot.className = "dot err";
+      text.textContent = "control error";
+      toast(err.message, true);
+    });
+  }
+  function busy(button, label, promise) {
+    button.disabled = true;
+    var old = button.textContent;
+    button.textContent = label;
+    return promise.finally(function () { button.disabled = false; button.textContent = old; });
+  }
+
+  document.getElementById("scrapeBtn").addEventListener("click", function () {
+    var btn = this;
+    busy(btn, "Refreshing…", post("/api/scrape").then(function (r) {
+      document.getElementById("scrapeInfo").textContent = r.message || "Pool refreshed";
+      toast("Proxy pool refreshed");
+      load();
+    })).catch(function (e) { toast(e.message, true); });
+  });
+  document.getElementById("calibrateBtn").addEventListener("click", function () {
+    var btn = this;
+    busy(btn, "Calibrating…", post("/api/calibrate").then(function (r) {
+      document.getElementById("calibrateInfo").textContent = r.message || "Calibration complete";
+      toast("Brain calibrated");
+      load();
+    })).catch(function (e) { toast(e.message, true); });
+  });
+  document.getElementById("caidoBtn").addEventListener("click", function () {
+    var indices = Array.from(state.selected);
+    if (!indices.length) { toast("Select at least one finding", true); return; }
+    var findings = (state.dashboard.findings || []).filter(function (_, i) { return state.selected.has(i); });
+    var btn = this;
+    busy(btn, "Pushing…", post("/api/caido/push", {
+      findings: findings,
+      url: document.getElementById("caidoUrl").value.trim(),
+      pat: document.getElementById("caidoPat").value.trim()
+    }).then(function (r) {
+      document.getElementById("caidoInfo").textContent = (r.pushed || 0) + " pushed";
+      toast("Caido Replay updated");
+    })).catch(function (e) { toast(e.message, true); });
+  });
+  document.getElementById("onlineToggleBtn").addEventListener("click", function () {
+    var btn = this;
+    var online = (state.dashboard && state.dashboard.online) || {};
+    var next = !(online.state === "ACTIVE" && online.active !== false);
+    busy(btn, next ? "Resuming…" : "Pausing…", post("/api/learning/toggle", {enabled: next}).then(function (r) {
+      document.getElementById("onlineInfo").textContent = r.message || (next ? "Loop resumed" : "Loop paused");
+      toast(r.message || "Online learning updated");
+      load();
+    })).catch(function (e) { toast(e.message, true); });
+  });
+  ["confirmBtn", "falsePositiveBtn"].forEach(function (id) {
+    document.getElementById(id).addEventListener("click", function () {
+      var kind = id === "confirmBtn" ? "confirm" : "false-positive";
+      var payload = selectedFeedbackPayload(kind);
+      if (!payload) return;
+      var btn = this;
+      busy(btn, "Applying…", post("/api/learning/feedback", payload).then(function (r) {
+        document.getElementById("onlineInfo").textContent = "Applied " + kind +
+          " · score Δ " + (r.score_delta == null ? "–" : r.score_delta);
+        toast("Weights updated, next tasks reranked");
+        load();
+      })).catch(function (e) { toast(e.message, true); });
+    });
+  });
+  document.getElementById("runBtn").addEventListener("click", function () {
+    var btn = this;
+    var payload = {
+      target: document.getElementById("runHost").value.trim(),
+      probe: document.getElementById("runProbe").value,
+      path: document.getElementById("runPath").value.trim() || "/"
+    };
+    if (!payload.target) { toast("Target host is required", true); return; }
+    busy(btn, "Launching…", post("/api/run", payload).then(function (r) {
+      document.getElementById("runInfo").textContent = r.message || "Job completed";
+      document.getElementById("output").textContent = JSON.stringify(r, null, 2);
+      toast("Scoped job completed");
+    })).catch(function (e) {
+      document.getElementById("output").textContent = e.message;
+      toast(e.message, true);
+    });
+  });
+
+  load();
+  setInterval(load, 5000);
+})();
+</script>
+</body>
+</html>

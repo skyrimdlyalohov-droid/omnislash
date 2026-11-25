@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -58,11 +59,18 @@ type Daemon struct {
 	states   map[string]*JobState
 	auditMu  sync.Mutex
 	learning *ExperienceStore
+	// online is the streaming feedback loop and its hot-reload state. It is
+	// nil when cfg.OnlineLearning is false.
+	online *onlineRuntime
 
 	slots  chan struct{}
 	wg     sync.WaitGroup
 	cancel context.CancelFunc
 	exit   atomic.Bool
+
+	// ui carries the optional transport/scope context used by the embedded
+	// dashboard registered on the control server.
+	ui omnislash.UIOptions
 }
 
 // New validates cfg and prepares the scheduler. audit may be nil.
@@ -108,6 +116,9 @@ func New(cfg *Config, exec Executor, logger *slog.Logger, audit io.Writer) (*Dae
 		j := &cfg.Jobs[i]
 		d.states[j.Name] = &JobState{Name: j.Name}
 	}
+	if cfg.IsOnlineLearningEnabled() {
+		d.online = newOnlineRuntime(d, cfg)
+	}
 	return d, nil
 }
 
@@ -121,6 +132,15 @@ func (d *Daemon) Learn(seeds []ExperienceSeed) {
 	d.learning.Seed(seeds)
 }
 
+// SetUI supplies the transport context used by the embedded control UI. It is
+// optional: without it the dashboard still serves legacy status endpoints but
+// reports unavailable actions honestly.
+func (d *Daemon) SetUI(opts omnislash.UIOptions) {
+	if d != nil {
+		d.ui = opts
+	}
+}
+
 // Run schedules jobs until ctx is cancelled or exit_on_success fires. A
 // cancelled context is a clean shutdown, not an error.
 func (d *Daemon) Run(ctx context.Context) error {
@@ -128,6 +148,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.cancel = cancel
 	defer cancel()
 
+	if d.online != nil {
+		d.online.start(ctx)
+		if err := d.online.reload(true); err != nil {
+			d.log.Warn("online state reload failed", "error", err)
+		}
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := d.online.reload(false); err != nil {
+						d.log.Warn("online state reload failed", "error", err)
+					}
+				}
+			}
+		}()
+	}
 	if d.cfg.ControlAddr != "" {
 		d.serveControl(ctx)
 	}
@@ -178,6 +220,145 @@ func (d *Daemon) RunJob(ctx context.Context, name string) (Outcome, error) {
 		return d.execute(ctx, j), nil
 	}
 	return Outcome{}, fmt.Errorf("daemon: unknown job %q", name)
+}
+
+// RunAdHoc executes one dashboard-originated probe on a scope-checked target.
+// It records the attempt in the same JSONL audit as scheduled jobs so the
+// finding journal and Caido export see it.
+func (d *Daemon) RunAdHoc(ctx context.Context, req omnislash.UIRunRequest) (omnislash.UIRunResult, error) {
+	if d == nil {
+		return omnislash.UIRunResult{}, errors.New("daemon: nil receiver")
+	}
+	// The HTTP handler already applies this gate; repeat it here so any other
+	// caller of RunAdHoc cannot bypass the fail-closed scope contract.
+	if d.ui.Scope == nil || !d.ui.Scope.Enabled() {
+		return omnislash.UIRunResult{}, errors.New("daemon: scope is disabled: quick run denied (fail-closed)")
+	}
+	if d.ui.Config == nil || len(d.ui.Config.Scope.AllowHosts) == 0 {
+		return omnislash.UIRunResult{}, errors.New("daemon: scope.allow_hosts is empty: quick run denied (fail-closed)")
+	}
+	if host := uiQuickHost(req); !uiRunHostAllowed(host, d.ui.Config.Scope.AllowHosts) {
+		return omnislash.UIRunResult{}, fmt.Errorf("daemon: target host %q is not in scope.allow_hosts", host)
+	}
+	checked, err := d.ui.Scope.CheckTarget(ctx, req.Target)
+	if err != nil {
+		return omnislash.UIRunResult{}, err
+	}
+	req.Target = checked
+	job, err := uiQuickJob(req)
+	if err != nil {
+		return omnislash.UIRunResult{}, err
+	}
+	p, err := buildProbe(&job)
+	if err != nil {
+		return omnislash.UIRunResult{}, err
+	}
+	target, err := job.target()
+	if err != nil {
+		return omnislash.UIRunResult{}, err
+	}
+	res, err := d.exec.Run(ctx, target, p, job.tlsMode())
+	success := jobSucceeded(&job, res, err)
+	d.record(&job, 1, res, err, success)
+	return uiQuickResult(req, res, err, success), nil
+}
+
+func uiQuickJob(req omnislash.UIRunRequest) (JobConfig, error) {
+	job := JobConfig{
+		Name:     "ui-quick-run",
+		Attempts: 1,
+		Timeout:  omnislash.Duration(10 * time.Second),
+		Path:     req.Path,
+		Target: TargetConfig{
+			Addr: req.Target,
+			Host: uiQuickHost(req),
+			Path: req.Path,
+		},
+	}
+	switch req.Probe {
+	case "adaptive":
+		job.Probe = "differential-fuzz"
+		job.Pairs = 3
+	case "smuggle-chain":
+		job.Probe = "smuggle-chain"
+		job.Variant = string(probe.VariantCLTE)
+		job.VictimMethod = "GET"
+		job.VictimPath = req.Path
+	case "h2-cl":
+		job.Probe = "h2-cl"
+		job.TLS = "h2"
+		job.Method = "GET"
+		job.Path = req.Path
+		job.VictimMethod = "GET"
+		job.VictimPath = req.Path
+	case "raw-replay":
+		return job, errors.New("daemon: raw-replay quick run needs a payload; use a configured job")
+	default:
+		return job, fmt.Errorf("daemon: unsupported quick-run probe %q", req.Probe)
+	}
+	return job, nil
+}
+
+func uiQuickHost(req omnislash.UIRunRequest) string {
+	original := strings.TrimSpace(req.Original)
+	if original != "" {
+		if host, _, err := net.SplitHostPort(original); err == nil {
+			return host
+		}
+		if !strings.Contains(original, "://") {
+			return strings.Trim(original, "[]")
+		}
+	}
+	if host, _, err := net.SplitHostPort(req.Target); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return req.Target
+}
+
+func uiRunHostAllowed(host string, rules []string) bool {
+	host = strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	if host == "" {
+		return false
+	}
+	for _, rule := range rules {
+		rule = strings.ToLower(strings.Trim(strings.TrimSpace(rule), "[]"))
+		if rule == host {
+			return true
+		}
+		if strings.HasPrefix(rule, "*.") && strings.HasSuffix(host, rule[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+func uiQuickResult(req omnislash.UIRunRequest, res *probe.Result, runErr error, success bool) omnislash.UIRunResult {
+	out := omnislash.UIRunResult{
+		Job:     "ui-quick-run",
+		Probe:   req.Probe,
+		Target:  req.Target,
+		Success: success,
+	}
+	if runErr != nil {
+		out.Error = runErr.Error()
+		out.Message = "quick run failed"
+	} else if success {
+		out.Message = "quick run reached its goal"
+	} else {
+		out.Message = "quick run completed without a confirmed goal"
+	}
+	if res != nil {
+		for _, finding := range res.Findings {
+			out.Findings = append(out.Findings, finding.Kind+" ("+finding.Confidence+")")
+		}
+		for _, response := range res.Responses {
+			out.Statuses = append(out.Statuses, response.Status)
+		}
+		if len(out.Findings) > 0 && runErr == nil && !success {
+			out.Message = "quick run completed with findings"
+		}
+	}
+	return out
 }
 
 // Status returns a copy of every job state.
@@ -337,6 +518,12 @@ func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
 		TechStack: tech,
 	}
 
+	// The streaming loop hot-reloads weights between attempts. Its priors only
+	// reorder declared candidates; they never invent a probe or a verdict.
+	if d.online != nil && len(c.DeclaredLengths) > 1 {
+		c.DeclaredLengths = d.online.rankCL(c.DeclaredLengths, host, tech)
+	}
+
 	if c.Probe == "differential-fuzz" {
 		candidates := c.Mutations
 		if len(candidates) == 0 {
@@ -346,6 +533,9 @@ func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
 			}
 		}
 		c.Mutations = d.learning.RankMutations(base, candidates)
+		if d.online != nil {
+			c.Mutations = d.online.rank("mutation", c.Mutations, host, tech)
+		}
 	}
 
 	if c.Variant == "auto" {
@@ -360,7 +550,13 @@ func (d *Daemon) applyLearning(j *JobConfig) JobConfig {
 			candidates = []string{string(probe.VariantCLTE), string(probe.VariantTECL)}
 		}
 		if len(candidates) > 0 {
-			c.Variant = d.learning.Rank(base, candidates)[0]
+			ranked := d.learning.Rank(base, candidates)
+			if d.online != nil {
+				// Preserve the daemon's own experience order and let online
+				// priors refine it, not replace it.
+				ranked = d.online.rank("variant", ranked, host, tech)
+			}
+			c.Variant = ranked[0]
 		}
 	}
 	return c
@@ -647,6 +843,29 @@ func (d *Daemon) serveControl(ctx context.Context) {
 		}
 		_ = enc.Encode(map[string]any{"enabled": d.cfg.IsLearningEnabled(), "cells": d.learning.Summary()})
 	})
+
+	// The dashboard shares this control server; legacy JSON routes above stay
+	// byte-compatible with existing health checks and lab scripts.
+	ui := d.ui
+	if len(ui.AuditPaths) == 0 && d.cfg.LogFile != "" {
+		ui.AuditPaths = []string{d.cfg.LogFile}
+	}
+	ui.Status = func() any { return map[string]any{"jobs": d.Status()} }
+	ui.Experience = func() any {
+		if d.learning == nil {
+			return map[string]any{"enabled": false, "cells": []ExperienceStat{}}
+		}
+		return map[string]any{"enabled": d.cfg.IsLearningEnabled(), "cells": d.learning.Summary()}
+	}
+	ui.Run = d.RunAdHoc
+	if d.online != nil {
+		ui.OnlineOptions = d.online.opts
+		ui.OnlineStatus = d.online.snapshot
+		ui.OnlineToggle = d.online.toggle
+		ui.OnlineFeedback = d.online.feedback
+	}
+	omnislash.RegisterUI(mux, ui)
+
 	srv := &http.Server{Addr: d.cfg.ControlAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

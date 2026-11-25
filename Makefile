@@ -8,7 +8,7 @@ IMAGE   ?= omnislash:$(VERSION)
 CONFIG  ?= config.json
 COMPOSE ?= docker compose
 
-.PHONY: all build run gateway daemon daemon-build daemon-once pipeline e2e radar incubate calibrate project test race vet fmt check lint docker up down logs ps scrape clean
+.PHONY: all build run gateway daemon daemon-build daemon-once release pipeline e2e radar incubate calibrate project test race vet fmt check lint docker up down logs ps scrape clean
 
 all: build
 
@@ -29,6 +29,25 @@ daemon: daemon-build
 
 daemon-once:
 	go run $(DAEMON_PKG) -config $(DAEMON_CONFIG) -once
+
+# Single autonomous release: one Go binary with the embedded Web UI, smoke-checked.
+release: build daemon-build
+	@test -f web/index.html
+	@PORT=$$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'); \
+	CFG=$$(mktemp); \
+	trap 'kill $$PID 2>/dev/null || true; rm -f $$CFG' EXIT; \
+	printf '{"trust_tier":"trusted","allow_direct":true,"health":{"enabled":false},"scraper":{"enabled":false},"gateway":{"listen":""},"stats":{"listen":"127.0.0.1:%s"},"audit":{"enabled":false}}' "$$PORT" > $$CFG; \
+	./bin/omnislash serve -config $$CFG >/dev/null 2>&1 & PID=$$!; \
+	for i in $$(seq 1 50); do \
+	  if curl -fsS --noproxy '*' http://127.0.0.1:$$PORT/ 2>/dev/null | grep -q 'OmniSlash Control'; then break; fi; \
+	  sleep 0.1; \
+	done; \
+	curl -fsS --noproxy '*' http://127.0.0.1:$$PORT/ | grep -q 'OmniSlash Control'; \
+	curl -fsS --noproxy '*' http://127.0.0.1:$$PORT/stats >/dev/null; \
+	curl -fsS --noproxy '*' http://127.0.0.1:$$PORT/api/dashboard >/dev/null; \
+	kill $$PID; wait $$PID 2>/dev/null || true
+	@./bin/omnislashd -h >/dev/null
+	@echo "RELEASE_OK: bin/omnislash + bin/omnislashd include the embedded dashboard"
 
 test:
 	go test ./...

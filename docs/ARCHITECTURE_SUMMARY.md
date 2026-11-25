@@ -63,6 +63,14 @@ OmniSlash — это безопасный Go/Python-пайплайн для ав
           v
       Internet / In-scope target
 
+          +-----------------------------------------------------------+
+          | Local control plane: stats.listen / daemon control_addr   |
+          | GET / embedded Web UI (web/index.html, //go:embed)         |
+          | GET /api/dashboard; POST /api/scrape|calibrate|run|        |
+          |                     /api/caido/push                        |
+          | legacy JSON: /stats /healthz /readyz /status /experience   |
+          +-----------------------------------------------------------+
+
           +-----------------------------------------------+
           | Post-processing                               |
           | nuclei.raw.jsonl -> osint/filter_nuclei.py    |
@@ -85,6 +93,7 @@ OmniSlash — это безопасный Go/Python-пайплайн для ав
 | Daemon/Probes | `cmd/omnislashd`, `daemon/*`, `probe/*` | Byte-exact probes, pinned session, JSONL audit |
 | Caido/Nuclei | `osint/caido_client.py`, `osint/filter_nuclei.py`, `osint/caido_bridge.py` | Recon chain, filtering, confirmed findings -> Replay |
 | Orchestration | `lab/run-pipeline.sh`, `Makefile` | Единый цикл и артефакты `runs/<ts>_<target>/` |
+| Control UI | `ui.go`, `web/web.go`, `web/index.html` | Встроенный SPA-дашборд на stats/control-порту, action API `/api/*`, legacy JSON без изменений |
 
 ## Пример сценария запуска
 
@@ -191,9 +200,11 @@ make project TECH="nginx+python+h1.1" PROJECT_ARGS="--targets ./targets_verified
 |---|---|---|
 | Semantic analyzer | `research/semantic_analyzer.py` | Классифицирует `QUEUE_SHIFTED_REDIRECT`, `PARSER_REJECT_STRICT`, `APP_ROUTE_MISS`, `WAF_OR_DECEPTION`, `CLEAN_BASELINE`; строит JSON/HTML skeleton без nonce/dynamic values; `TransitionTracker` считает успехом только `poison_sent -> response_queued -> victim_shifted` с подтверждённым сдвигом на victim |
 | Self-learning | `research/self_learning.py` | Ингестит JSONL-аудиты `omnislashd`, exploit-логи и Caido feedback (`--feedback-confirmed` / `--feedback-false-positive`), обновляет EMA-веса и `LinUCB`; явные негативы (`CL 1..3`, duplicate CL, bad timing) вычитаются из score |
+| Online loop | `research/online_loop.py`, `online.go`, `daemon/online.go` | Хвост JSONL по персистентному offset, семантическая классификация каждой попытки, atomic `state/learned_weights.json`, hot-reload priors/jobs по `mtime`, control file для паузы; непроверенные hypothesis уходят в `candidates`, а strike требует двух независимых egress-идентификаторов |
 | Parameter inference | `research/self_learning.py` | `ParameterInferencer` двухэтапно выводит gadget-path и границу `Content-Length`/тайминги; adaptive binary search идёт по градиенту `PARSER_REJECT_STRICT -> QUEUE_SHIFTED_REDIRECT`, без чтения `solution-derived` playbook |
 | Holdout | `research/self_learning.py` | Детерминированный split по host/lab ID; точные host/tech-наблюдения перебивают глобальный `host:"*"` приор через `exact_weight`; пересечение train/validation запрещено |
-| Native calibration | `lab/calibrate-brain.sh`, `make calibrate` | Только Go/Python + JSONL из `runs/` + локальные симуляции каскадов H2→H1/CL.TE/WAF; результат — gitignored `state/learned_weights.json` |
+| Native calibration | `lab/calibrate-brain.sh`, `make calibrate`, `research/self_learning.py` | Только Go/Python + **все** JSONL-аудиты `runs/*` + локальные контрастирующие/негативные примеры (CL 1..3, duplicate CL, bad timing, WAF-stub) и симуляции каскадов H2→H1/CL.TE; строгий per-host holdout; результат — gitignored `state/learned_weights.json` с верхним уровнем `examples` |
+| Dashboard telemetry | `ui.go`, `web/index.html` | `holdout_accuracy`/`examples` из весов, vault stacks/keys, findings journal с `confidence_score`/NCD, action API; Online Feedback Loop показывает `ACTIVE`/`PAUSED`, processed episodes, online accuracy/Δ и применяет метки ±2.0 через `/api/learning/feedback` без рестарта |
 | Planner integration | `osint/planner.py` | `--adaptive --learned-weights state/learned_weights.json` добавляет h2-cl гипотезы с `provenance: "autonomous-inferred"`; `solution-derived` vault-ключ остаётся отдельным replay-приором |
 
 Curated `solution-derived` сиды остаются видимыми в `/experience` как
@@ -201,6 +212,39 @@ Curated `solution-derived` сиды остаются видимыми в `/exper
 калибровки хосты lab instance попадают в holdout и не обучают модель на самом
 себе; inference работает на tech-stack/глобальных признаках и локальных
 симуляциях.
+
+Расширенный цикл не требует Docker: вход — все аудиты `runs/*`, локальные
+пары прокси+бэкенд на `127.0.0.1` (Go `net/http` + Python `http.server`),
+контрастирующие примеры (успешный queue shift против parser-reject/clean
+baseline) и явные негативы, включая WAF-stub Cloudflare/Akamai/AWS WAF/QRATOR/Nginx
+и чистый шум. Разделение детерминировано по
+хосту/lab ID и строго: хост из holdout не участвует в обучении. Число примеров
+сохраняется в `state/learned_weights.json` как top-level `examples`, поэтому
+дашборд показывает реальный объём выборки, а не только число ячеек;
+точность — из `holdout.metrics.accuracy`.
+
+## Embedded Web UI (локальный дашборд)
+
+`web/index.html` — ванильный HTML/CSS/JS SPA, встраиваемый через `//go:embed`
+(`web/web.go`) и регистрируемый `RegisterUI` (`ui.go`). Страница отдаётся на
+`GET /` на `stats.listen` (по умолчанию `127.0.0.1:9090`) и на `control_addr`
+демона, если он настроен. Legacy JSON `/stats`, `/healthz`, `/readyz`,
+`/status`, `/experience` сохраняются.
+
+| Маршрут | Назначение | Граница |
+|---|---|---|
+| `GET /api/dashboard` | pool (sniper/infantry/cooldown/avg IQR), brain (holdout accuracy, examples), vault (stacks/keys), scope, findings, status/experience | только локальный control-порт |
+| `POST /api/scrape` | нативный scrape + hot-swap пула | `501`, если скрапер не подключён |
+| `POST /api/calibrate` | `lab/calibrate-brain.sh`: калибровка Brain из `runs/*` + локальных примеров | без Docker; пишет `state/learned_weights.json` |
+| `POST /api/caido/push` | отправка выбранных подтверждённых finding'ов через `osint/caido_bridge.py` | Caido URL только localhost по умолчанию (`OMNISLASH_CAIDO_HOSTS`), PAT через env `CAIDO_PAT` |
+| `POST /api/run` | один scoped-запуск (`adaptive`, `h2-cl`, `smuggle-chain`, `raw-replay`) | fail-closed `scope.allow_hosts` + `Scope.CheckTarget`, иначе `403` |
+
+В журнал попадают только подтверждённые (`*_confirmed`) и не-`unverified`
+находки с `confidence_score`/NCD; записи с `unverified` отфильтровываются.
+Quick Run валидирует хост по allowlist (включая `*.domain`) и резолвит/пинит
+цель до запуска pinned-сессии. `make release` собирает `bin/omnislash` и
+`bin/omnislashd` со встроенным UI, поднимает сервис на эфемерном loopback-порту
+и проверяет `GET /`, `/stats` и `/api/dashboard` перед остановкой.
 
 ## Что проверяется тестами
 
@@ -220,4 +264,5 @@ git diff --check
 - **Audit**: JSONL, без query/userinfo/body.
 - **Deception defense**: детект/карантин/блокировка; секреты `unverified` не переиспользуются автоматически.
 - **Probe integrity**: smuggling/desync/race идут через `Dialer/Session` без Caido MITM.
+- **Control UI**: только локальный порт; Quick Run fail-closed по `scope.allow_hosts` + `Scope.CheckTarget`; Caido — localhost-only по умолчанию, PAT — через окружение дочернего процесса.
 - **No evasion**: нет обхода honeypot/deception/canary/sandbox, нет out-of-scope сканирования.

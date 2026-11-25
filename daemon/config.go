@@ -46,7 +46,26 @@ type Config struct {
 	// log_file is always included in addition to these.
 	LearningSources []string `json:"learning_sources,omitempty"`
 
+	// OnlineLearning starts research/online_loop.py alongside the long-running
+	// daemon. Nil means enabled. One-shot (-once / -job) modes never start it.
+	OnlineLearning *bool `json:"online_learning,omitempty"`
+	// OnlinePaths overrides the state files shared with the python worker.
+	// Relative paths are resolved against this config's directory.
+	OnlinePaths OnlineLearningPaths `json:"online_paths,omitempty"`
+
 	Jobs []JobConfig `json:"jobs"`
+}
+
+// OnlineLearningPaths names the files owned by the streaming feedback loop.
+type OnlineLearningPaths struct {
+	// WorkDir is the directory the python worker runs from (defaults to the
+	// process CWD). It holds research/online_loop.py and self_learning.py.
+	WorkDir     string `json:"work_dir,omitempty"`
+	WeightsPath string `json:"weights_path,omitempty"`
+	JobsPath    string `json:"jobs_path,omitempty"`
+	OffsetPath  string `json:"offset_path,omitempty"`
+	StatusPath  string `json:"status_path,omitempty"`
+	ControlPath string `json:"control_path,omitempty"`
 }
 
 // TargetConfig is the dial target and the request authority.
@@ -153,6 +172,12 @@ func LoadConfig(path string) (*Config, error) {
 	for i, src := range cfg.LearningSources {
 		cfg.LearningSources[i] = resolvePath(base, src)
 	}
+	cfg.OnlinePaths.WorkDir = resolvePath(base, cfg.OnlinePaths.WorkDir)
+	cfg.OnlinePaths.WeightsPath = resolvePath(base, cfg.OnlinePaths.WeightsPath)
+	cfg.OnlinePaths.JobsPath = resolvePath(base, cfg.OnlinePaths.JobsPath)
+	cfg.OnlinePaths.OffsetPath = resolvePath(base, cfg.OnlinePaths.OffsetPath)
+	cfg.OnlinePaths.StatusPath = resolvePath(base, cfg.OnlinePaths.StatusPath)
+	cfg.OnlinePaths.ControlPath = resolvePath(base, cfg.OnlinePaths.ControlPath)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -231,6 +256,13 @@ func (j *JobConfig) IsEnabled() bool {
 // means enabled, so existing configs gain learning without a schema change.
 func (c *Config) IsLearningEnabled() bool {
 	return c.LearningEnabled == nil || *c.LearningEnabled
+}
+
+// IsOnlineLearningEnabled reports whether the streaming python loop is active.
+// Nil means enabled; -once/-job modes still skip it because no worker survives
+// a one-shot process.
+func (c *Config) IsOnlineLearningEnabled() bool {
+	return c.OnlineLearning == nil || *c.OnlineLearning
 }
 
 func (j *JobConfig) interval() time.Duration {

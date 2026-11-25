@@ -78,6 +78,15 @@ type Config struct {
 	Scope              ScopeConfig     `json:"scope"`
 	Scraper            ScraperConfig   `json:"scraper"`
 	LogLevel           string          `json:"log_level"`
+	// OnlineLearning starts the streaming feedback loop next to the control
+	// UI. Nil means enabled; set false to keep serve read-only.
+	OnlineLearning *bool `json:"online_learning,omitempty"`
+}
+
+// IsOnlineLearningEnabled reports whether the streaming feedback loop should
+// be started. Nil means enabled so existing configs need no change.
+func (c *Config) IsOnlineLearningEnabled() bool {
+	return c == nil || c.OnlineLearning == nil || *c.OnlineLearning
 }
 
 // CooldownConfig controls exponential backoff after proxy failures.
@@ -155,15 +164,15 @@ type SafetyConfig struct {
 // DeceptionConfig enables defensive response-side filtering for tarpit/deception
 // targets. It never bypasses deception; it detects and excludes/quarantines.
 type DeceptionConfig struct {
-	Enabled             bool     `json:"enabled"`
-	BaselineSamples     int      `json:"baseline_samples"`
-	MaxBodySample       int64    `json:"max_body_sample"`
-	SimilarityThreshold float64  `json:"similarity_threshold"`
-	RepeatStatus        int      `json:"repeat_status"`
-	RepeatThreshold     int      `json:"repeat_threshold"`
-	LatencySpikeFactor  float64  `json:"latency_spike_factor"`
-	QuarantineSecrets   bool     `json:"quarantine_secrets"`
-	Action              string   `json:"action"` // "cooldown" | "disable" | "mark"
+	Enabled             bool    `json:"enabled"`
+	BaselineSamples     int     `json:"baseline_samples"`
+	MaxBodySample       int64   `json:"max_body_sample"`
+	SimilarityThreshold float64 `json:"similarity_threshold"`
+	RepeatStatus        int     `json:"repeat_status"`
+	RepeatThreshold     int     `json:"repeat_threshold"`
+	LatencySpikeFactor  float64 `json:"latency_spike_factor"`
+	QuarantineSecrets   bool    `json:"quarantine_secrets"`
+	Action              string  `json:"action"` // "cooldown" | "disable" | "mark"
 }
 
 // AuditConfig writes one JSON object per event to Path. Path "-" means stdout.
