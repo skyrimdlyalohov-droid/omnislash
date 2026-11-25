@@ -114,11 +114,11 @@ func quantileDuration(sorted []time.Duration, q float64) time.Duration {
 
 // KalmanFilter1D is a simple 1D Kalman filter for latency residuals/TTFB.
 type KalmanFilter1D struct {
-	Q float64 // process variance
-	R float64 // measurement variance
-	X float64 // state estimate
-	P float64 // estimate covariance
-	K float64 // gain
+	Q           float64 // process variance
+	R           float64 // measurement variance
+	X           float64 // state estimate
+	P           float64 // estimate covariance
+	K           float64 // gain
 	initialized bool
 }
 
