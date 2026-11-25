@@ -76,6 +76,9 @@ type Daemon struct {
 	// online is the streaming feedback loop and its hot-reload state. It is
 	// nil when cfg.OnlineLearning is false.
 	online *onlineRuntime
+	// orchestrator is an opt-in top-level FSM. When set, it owns learning
+	// feedback for parsed attempts; job order and success semantics stay intact.
+	orchestrator *Orchestrator
 
 	// observations counts real attempts and drives exponential epsilon decay.
 	observations atomic.Int64
@@ -162,6 +165,20 @@ func (d *Daemon) SetUI(opts omnislash.UIOptions) {
 	if d != nil {
 		d.ui = opts
 		d.configureMutation()
+		if d.orchestrator != nil {
+			d.orchestrator.SetCaidoPush(opts.CaidoPush)
+		}
+	}
+}
+
+// SetOrchestrator installs the top-level FSM. It is opt-in: without it the
+// daemon keeps its existing per-attempt ranking and audit behavior verbatim.
+func (d *Daemon) SetOrchestrator(o *Orchestrator) {
+	if d != nil {
+		d.orchestrator = o
+		if o != nil {
+			o.SetCaidoPush(d.ui.CaidoPush)
+		}
 	}
 }
 
@@ -726,6 +743,18 @@ func (d *Daemon) applyLearningWithRoll(j *JobConfig, roll explorationRoll) JobCo
 			c.Variant = ranked[0]
 		}
 	}
+	// Opt-in top-level FSM: the final mutation is the brain's best declared
+	// candidate. TLS fingerprints are pinned per Session by the transport, so
+	// the chosen fingerprint is audited but the job's TLS mode is not rewritten.
+	if !roll.explore && d.orchestrator != nil {
+		var fingerprints []string
+		if d.ui.Config != nil {
+			fingerprints = d.ui.Config.TLSFingerprints
+		}
+		if action, err := d.orchestrator.GetBestAction(orchestratorProfile(&c, fingerprints)); err == nil && action.Mutation != "" {
+			c.Mutations = []string{action.Mutation}
+		}
+	}
 	return c
 }
 
@@ -882,7 +911,26 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 			d.auditMu.Unlock()
 		}
 	}
-	if d.learning != nil && d.cfg.IsLearningEnabled() {
+	fedBack := false
+	if d.orchestrator != nil {
+		state, ok := parserStateOf(rec.ParserDivergence)
+		if !ok && rec.Outcome == string(OutcomeEngineFault) {
+			state, ok = probe.ParserEngineFault, true
+		}
+		action := d.orchestrator.LastAction()
+		if ok && action.TLSFingerprint != "" && action.Mutation != "" {
+			if action.Proxy == "" && res != nil {
+				action.Proxy = res.Attribution.Proxy
+			}
+			// The FSM owns this attempt's feedback, so the shared store is
+			// observed exactly once through its provider.
+			if err := d.orchestrator.RecordOutcome(action, state); err != nil && d.log != nil {
+				d.log.Warn("orchestrator feedback failed", "error", err)
+			}
+			fedBack = true
+		}
+	}
+	if !fedBack && d.learning != nil && d.cfg.IsLearningEnabled() {
 		d.learning.Observe(rec)
 	}
 	// Decay is driven by observed attempts, not by wall clock: a quiet lab does
