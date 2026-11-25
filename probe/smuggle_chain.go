@@ -99,7 +99,14 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 		return nil, fmt.Errorf("probe: dial for payload: %w", err)
 	}
 	e := newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
-	defer func() { _ = conn.Close() }()
+	// conn is reassigned between the payload and victim stages; a failed dial
+	// leaves it nil. Guard the deferred close so the real dial error is returned
+	// instead of a nil-pointer panic being recorded as precision loss.
+	defer func() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}()
 	idle := orDuration(p.Idle, 2*time.Second)
 
 	for attempt := 1; attempt <= attempts; attempt++ {

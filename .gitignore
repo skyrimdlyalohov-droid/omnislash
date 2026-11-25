@@ -6,6 +6,7 @@ config.local.json
 
 # daemon runtime evidence
 /examples/daemon/*.jsonl
+/panic_audit.log
 
 # local safety lab runtime artifacts
 /lab/bin/

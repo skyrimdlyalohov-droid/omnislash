@@ -159,7 +159,14 @@ func (p *SmugglingProbe) ExecuteMulti(ctx context.Context, target Target, source
 		return nil, fmt.Errorf("probe: dial for baseline: %w", err)
 	}
 	e := newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
-	defer func() { _ = conn.Close() }()
+	// conn is reassigned for every stage and source.Dial can return a nil conn
+	// with an error. Closing the nil value in a deferred cleanup would panic
+	// and hide the real dial failure as a precision-loss engine fault.
+	defer func() {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}()
 
 	baseline, err := render(requestSpec{
 		Method: "GET",
