@@ -138,6 +138,13 @@ type ProbeConfig struct {
 	MaxResponseBytes int64    `json:"max_response_bytes"`
 	ReadTimeout      Duration `json:"read_timeout"`
 	RaceReadTimeout  Duration `json:"race_read_timeout"`
+
+	// MutationEnabled opts into the additive raw-byte mutation pass. It is off
+	// by default so existing byte-exact probes are unchanged. The daemon only
+	// activates it when a Scope guard is available; without one mutations are
+	// refused (fail-closed).
+	MutationEnabled bool   `json:"mutation_enabled,omitempty"`
+	MutationMode    string `json:"mutation_mode,omitempty"`
 }
 
 // StatsConfig controls the optional JSON stats HTTP endpoint.

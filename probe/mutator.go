@@ -1,11 +1,18 @@
 package probe
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/skyrimdlyalohov-droid/omnislash/util"
 
 	rawhttp "github.com/projectdiscovery/rawhttp/client"
 )
@@ -141,4 +148,357 @@ func (m Mutator) ApplyRandom(target Target, idx int) ([]byte, Mutation, error) {
 		i = -i
 	}
 	return m.Apply(muts[i].Name, target)
+}
+
+// ScopeGuard is the fail-closed allowlist contract used before any payload is
+// mutated. *omnislash.Scope satisfies it; a nil guard never authorizes a write.
+type ScopeGuard interface {
+	CheckTarget(ctx context.Context, target string) (string, error)
+}
+
+// ErrMutationScopeDenied means a mutation was refused before any byte was
+// changed. Refusal is fail-closed: no guard or no target means no mutation.
+var ErrMutationScopeDenied = errors.New("probe: mutation denied by scope guard")
+
+// MutationMode selects one mutation family. Auto rotates deterministically by
+// seed, so one attempt is reproducible from (base payload, seed, mode).
+type MutationMode string
+
+const (
+	MutationAuto            MutationMode = ""
+	MutationHeaderFolding   MutationMode = "header_folding"
+	MutationChunkExtensions MutationMode = "chunk_extensions"
+	MutationCaseMixing      MutationMode = "case_mixing"
+)
+
+var mutationModeOrder = []MutationMode{
+	MutationHeaderFolding,
+	MutationChunkExtensions,
+	MutationCaseMixing,
+}
+
+const maxMutationPayload = 4 << 20
+
+// payloadMutationPool is the default pool for mutation scratch buffers. A
+// caller can supply its own Pool (tests use it to prove every byte is wiped and
+// the buffer is returned with len 0).
+var payloadMutationPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32<<10)
+		return &buf
+	},
+}
+
+// BufferPool is the sync.Pool-shaped contract for mutation scratch buffers.
+// *sync.Pool satisfies it; tests can supply an observer to prove zeroing and
+// return-to-pool without relying on pool reuse heuristics.
+type BufferPool interface {
+	Get() any
+	Put(any)
+}
+
+// PayloadMutator rewrites raw HTTP/1 requests without touching net/http. It
+// only changes bytes inside header lines or chunk-size lines: the number and
+// position of every \r\n in the base request is preserved.
+//
+// A mutation is never performed without a successful ScopeGuard.CheckTarget on
+// Target. This is independent of the transport's own dial-time scope check: the
+// mutation layer does not trust an upstream decision.
+type PayloadMutator struct {
+	Scope  ScopeGuard
+	Target string
+	Mode   MutationMode
+	Ctx    context.Context
+	// Pool is optional. It must return *[]byte.
+	Pool BufferPool
+}
+
+func (m *PayloadMutator) pool() BufferPool {
+	if m != nil && m.Pool != nil {
+		return m.Pool
+	}
+	return &payloadMutationPool
+}
+
+// Mutate returns a fresh byte slice. The pooled scratch buffer is cleared,
+// truncated to len 0 and returned before the function exits, on every path.
+// A panic (for example from a hostile pool) is converted to ErrPrecisionLost
+// by safeMutate; callers must use that wrapper on the probe hot path.
+func (m *PayloadMutator) Mutate(basePayload []byte, seed int64) ([]byte, error) {
+	if m == nil {
+		return nil, errors.New("probe: nil payload mutator")
+	}
+	if len(basePayload) == 0 {
+		return nil, errors.New("probe: empty payload")
+	}
+	if len(basePayload) > maxMutationPayload {
+		return nil, fmt.Errorf("probe: payload exceeds %d bytes", maxMutationPayload)
+	}
+	if err := m.checkScope(); err != nil {
+		return nil, err
+	}
+	if !validCRLF(basePayload) {
+		return nil, errors.New("probe: payload contains bare CR or LF")
+	}
+
+	ptr := m.pool().Get().(*[]byte)
+	buf := (*ptr)[:0]
+	released := false
+	defer func() {
+		if !released {
+			releaseMutationBuffer(m.pool(), buf)
+		}
+	}()
+
+	buf = append(buf, basePayload...)
+	rng := rand.New(rand.NewSource(seed))
+	mode := m.Mode
+	if mode == MutationAuto {
+		idx := seed % int64(len(mutationModeOrder))
+		if idx < 0 {
+			idx = -idx
+		}
+		mode = mutationModeOrder[idx]
+	}
+	switch mode {
+	case MutationHeaderFolding:
+		buf = rewriteRequestHeaders(buf, foldingRewrite(rng))
+	case MutationCaseMixing:
+		buf = rewriteRequestHeaders(buf, caseRewrite(rng))
+	case MutationChunkExtensions:
+		buf = appendChunkExtension(buf, rng)
+	default:
+		return nil, fmt.Errorf("probe: unknown mutation mode %q", mode)
+	}
+
+	out := append([]byte(nil), buf...)
+	releaseMutationBuffer(m.pool(), buf)
+	released = true
+	return out, nil
+}
+
+func (m *PayloadMutator) checkScope() error {
+	if m.Scope == nil {
+		return fmt.Errorf("%w: no scope guard configured", ErrMutationScopeDenied)
+	}
+	if m.Target == "" {
+		return fmt.Errorf("%w: empty target", ErrMutationScopeDenied)
+	}
+	ctx := m.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := m.Scope.CheckTarget(ctx, m.Target); err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrMutationScopeDenied, m.Target, err)
+	}
+	return nil
+}
+
+// safeMutate is the synchronous SafeGo boundary for the mutation hot path. A
+// panic becomes util.ErrPrecisionLost and is written to the panic audit, never
+// propagated as an unrecovered daemon crash.
+func safeMutate(m *PayloadMutator, base []byte, seed int64) (out []byte, err error) {
+	errs := util.SafeGoPayload(base, func() {
+		out, err = m.Mutate(base, seed)
+	})
+	if fault := <-errs; fault != nil {
+		return nil, fault
+	}
+	return out, err
+}
+
+func releaseMutationBuffer(p BufferPool, buf []byte) {
+	full := buf[:cap(buf)]
+	clear(full)
+	buf = buf[:0]
+	p.Put(&buf)
+}
+
+// validCRLF rejects a base request with any bare CR or LF. Rewriting such a
+// request could silently change framing, so it is refused instead of guessed.
+func validCRLF(raw []byte) bool {
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '\r':
+			if i+1 >= len(raw) || raw[i+1] != '\n' {
+				return false
+			}
+			i++
+		case '\n':
+			return false
+		}
+	}
+	return true
+}
+
+var requestSeparator = []byte("\r\n\r\n")
+
+// rewriteRequestHeaders rebuilds only the header section. Body bytes are copied
+// verbatim and every line boundary is re-emitted as CRLF.
+func rewriteRequestHeaders(raw []byte, fn func(key, value []byte) ([]byte, []byte)) []byte {
+	at := bytes.Index(raw, requestSeparator)
+	if at < 0 {
+		return raw
+	}
+	head, body := raw[:at], raw[at+len(requestSeparator):]
+	lines := bytes.Split(head, []byte("\r\n"))
+	if len(lines) == 0 {
+		return raw
+	}
+	out := make([]byte, 0, len(raw)+64)
+	out = append(out, lines[0]...)
+	for _, line := range lines[1:] {
+		out = append(out, '\r', '\n')
+		colon := bytes.IndexByte(line, ':')
+		if colon < 0 {
+			out = append(out, line...)
+			continue
+		}
+		key, value := fn(line[:colon], line[colon+1:])
+		out = append(out, key...)
+		out = append(out, ':')
+		out = append(out, value...)
+	}
+	out = append(out, requestSeparator...)
+	return append(out, body...)
+}
+
+func isFramingHeader(key []byte) bool {
+	return asciiEqualFold(key, []byte("content-length")) ||
+		asciiEqualFold(key, []byte("transfer-encoding"))
+}
+
+// Header Folding: OWS inside CL/TE values becomes a tab or a double space.
+// inserted OWS is legal and never includes a line break.
+func foldingRewrite(rng *rand.Rand) func([]byte, []byte) ([]byte, []byte) {
+	return func(key, value []byte) ([]byte, []byte) {
+		if !isFramingHeader(key) {
+			return key, value
+		}
+		sep := []byte("\t")
+		if rng.Intn(2) == 1 {
+			sep = []byte("  ")
+		}
+		value = bytes.TrimLeft(value, " \t")
+		out := make([]byte, 0, len(value)+len(sep))
+		out = append(out, sep...)
+		for _, c := range value {
+			if c == ' ' || c == '\t' {
+				out = append(out, sep...)
+				continue
+			}
+			out = append(out, c)
+		}
+		return key, out
+	}
+}
+
+// Case Mixing: randomize the case of CL/TE header names. The first letter is
+// always toggled so the mutation is observable even for an unlucky draw.
+func caseRewrite(rng *rand.Rand) func([]byte, []byte) ([]byte, []byte) {
+	return func(key, value []byte) ([]byte, []byte) {
+		if !isFramingHeader(key) {
+			return key, value
+		}
+		out := append([]byte(nil), key...)
+		toggled := false
+		for i, c := range out {
+			if !isASCIILetter(c) {
+				continue
+			}
+			if !toggled || rng.Intn(2) == 0 {
+				out[i] = toggleASCIICase(c)
+				toggled = true
+			}
+		}
+		return out, value
+	}
+}
+
+// Chunk Extensions: add a junk hex extension to the first chunk-size line when
+// the request has a chunked body. Otherwise extend the TE header value itself.
+// Both forms stay on one line, so CRLF framing is unchanged.
+func appendChunkExtension(raw []byte, rng *rand.Rand) []byte {
+	ext := make([]byte, 0, 9)
+	ext = append(ext, ';')
+	const hexChars = "0123456789abcdef"
+	for i := 0; i < 4; i++ {
+		ext = append(ext, hexChars[rng.Intn(len(hexChars))])
+	}
+	at := bytes.Index(raw, requestSeparator)
+	if at >= 0 {
+		body := raw[at+len(requestSeparator):]
+		if end := bytes.Index(body, []byte("\r\n")); end > 0 {
+			size := body[:end]
+			if isHexChunkSize(size) && asciiContainsFold(raw[:at], "chunked") {
+				out := make([]byte, 0, len(raw)+len(ext))
+				out = append(out, raw[:at+len(requestSeparator)]...)
+				out = append(out, size...)
+				out = append(out, ext...)
+				return append(out, body[end:]...)
+			}
+		}
+	}
+	return rewriteRequestHeaders(raw, func(key, value []byte) ([]byte, []byte) {
+		if !asciiEqualFold(key, []byte("transfer-encoding")) {
+			return key, value
+		}
+		out := make([]byte, 0, len(value)+len(ext))
+		out = append(out, value...)
+		return key, append(out, ext...)
+	})
+}
+
+func isHexChunkSize(v []byte) bool {
+	if len(v) == 0 {
+		return false
+	}
+	for _, c := range v {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func toggleASCIICase(c byte) byte {
+	if c >= 'a' && c <= 'z' {
+		return c - ('a' - 'A')
+	}
+	return c + ('a' - 'A')
+}
+
+func asciiEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiContainsFold(raw []byte, needle string) bool {
+	if len(needle) == 0 || len(raw) < len(needle) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(raw); i++ {
+		if asciiEqualFold(raw[i:i+len(needle)], []byte(needle)) {
+			return true
+		}
+	}
+	return false
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }

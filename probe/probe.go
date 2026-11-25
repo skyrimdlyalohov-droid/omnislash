@@ -99,6 +99,9 @@ type Result struct {
 	// differential-fuzz run. It lets the daemon learn which mutation worked
 	// without re-parsing the raw request from the audit log.
 	Mutation string `json:"mutation,omitempty"`
+	// ParserDivergence is the FSM verdict for the last exchange. It is copied
+	// into the daemon's JSONL record as "parser_divergence".
+	ParserDivergence string `json:"parser_divergence,omitempty"`
 }
 
 // Burst describes how a batch of requests was emitted. A single-packet attack

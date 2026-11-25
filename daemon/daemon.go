@@ -161,6 +161,35 @@ func (d *Daemon) Learn(seeds []ExperienceSeed) {
 func (d *Daemon) SetUI(opts omnislash.UIOptions) {
 	if d != nil {
 		d.ui = opts
+		d.configureMutation()
+	}
+}
+
+// configureMutation is the daemon-side integration point: the transport config
+// decides whether the mutation pass is on, and the already-loaded Scope is the
+// only guard allowed to authorize it. A missing scope disables mutations
+// instead of letting raw bytes reach an unreviewed target.
+func (d *Daemon) configureMutation() {
+	if d == nil {
+		return
+	}
+	setter, ok := d.exec.(interface {
+		SetMutationPolicy(*probe.MutationPolicy) error
+	})
+	if !ok {
+		return
+	}
+	policy := (*probe.MutationPolicy)(nil)
+	if d.ui.Config != nil && d.ui.Scope != nil && d.ui.Config.Probe.MutationEnabled {
+		policy = &probe.MutationPolicy{
+			Enabled: true,
+			Scope:   d.ui.Scope,
+			Mode:    probe.MutationMode(d.ui.Config.Probe.MutationMode),
+			Seed:    1, // stable across restarts: evidence stays reproducible
+		}
+	}
+	if err := setter.SetMutationPolicy(policy); err != nil && d.log != nil {
+		d.log.Warn("mutation policy refused", "error", err)
 	}
 }
 
@@ -782,9 +811,12 @@ type Record struct {
 	DeceptionUncertain bool `json:"deception_uncertain,omitempty"`
 	// Outcome separates proxy failures from real target responses. It is the
 	// only field the learning loop may use to decide whether to train.
-	Outcome string        `json:"outcome,omitempty"`
-	Explore bool          `json:"explore,omitempty"`
-	Result  *probe.Result `json:"result,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
+	Explore bool   `json:"explore,omitempty"`
+	// ParserDivergence is the FSM verdict for this attempt. It is promoted from
+	// Result so an audit reader does not have to descend into the raw exchange.
+	ParserDivergence string        `json:"parser_divergence"`
+	Result           *probe.Result `json:"result,omitempty"`
 }
 
 func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error, success bool) {
@@ -814,6 +846,28 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 	if res != nil {
 		rec.DurationMS = float64(res.Duration.Microseconds()) / 1000
 		rec.Attribution = res.Attribution
+		// A registered FSM verdict must never be lost between the runner and
+		// the audit line, even when the result came from a test executor.
+		rec.ParserDivergence = res.ParserDivergence
+		if res.ParserDivergence == string(probe.FEClosedBEWaiting) {
+			hasDesync := false
+			for _, f := range res.Findings {
+				if f.Kind == "desync_confirmed" {
+					hasDesync = true
+					break
+				}
+			}
+			if !hasDesync {
+				res.Findings = append(res.Findings, probe.Finding{
+					Kind:       "desync_confirmed",
+					Confidence: probe.ConfidenceHigh,
+					Detail:     "FSM classified the exchange as frontend closed / backend waiting",
+				})
+			}
+		}
+		if res.ParserDivergence == string(probe.EngineFault) {
+			rec.Outcome = string(OutcomeEngineFault)
+		}
 		rec.Findings = res.Findings
 		rec.Result = res
 		for _, r := range res.Responses {
@@ -1085,6 +1139,21 @@ func (s *RunnerSet) SetLimits(cfg omnislash.ProbeConfig) {
 			r.SetLimits(cfg.MaxResponseBytes, cfg.ReadTimeout.Std(), cfg.RaceReadTimeout.Std())
 		}
 	}
+}
+
+// SetMutationPolicy applies the same scoped policy to every TLS mode. A policy
+// without a scope guard is rejected by Runner, so all three modes fail closed.
+func (s *RunnerSet) SetMutationPolicy(p *probe.MutationPolicy) error {
+	if s == nil {
+		return errors.New("daemon: nil runner set")
+	}
+	var errs []error
+	for _, r := range []*probe.Runner{s.None, s.H1, s.H2} {
+		if r != nil {
+			errs = append(errs, r.SetMutationPolicy(p))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Run implements Executor.

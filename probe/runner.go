@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +44,38 @@ type Runner struct {
 	// H2RaceProbe. Zero means the 1500 ms default. It is intentionally not
 	// taken from the job's dynamic timeout.
 	RaceReadTimeout time.Duration
+
+	// mutation is opt-in. Without it, probes keep the byte-exact behavior the
+	// existing differential-fuzz and smuggling jobs depend on.
+	mutation *MutationPolicy
+}
+
+// MutationPolicy enables the additive raw-byte mutation pass. A scope guard is
+// mandatory: enabling mutations without one is refused, never silently
+// downgraded to "mutate everything".
+type MutationPolicy struct {
+	Enabled bool
+	Scope   ScopeGuard
+	Mode    MutationMode
+	Seed    int64
+}
+
+// SetMutationPolicy installs or removes the mutation pass on every path this
+// runner owns. Nil/Disabled restores the legacy byte-exact pipeline.
+func (r *Runner) SetMutationPolicy(p *MutationPolicy) error {
+	if r == nil {
+		return errors.New("probe: nil runner")
+	}
+	if p == nil || !p.Enabled {
+		r.mutation = nil
+		return nil
+	}
+	if p.Scope == nil {
+		return errors.New("probe: mutation policy requires a scope guard")
+	}
+	copyPolicy := *p
+	r.mutation = &copyPolicy
+	return nil
 }
 
 // NewRunner creates a runner for dialer.
@@ -112,9 +145,14 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 				addr:    target.Addr,
 				race:    isRaceProbe(p),
 				runner:  r,
+				ctx:     ctx,
+				target:  target,
 			}
 			defer src.closeAll()
 			out, runErr = mp.ExecuteMulti(ctx, target, src)
+			if fault := src.finishAll(out, runErr); fault != nil {
+				runErr = errors.Join(runErr, fault)
+			}
 			return runErr
 		}
 		session, conn, err := r.dial(ctx, target)
@@ -124,7 +162,13 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 		defer session.Close()
 		guarded := r.guardConn(conn, isRaceProbe(p))
 		defer guarded.Close()
-		out, runErr = p.Execute(ctx, target, guarded)
+		mutated := r.wrapMutation(ctx, target, guarded)
+		out, runErr = p.Execute(ctx, target, mutatedConn(guarded, mutated))
+		if mutated != nil {
+			if fault := mutated.finish(out, runErr); fault != nil {
+				runErr = errors.Join(runErr, fault)
+			}
+		}
 		return runErr
 	})
 	if errors.Is(err, util.ErrPrecisionLost) {
@@ -264,9 +308,12 @@ type sessionSource struct {
 	addr    string
 	race    bool
 	runner  *Runner
+	ctx     context.Context
+	target  Target
 
-	mu   sync.Mutex
-	conn []net.Conn
+	mu       sync.Mutex
+	conn     []net.Conn
+	mutation []*mutationConn
 }
 
 func (s *sessionSource) Dial(ctx context.Context) (net.Conn, error) {
@@ -282,11 +329,35 @@ func (s *sessionSource) Dial(ctx context.Context) (net.Conn, error) {
 	}
 	if s.runner != nil {
 		conn = s.runner.guardConn(conn, s.race)
+		if mc := s.runner.wrapMutation(s.ctx, s.target, conn); mc != nil {
+			conn = mc
+			s.mu.Lock()
+			s.mutation = append(s.mutation, mc)
+			s.mu.Unlock()
+		}
 	}
 	s.mu.Lock()
 	s.conn = append(s.conn, conn)
 	s.mu.Unlock()
 	return conn, nil
+}
+
+// finishAll runs the FSM over every mutated connection in a multi-connection
+// probe. A panic in the FSM is contained by safeAnalyze and returned as an
+// ErrPrecisionLost fault; it is never allowed to escape the daemon.
+func (s *sessionSource) finishAll(res *Result, runErr error) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	conns := s.mutation
+	s.mutation = nil
+	s.mu.Unlock()
+	var fault error
+	for _, mc := range conns {
+		fault = errors.Join(fault, mc.finish(res, runErr))
+	}
+	return fault
 }
 
 func (s *sessionSource) closeAll() {
@@ -297,4 +368,185 @@ func (s *sessionSource) closeAll() {
 	for _, c := range conns {
 		_ = c.Close()
 	}
+}
+
+const maxMutationFSMBytes = 4 << 20
+
+// wrapMutation returns nil when no policy is installed, so all existing probes
+// keep writing the exact bytes they built.
+func (r *Runner) wrapMutation(ctx context.Context, target Target, conn net.Conn) *mutationConn {
+	if r == nil || r.mutation == nil || !r.mutation.Enabled || conn == nil {
+		return nil
+	}
+	m := &PayloadMutator{
+		Scope:  r.mutation.Scope,
+		Target: target.Addr,
+		Mode:   r.mutation.Mode,
+		Ctx:    ctx,
+	}
+	return newMutationConn(conn, m, r.mutation.Seed, &ParserStateMachine{})
+}
+
+func mutatedConn(base net.Conn, mc *mutationConn) net.Conn {
+	if mc == nil {
+		return base
+	}
+	return mc
+}
+
+// mutationConn is a net.Conn decorator. It is the only place where a probe's
+// raw bytes are rewritten before conn.Write, and where raw response bytes are
+// captured for the FSM. No net/http value is involved on either path.
+type mutationConn struct {
+	net.Conn
+
+	mut  *PayloadMutator
+	seed int64
+
+	mu       sync.Mutex
+	fsm      *ParserStateMachine
+	resp     []byte
+	readErr  error
+	fault    error
+	finished bool
+}
+
+func newMutationConn(conn net.Conn, mut *PayloadMutator, seed int64, fsm *ParserStateMachine) *mutationConn {
+	return &mutationConn{Conn: conn, mut: mut, seed: seed, fsm: fsm}
+}
+
+func (c *mutationConn) Write(p []byte) (int, error) {
+	if !looksLikeHTTP1Request(p) {
+		// Binary frames (HTTP/2, WebSocket after upgrade) must never be
+		// rewritten as an HTTP/1 header block.
+		return c.Conn.Write(p)
+	}
+	c.mu.Lock()
+	if c.fsm != nil && asciiContainsFold(p, "transfer-encoding:") {
+		c.fsm.RequestHadTE = true
+	}
+	c.mu.Unlock()
+
+	mutated, err := safeMutate(c.mut, p, c.seed)
+	if err != nil {
+		c.mu.Lock()
+		if c.fault == nil {
+			c.fault = err
+		}
+		c.mu.Unlock()
+		return 0, err
+	}
+	return c.Conn.Write(mutated)
+}
+
+func (c *mutationConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.mu.Lock()
+		if len(c.resp) < maxMutationFSMBytes {
+			remaining := maxMutationFSMBytes - len(c.resp)
+			if n > remaining {
+				c.resp = append(c.resp, p[:remaining]...)
+			} else {
+				c.resp = append(c.resp, p[:n]...)
+			}
+		}
+		c.mu.Unlock()
+	}
+	if err != nil {
+		c.mu.Lock()
+		if c.readErr == nil {
+			c.readErr = err
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+// finish is called once per probe run. It stores the FSM verdict on Result and
+// escalates FE_Closed_BE_Waiting to a high-confidence desync finding.
+func (c *mutationConn) finish(res *Result, runErr error) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	if c.finished {
+		fault := c.fault
+		c.mu.Unlock()
+		return fault
+	}
+	c.finished = true
+	fsm := c.fsm
+	if fsm == nil {
+		fsm = &ParserStateMachine{}
+	}
+	// Snapshot the FSM: RequestHadTE is written by Write and read here.
+	local := *fsm
+	raw := append([]byte(nil), c.resp...)
+	readErr := c.readErr
+	fault := c.fault
+	c.mu.Unlock()
+
+	observedErr := runErr
+	if observedErr == nil {
+		observedErr = readErr
+	}
+	state, analyzeFault := safeAnalyze(&local, raw, observedErr)
+	if analyzeFault != nil {
+		fault = errors.Join(fault, analyzeFault)
+	}
+	if res != nil {
+		res.ParserDivergence = string(state)
+		switch state {
+		case ParserFEClosedBEWaiting:
+			addFindingOnce(res, Finding{
+				Kind:       "desync_confirmed",
+				Confidence: ConfidenceHigh,
+				Detail:     "frontend closed the connection while the backend was still waiting for a smuggled body",
+			})
+		case ParserEngineFault:
+			addFindingOnce(res, Finding{
+				Kind:       "engine_fault",
+				Confidence: ConfidenceHigh,
+				Detail:     "FSM classified the exchange as a local correctness failure",
+			})
+		}
+	}
+	return fault
+}
+
+// NetConn, Unwrap and ConnectionState keep the proxy/TLS introspection that
+// probes and omnislash.ProxyOf rely on through this decorator.
+func (c *mutationConn) NetConn() net.Conn { return c.Conn }
+func (c *mutationConn) Unwrap() net.Conn  { return c.Conn }
+func (c *mutationConn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
+}
+
+func addFindingOnce(res *Result, f Finding) {
+	if res == nil {
+		return
+	}
+	for _, existing := range res.Findings {
+		if existing.Kind == f.Kind {
+			return
+		}
+	}
+	res.Findings = append(res.Findings, f)
+}
+
+func looksLikeHTTP1Request(p []byte) bool {
+	if len(p) == 0 {
+		return false
+	}
+	limit := len(p)
+	if limit > 128 {
+		limit = 128
+	}
+	head := string(p[:limit])
+	space := strings.IndexByte(head, ' ')
+	return space > 0 && space < 12 && strings.Contains(head, "HTTP/1.")
 }

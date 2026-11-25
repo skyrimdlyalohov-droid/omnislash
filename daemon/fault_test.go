@@ -71,6 +71,66 @@ func TestDeceptionUncertainIsEngineFaultInJSONL(t *testing.T) {
 	}
 }
 
+type parserExec struct {
+	state string
+}
+
+func (p parserExec) Run(context.Context, probe.Target, probe.Probe, string) (*probe.Result, error) {
+	return &probe.Result{
+		Probe:            "smuggle",
+		ParserDivergence: p.state,
+		Responses:        []probe.Response{{Seq: 1, Status: 200, Body: "ok"}},
+	}, nil
+}
+
+func TestParserDivergenceAndDesyncFindingAreAudited(t *testing.T) {
+	job := testJob()
+	job.Attempts = 1
+	cfg := testConfig(job)
+	audit := &bytes.Buffer{}
+	d, err := New(cfg, parserExec{state: string(probe.FEClosedBEWaiting)}, nil, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out := d.RunOnce(context.Background()); len(out) != 1 {
+		t.Fatalf("outcomes = %+v, want one attempt", out)
+	}
+
+	var rec Record
+	if err := json.Unmarshal([]byte(strings.TrimSpace(audit.String())), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.ParserDivergence != string(probe.FEClosedBEWaiting) {
+		t.Fatalf("parser_divergence = %q", rec.ParserDivergence)
+	}
+	found := false
+	for _, f := range rec.Findings {
+		if f.Kind == "desync_confirmed" && f.Confidence == probe.ConfidenceHigh {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("findings = %+v, want high-confidence desync_confirmed", rec.Findings)
+	}
+}
+
+func TestParserEngineFaultIsNotTrainable(t *testing.T) {
+	job := testJob()
+	job.Attempts = 1
+	cfg := testConfig(job)
+	audit := &bytes.Buffer{}
+	d, err := New(cfg, parserExec{state: string(probe.EngineFault)}, nil, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.RunOnce(context.Background())
+	if !strings.Contains(audit.String(), `"outcome":"Engine Fault"`) {
+		t.Fatalf("parser engine fault was not classified: %s", audit.String())
+	}
+}
+
 func TestRecoveredPanicIsEngineFaultInJSONL(t *testing.T) {
 	job := testJob()
 	job.Attempts = 1
