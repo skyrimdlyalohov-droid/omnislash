@@ -127,7 +127,8 @@ func run() error {
 	defer stop()
 
 	if transport.Safety.Deception.Enabled && transport.Safety.Deception.SemanticService {
-		if _, err := omnislash.StartSemanticService(ctx, transport.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+		semantic, err := omnislash.StartSemanticService(ctx, transport.Safety.Deception.SemanticAddr, ".", logger)
+		if err != nil {
 			if transport.Safety.Deception.SemanticRequired {
 				pool.Audit().Log(omnislash.AuditEvent{
 					Kind:               "deception",
@@ -138,6 +139,7 @@ func run() error {
 			}
 			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
 		} else {
+			defer semantic.Close()
 			logger.Info("semantic skeleton service started", "addr", transport.Safety.Deception.SemanticAddr)
 		}
 	}

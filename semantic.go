@@ -284,13 +284,33 @@ func (p *SemanticProcess) waitHealthy(ctx context.Context, timeout time.Duration
 	}
 }
 
-// Close stops the supervisor and the child. It is safe to call more than once.
+// Close stops the supervisor and the child. It is synchronous: a one-shot
+// command can call it and then exit immediately without leaving an orphaned
+// analyzer bound to the loopback port. It is safe to call more than once.
 func (p *SemanticProcess) Close() {
 	if p == nil {
 		return
 	}
 	if p.cancel != nil {
 		p.cancel()
+	}
+	select {
+	case <-p.done:
+		return
+	case <-time.After(3 * time.Second):
+	}
+	// CommandContext kills the child asynchronously. If the process is about
+	// to exit (os.Exit in -job/-once mode), the killer goroutine may never get
+	// scheduled, so kill directly and give Wait a bounded chance to finish.
+	p.mu.Lock()
+	cmd := p.cmd
+	p.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-p.done:
+	case <-time.After(time.Second):
 	}
 }
 

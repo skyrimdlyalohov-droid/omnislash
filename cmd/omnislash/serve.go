@@ -61,7 +61,8 @@ func cmdServe(args []string) error {
 	// One loopback Python child supplies value-free skeletons for NCD. It is
 	// started once; no os/exec happens per HTTP response.
 	if cfg.Safety.Deception.Enabled && cfg.Safety.Deception.SemanticService {
-		if _, err := omnislash.StartSemanticService(ctx, cfg.Safety.Deception.SemanticAddr, ".", logger); err != nil {
+		semantic, err := omnislash.StartSemanticService(ctx, cfg.Safety.Deception.SemanticAddr, ".", logger)
+		if err != nil {
 			if cfg.Safety.Deception.SemanticRequired {
 				pool.Audit().Log(omnislash.AuditEvent{
 					Kind:               "deception",
@@ -72,6 +73,7 @@ func cmdServe(args []string) error {
 			}
 			logger.Warn("semantic skeleton service did not start; NCD will use raw samples", "error", err)
 		} else {
+			defer semantic.Close()
 			logger.Info("semantic skeleton service started", "addr", cfg.Safety.Deception.SemanticAddr)
 		}
 	}
