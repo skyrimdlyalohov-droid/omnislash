@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -410,11 +409,4 @@ func (r *onlineRuntime) feedback(ctx context.Context, req omnislash.UIFeedbackRe
 		}
 	}
 	return result, err
-}
-
-func resolveStatePath(workDir, path string) string {
-	if path == "" || filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(workDir, path)
 }

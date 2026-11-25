@@ -59,9 +59,7 @@ func measureTTFBOnce(ctx context.Context, target Target, source ConnSource) (tim
 		return 0, err
 	}
 	defer conn.Close()
-	if err := setNoDelay(conn, true); err != nil {
-		// best-effort
-	}
+	_ = setNoDelay(conn, true) // best-effort
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: omnislash-probe/1\r\nAccept: */*\r\nConnection: close\r\n\r\n", target.RequestPath(), target.HostHeader())
 	deadline := time.Now().Add(5 * time.Second)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {

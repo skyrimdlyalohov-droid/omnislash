@@ -58,10 +58,7 @@ func (p *UpgradeDesyncProbe) Execute(ctx context.Context, target Target, conn ne
 	// Follow-up probe: send a smuggled raw HTTP request after upgrade attempt to detect tunnel/desync.
 	smuggle := fmt.Sprintf("GET /__omni_upgrade_probe__ HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target.HostHeader())
 	_ = e.write([]byte(smuggle))
-	resp2, err2 := e.read()
-	if err2 != nil && !isTimeout(err2) {
-		// keep evidence
-	}
+	resp2, _ := e.read()
 	if resp2 != nil {
 		if p.SuccessContains != "" && strings.Contains(strings.ToLower(resp2.Body), strings.ToLower(p.SuccessContains)) {
 			e.addFinding(Finding{Kind: "upgrade_desync_confirmed", Confidence: ConfidenceHigh, Detail: "marker observed after upgrade follow-up", Response: resp2.Seq})

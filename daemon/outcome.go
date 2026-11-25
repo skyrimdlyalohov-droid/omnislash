@@ -24,14 +24,6 @@ const (
 	OutcomeEngineFault OutcomeLabel = "Engine Fault"
 )
 
-var outcomeSlugs = map[OutcomeLabel]string{
-	OutcomeProxyFailed:    "proxy-failed",
-	OutcomeWAFBlocked:     "waf-blocked",
-	OutcomeTargetRejected: "target-rejected",
-	OutcomeTargetResponse: "target-response",
-	OutcomeEngineFault:    "engine-fault",
-}
-
 var outcomeLabels = map[string]OutcomeLabel{
 	"proxy failed":    OutcomeProxyFailed,
 	"proxy-failed":    OutcomeProxyFailed,
@@ -54,13 +46,6 @@ var outcomeLabels = map[string]OutcomeLabel{
 func ParseOutcomeLabel(value string) (OutcomeLabel, bool) {
 	label, ok := outcomeLabels[strings.ToLower(strings.TrimSpace(value))]
 	return label, ok
-}
-
-func (l OutcomeLabel) slug() string {
-	if slug, ok := outcomeSlugs[l]; ok {
-		return slug
-	}
-	return strings.ToLower(strings.ReplaceAll(string(l), " ", "-"))
 }
 
 // Trainable reports whether this outcome is a real target response. Proxy

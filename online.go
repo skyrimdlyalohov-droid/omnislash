@@ -196,13 +196,6 @@ func (p *OnlineProcess) Done() <-chan struct{} {
 	return p.done
 }
 
-func (p *OnlineProcess) options() OnlineLoopOptions {
-	if p == nil {
-		return DefaultOnlineLoopOptions(".")
-	}
-	return p.opts
-}
-
 type onlineLogWriter struct{ logger *slog.Logger }
 
 func (w *onlineLogWriter) Write(b []byte) (int, error) {

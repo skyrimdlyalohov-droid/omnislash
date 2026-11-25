@@ -47,8 +47,5 @@ func (l *BehavioralTimingLayer) RoundTrip(ctx context.Context, rt http.RoundTrip
 		}
 	}
 	resp, err := rt.RoundTrip(req)
-	if err == nil && l.Adaptive && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden) && resp.Body != nil {
-		// adaptive backoff / IP quarantine path (design hook)
-	}
 	return resp, err
 }

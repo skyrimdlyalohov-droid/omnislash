@@ -296,7 +296,7 @@ func RegisterUI(mux *http.ServeMux, opts UIOptions) {
 		if !uiDecode(w, r, &req) {
 			return
 		}
-		enabled := true
+		var enabled bool
 		if req.Enabled != nil {
 			enabled = *req.Enabled
 		} else {
@@ -801,10 +801,10 @@ func uiValidateCaidoURL(raw string) (string, error) {
 		return "", fmt.Errorf("invalid Caido URL: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", errors.New("Caido URL must use http or https")
+		return "", errors.New("caido URL must use http or https")
 	}
 	if u.User != nil {
-		return "", errors.New("Caido URL must not contain credentials")
+		return "", errors.New("caido URL must not contain credentials")
 	}
 	host := strings.ToLower(u.Hostname())
 	allowed := map[string]bool{"localhost": true, "127.0.0.1": true, "::1": true}
@@ -814,7 +814,7 @@ func uiValidateCaidoURL(raw string) (string, error) {
 		}
 	}
 	if !allowed[host] {
-		return "", fmt.Errorf("Caido host %q is not allowed (set OMNISLASH_CAIDO_HOSTS to override)", host)
+		return "", fmt.Errorf("caido host %q is not allowed (set OMNISLASH_CAIDO_HOSTS to override)", host)
 	}
 	return u.String(), nil
 }
