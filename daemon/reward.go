@@ -55,8 +55,9 @@ type Reward struct {
 }
 
 // RewardFor converts one FSM verdict plus its sonar evidence into reward. A
-// WAF block is always a loss; a parser rejection is a small win that permits a
-// boundary tweak; only a strong confirmed anomaly earns elite promotion.
+// WAF block is always a loss; a parser rejection and a quiet redirect are weak
+// negative evidence that downweight an already-explored branch; only a strong
+// confirmed anomaly earns elite promotion.
 func RewardFor(state probe.ParserState, signal probe.SignalQuality) Reward {
 	switch state {
 	case probe.ParserEngineFault:
@@ -66,7 +67,13 @@ func RewardFor(state probe.ParserState, signal probe.SignalQuality) Reward {
 		return Reward{Value: -0.5, BetaDelta: 0.5, Stop: true, Reason: "waf_block"}
 	}
 	if signal.Status == 400 {
-		return Reward{Value: 0.1, AlphaDelta: 0.1, Boundary: true, Reason: "parser_reject"}
+		// The parser already rejected this syntax for the host. Keep the
+		// signal informative but stop spending budget on the same mutation.
+		return Reward{Value: -0.1, BetaDelta: 0.1, Stop: true, Reason: "parser_reject"}
+	}
+	if quietRedirect(signal) {
+		// A clean 301/302 without a status shift carries no queue evidence.
+		return Reward{Value: -0.15, BetaDelta: 0.15, Reason: "redirect_no_shift"}
 	}
 	if state == probe.ParserFEClosedBEWaiting {
 		if signal.Strong() {
@@ -75,6 +82,13 @@ func RewardFor(state probe.ParserState, signal probe.SignalQuality) Reward {
 		return Reward{Value: -0.25, BetaDelta: 0.25, Stop: true, Reason: "weak_signal"}
 	}
 	return Reward{Value: 0, Reason: "sync_ok"}
+}
+
+// quietRedirect reports a redirect that did not move the response queue. The
+// baseline status is the only shift oracle available without retaining bodies:
+// an uncalibrated attempt has no baseline and therefore no observed shift.
+func quietRedirect(signal probe.SignalQuality) bool {
+	return (signal.Status == 301 || signal.Status == 302) && !signal.StatusShift
 }
 
 // rewardFitness maps the current signal to the scalar handed to the mutator.

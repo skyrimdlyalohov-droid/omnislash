@@ -123,12 +123,17 @@ func NormalizedEntropy(raw []byte) float64 {
 // body or sample array is retained.
 type SignalQuality struct {
 	Status      int
+	Host        string // pair key component for the per-pair sonar
+	Proxy       string // pair key component for the per-pair sonar
 	LatencyMS   float64
 	NCD         float64
 	Entropy     float64 // normalized Shannon entropy in [0,1]
 	BodyBytes   int     // length of the response body; empty is a valid FE shape
 	ZScore      float64 // Welford Z-score of this attempt's TTFB
 	StatusShift bool    // status differs from the calibrated baseline
+	// Uncalibrated is true while the (host, proxy) pair has fewer than
+	// SonarMinSamples baseline observations. ZScore is then always zero.
+	Uncalibrated bool
 }
 
 const (

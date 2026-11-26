@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +115,203 @@ func TestOrchestratorTrainsWeightsAfterConfirmedDesync(t *testing.T) {
 	}
 	if !strings.Contains(audit.String(), `"orchestrator_state":"StateFeedback"`) {
 		t.Fatalf("audit lost the feedback transition: %q", audit.String())
+	}
+}
+
+func TestOrchestratorEmitsFeedbackForParserRejectAndQuietRedirect(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		statusShift bool
+		ncd         float64
+		zscore      float64
+		wantReward  float64
+		wantDelta   float64
+		wantReason  string
+	}{
+		{
+			name: "parser_reject_400", status: 400,
+			ncd: 0.42, zscore: 2.5,
+			wantReward: -0.1, wantDelta: 0.1, wantReason: "parser_reject",
+		},
+		{
+			name: "quiet_redirect_301", status: 301,
+			ncd: 0.12, zscore: -1.25,
+			wantReward: -0.15, wantDelta: 0.15, wantReason: "redirect_no_shift",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := orchestratorTestStore()
+			var audit bytes.Buffer
+			orch := NewOrchestrator(&ExperienceProvider{Store: store}, &audit)
+			profile := orchestratorTestProfile()
+			if err := orch.StartRecon(profile); err != nil {
+				t.Fatal(err)
+			}
+			if err := orch.Calibrate(0.1, false); err != nil {
+				t.Fatal(err)
+			}
+			action, err := orch.GetBestAction(profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			feature := orch.lastFeature
+			before := orch.BetaFor(feature)
+			orch.ObserveExchange(probe.SignalQuality{
+				Status: tc.status, StatusShift: tc.statusShift,
+				NCD: tc.ncd, ZScore: tc.zscore, Entropy: 0.5,
+				LatencyMS: 12,
+			})
+			if err := orch.RecordOutcome(action, probe.SyncOK); err != nil {
+				t.Fatal(err)
+			}
+
+			var feedback map[string]any
+			found := false
+			for _, line := range strings.Split(strings.TrimSpace(audit.String()), "\n") {
+				var event map[string]any
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					t.Fatalf("invalid audit line %q: %v", line, err)
+				}
+				if event["orchestrator_state"] == string(StateFeedback) {
+					feedback, found = event, true
+				}
+			}
+			if !found {
+				t.Fatalf("StateFeedback was not emitted: %s", audit.String())
+			}
+			for key, want := range map[string]float64{
+				"reward": tc.wantReward, "beta_delta": tc.wantDelta,
+				"alpha_delta": 0, "ncd": tc.ncd, "zscore": tc.zscore,
+			} {
+				got := 0.0
+				if value, ok := feedback[key].(float64); ok {
+					got = value
+				}
+				if math.Abs(got-want) > 1e-9 {
+					t.Fatalf("feedback[%q] = %v, want %v: %v", key, feedback[key], want, feedback)
+				}
+			}
+			if feedback["posterior_key"] != feature {
+				t.Fatalf("posterior_key = %v, want %q", feedback["posterior_key"], feature)
+			}
+			if reason, _ := feedback["reason"].(string); reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q: %v", reason, tc.wantReason, feedback)
+			}
+			after := orch.BetaFor(feature)
+			if math.Abs(after.Alpha-before.Alpha) > 1e-9 ||
+				math.Abs(after.Beta-before.Beta-tc.wantDelta) > 1e-9 {
+				t.Fatalf("posterior = (%v,%v), want (%v,%v)", before.Alpha, before.Beta, after.Alpha, after.Beta)
+			}
+		})
+	}
+}
+
+func TestDaemonEmitsFeedbackWithoutRegisteredParserVerdict(t *testing.T) {
+	cfg := testConfig(testJob())
+	audit := &bytes.Buffer{}
+	d, err := New(cfg, &fakeExec{}, nil, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := d.EnableOrchestrator()
+	if _, err := orch.GetBestAction(orchestratorTestProfile()); err != nil {
+		t.Fatal(err)
+	}
+	res := &probe.Result{
+		Probe:    "smuggle-chain",
+		Duration: 5 * time.Millisecond,
+		Responses: []probe.Response{{
+			Seq: 1, Status: 400, Raw: "HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nbad", Body: "bad",
+		}},
+	}
+	d.record(&cfg.Jobs[0], 1, res, nil, false)
+
+	feedback := ""
+	for _, line := range strings.Split(strings.TrimSpace(audit.String()), "\n") {
+		if strings.Contains(line, `"orchestrator_state":"StateFeedback"`) {
+			feedback = line
+		}
+	}
+	if feedback == "" {
+		t.Fatalf("a 400 without parser divergence lost its feedback line: %s", audit.String())
+	}
+	for _, want := range []string{
+		`"parser_divergence":"SyncOK"`, `"reward":-0.1`, `"beta_delta":0.1`,
+		`"ncd":`, `"zscore":`,
+	} {
+		if !strings.Contains(feedback, want) {
+			t.Fatalf("feedback %q is missing %s", feedback, want)
+		}
+	}
+}
+
+func TestParserRejectInPairedExchangeIsNotHiddenByFinalResponse(t *testing.T) {
+	cfg := testConfig(testJob())
+	audit := &bytes.Buffer{}
+	d, err := New(cfg, &fakeExec{}, nil, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := d.EnableOrchestrator()
+	if _, err := orch.GetBestAction(orchestratorTestProfile()); err != nil {
+		t.Fatal(err)
+	}
+	res := &probe.Result{
+		Probe:    "differential-fuzz",
+		Duration: 5 * time.Millisecond,
+		Responses: []probe.Response{
+			{Seq: 1, Status: 400, Raw: "HTTP/1.1 400 Bad Request\r\n\r\nbad", Body: "bad"},
+			{Seq: 2, Status: 200, Raw: "HTTP/1.1 200 OK\r\n\r\nok", Body: "ok"},
+		},
+	}
+	d.record(&cfg.Jobs[0], 1, res, nil, false)
+
+	feedback := ""
+	for _, line := range strings.Split(strings.TrimSpace(audit.String()), "\n") {
+		if strings.Contains(line, `"orchestrator_state":"StateFeedback"`) {
+			feedback = line
+		}
+	}
+	if feedback == "" {
+		t.Fatalf("paired exchange lost its feedback line: %s", audit.String())
+	}
+	for _, want := range []string{`"reward":-0.1`, `"beta_delta":0.1`, `"reason":"parser_reject"`} {
+		if !strings.Contains(feedback, want) {
+			t.Fatalf("feedback %q is missing %s", feedback, want)
+		}
+	}
+}
+
+func TestExploreRollDoesNotReuseStaleFSMAction(t *testing.T) {
+	cfg := testConfig(testJob())
+	audit := &bytes.Buffer{}
+	d, err := New(cfg, &fakeExec{}, nil, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := d.EnableOrchestrator()
+	if _, err := orch.GetBestAction(orchestratorTestProfile()); err != nil {
+		t.Fatal(err)
+	}
+	job := cfg.Jobs[0]
+	d.applyLearningWithRoll(&job, explorationRoll{explore: true})
+	if action := orch.LastAction(); action.Mutation != "" || action.TLSFingerprint != "" {
+		t.Fatalf("explore roll kept a stale FSM action: %+v", action)
+	}
+
+	res := &probe.Result{
+		Probe:    "smuggle-chain",
+		Duration: 5 * time.Millisecond,
+		Responses: []probe.Response{{
+			Seq: 1, Status: 400, Raw: "HTTP/1.1 400 Bad Request\r\n\r\nbad", Body: "bad",
+		}},
+	}
+	d.record(&job, 1, res, nil, false)
+	if strings.Contains(audit.String(), `"orchestrator_state":"StateFeedback"`) {
+		t.Fatalf("an explore roll with no FSM action emitted feedback: %s", audit.String())
 	}
 }
 
@@ -248,5 +447,34 @@ func TestOrchestratorMinimizeAndReport(t *testing.T) {
 	}
 	if _, err := orch.Mutate(context.Background(), action, raw, allowAllScope{}, "lab.test:443"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOrchestratorSonarIsPerPairAndNeedsWarmup(t *testing.T) {
+	var audit bytes.Buffer
+	orch := NewOrchestrator(&ExperienceProvider{Store: orchestratorTestStore()}, &audit)
+	if err := orch.StartRecon(orchestratorTestProfile()); err != nil {
+		t.Fatal(err)
+	}
+	observe := func(host, proxy string, latency float64) probe.SignalQuality {
+		orch.ObserveExchange(probe.SignalQuality{
+			Host: host, Proxy: proxy, Status: http.StatusOK,
+			LatencyMS: latency, NCD: 0.1, Entropy: 0.5,
+		})
+		return orch.signal
+	}
+
+	for i := 0; i < int(probe.SonarMinSamples); i++ {
+		got := observe("hostA", "proxy1", 10)
+		if got.ZScore != 0 || !got.Uncalibrated {
+			t.Fatalf("sample %d: z=%v uncalibrated=%v, want 0/true", i+1, got.ZScore, got.Uncalibrated)
+		}
+	}
+	if got := observe("hostA", "proxy1", 10.5); got.Uncalibrated || math.Abs(got.ZScore) > 100 {
+		t.Fatalf("calibrated z=%v uncalibrated=%v", got.ZScore, got.Uncalibrated)
+	}
+	// A different pair must not inherit hostA/proxy1's tiny variance.
+	if got := observe("hostB", "proxy2", 5000); got.ZScore != 0 || !got.Uncalibrated {
+		t.Fatalf("pair switch produced a huge Z: z=%v uncalibrated=%v", got.ZScore, got.Uncalibrated)
 	}
 }

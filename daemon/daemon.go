@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,9 @@ type Daemon struct {
 	// ui carries the optional transport/scope context used by the embedded
 	// dashboard registered on the control server.
 	ui omnislash.UIOptions
+	// redirect is built from ui by SetUI. It resolves root redirect stubs to
+	// the real application path before the byte-exact probes run.
+	redirect *redirectResolver
 }
 
 // New validates cfg and prepares the scheduler. audit may be nil.
@@ -165,6 +169,27 @@ func (d *Daemon) Learn(seeds []ExperienceSeed) {
 func (d *Daemon) SetUI(opts omnislash.UIOptions) {
 	if d != nil {
 		d.ui = opts
+		d.redirect = nil
+		if opts.Pool != nil && opts.Config != nil {
+			dialer := omnislash.NewDialer(opts.Pool, d.log)
+			transport := omnislash.NewRotatingTransport(opts.Pool, dialer, opts.Config.HTTP, d.log)
+			timeout := opts.Config.HTTP.Timeout.Std()
+			if timeout <= 0 {
+				timeout = 5 * time.Second
+			}
+			client := &http.Client{
+				Transport: transport,
+				Timeout:   timeout,
+				// Redirects are resolved one hop at a time so every Location
+				// can be scope-checked before it is dialed.
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			}
+			scope := opts.Scope
+			if scope == nil {
+				scope = opts.Pool.Scope()
+			}
+			d.redirect = newRedirectResolver(client, scope, opts.Config.Scope.AllowHosts, d.log)
+		}
 		d.configureMutation()
 		if d.orchestrator != nil {
 			d.orchestrator.SetCaidoPush(opts.CaidoPush)
@@ -540,11 +565,44 @@ func (d *Daemon) job(name string) *JobConfig {
 	return nil
 }
 
+// resolveProbeTarget walks a short 301/302 chain before the byte-exact probes
+// so a root redirect stub does not receive every diagnostic request. A blocked
+// or unsettled chain leaves the operator's target untouched.
+func (d *Daemon) resolveProbeTarget(ctx context.Context, j *JobConfig, target Target) Target {
+	if d == nil || d.redirect == nil || target.Addr == "" {
+		return target
+	}
+	host := target.Host
+	if host == "" {
+		host = hostFromAddr(target.Addr)
+	}
+	scheme := "https"
+	if j.tlsMode() == "none" {
+		scheme = "http"
+	}
+	path := target.Path
+	if path == "" {
+		path = "/"
+	}
+	start := &url.URL{Scheme: scheme, Host: host, Path: path}
+	settled := d.redirect.Resolve(ctx, start)
+	if settled == nil || settled.Path == "" || settled.Path == path {
+		return target
+	}
+	out := target
+	out.Path = settled.Path
+	if d.log != nil {
+		d.log.Debug("redirect target resolved", "job", j.Name, "from", path, "to", out.Path)
+	}
+	return out
+}
+
 func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 	target, err := j.target()
 	if err != nil {
 		return Outcome{Job: j.Name, Err: err}
 	}
+	target = d.resolveProbeTarget(ctx, j, target)
 	host := target.Host
 	if host == "" {
 		host = hostFromAddr(target.Addr)
@@ -713,6 +771,11 @@ func (d *Daemon) applyLearningWithRoll(j *JobConfig, roll explorationRoll) JobCo
 			if len(candidates) > 0 {
 				c.Variant = d.exploreStrings(candidates)[0]
 			}
+		}
+		if d.orchestrator != nil {
+			// No GetBestAction ran for this roll: without clearing, record()
+			// would attribute the result to the previous job's action.
+			d.orchestrator.ClearLastAction()
 		}
 		return c
 	}
@@ -945,6 +1008,12 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 		state, ok := parserStateOf(rec.ParserDivergence)
 		if !ok && rec.Outcome == string(OutcomeEngineFault) {
 			state, ok = probe.ParserEngineFault, true
+		}
+		if !ok {
+			// No registered parser verdict still completes an FSM branch.
+			// SyncOK carries the scalar status/NCD/Z evidence into RewardFor,
+			// so a 400 reject or a quiet redirect cannot be dropped silently.
+			state, ok = probe.ParserSyncOK, true
 		}
 		action := d.orchestrator.LastAction()
 		if ok && action.TLSFingerprint != "" && action.Mutation != "" {

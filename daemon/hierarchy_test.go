@@ -103,8 +103,16 @@ func TestRewardCurrencyAndPhaseGating(t *testing.T) {
 		t.Fatalf("WAF reward = %+v, want -0.5 / beta+0.5 / stop", waf)
 	}
 	reject := RewardFor(probe.SyncOK, probe.SignalQuality{Status: 400})
-	if reject.Value != 0.1 || !reject.Boundary {
-		t.Fatalf("parser reject reward = %+v, want +0.1 and boundary permission", reject)
+	if reject.Value != -0.1 || reject.BetaDelta != 0.1 || !reject.Stop {
+		t.Fatalf("parser reject reward = %+v, want -0.1 / beta+0.1 / stop", reject)
+	}
+	redirect := RewardFor(probe.SyncOK, probe.SignalQuality{Status: 302})
+	if redirect.Value != -0.15 || redirect.BetaDelta != 0.15 {
+		t.Fatalf("quiet redirect reward = %+v, want -0.15 / beta+0.15", redirect)
+	}
+	shifted := RewardFor(probe.SyncOK, probe.SignalQuality{Status: 301, StatusShift: true})
+	if shifted.Value != 0 {
+		t.Fatalf("a redirect with a status shift must not take the quiet penalty: %+v", shifted)
 	}
 	strong := probe.SignalQuality{Status: 502, NCD: 0.9, Entropy: 0.5, ZScore: 3, StatusShift: true}
 	confirmed := RewardFor(probe.FEClosedBEWaiting, strong)

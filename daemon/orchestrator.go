@@ -197,6 +197,7 @@ type OrchestratorEvent struct {
 	From             OrchestratorState `json:"from_state,omitempty"`
 	State            OrchestratorState `json:"orchestrator_state"`
 	Host             string            `json:"host,omitempty"`
+	Proxy            string            `json:"proxy,omitempty"`
 	Probe            string            `json:"probe,omitempty"`
 	Attempt          int               `json:"attempt,omitempty"`
 	ChosenTLS        string            `json:"chosen_tls,omitempty"`
@@ -210,9 +211,14 @@ type OrchestratorEvent struct {
 	AlphaDelta float64           `json:"alpha_delta,omitempty"`
 	BetaDelta  float64           `json:"beta_delta,omitempty"`
 	Posterior  string            `json:"posterior_key,omitempty"`
-	NCD        float64           `json:"ncd,omitempty"`
-	Entropy    float64           `json:"entropy,omitempty"`
-	ZScore     float64           `json:"zscore,omitempty"`
+	// NCD and ZScore are always serialized: online_loop needs both scalars on
+	// the feedback line even when the measured value is exactly zero.
+	NCD     float64 `json:"ncd"`
+	Entropy float64 `json:"entropy,omitempty"`
+	ZScore  float64 `json:"zscore"`
+	// Uncalibrated is emitted on every feedback line: a zero Z before the
+	// pair collected SonarMinSamples samples is not a calibrated "no shift".
+	Uncalibrated bool `json:"uncalibrated"`
 }
 
 // CaidoPushFunc has the same shape as UIOptions.CaidoPush.
@@ -259,7 +265,7 @@ type Orchestrator struct {
 
 	// Operational loop: O(1) telemetry and posterior state. No network call and
 	// no unbounded sample history is owned here.
-	sonar          probe.Welford
+	sonar          *probe.SonarTracker
 	signal         probe.SignalQuality
 	baseline       []byte
 	baselineSet    bool
@@ -288,6 +294,9 @@ func NewOrchestrator(provider LearningProvider, audit io.Writer) *Orchestrator {
 		// A nil rng uses the global concurrency-safe source. SetRNG installs a
 		// seeded source for reproducible tests and audits.
 		posterior: make(map[string]*BetaCell),
+		// Per-pair Welford state: a new host or exit proxy starts
+		// uncalibrated instead of inheriting another pair's variance.
+		sonar: probe.NewSonarTracker(probe.DefaultSonarSlots, probe.SonarMinSamples),
 	}
 }
 
@@ -338,11 +347,20 @@ func (o *Orchestrator) ObserveExchange(signal probe.SignalQuality) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.observed = true
-	if signal.LatencyMS > 0 {
+	host := signal.Host
+	if host == "" {
+		host = o.profile.Host
+	}
+	if host == "" {
+		host = hostFromAddr(o.profile.Addr)
+	}
+	proxy := signal.Proxy
+	if signal.LatencyMS > 0 && o.sonar != nil {
+		z, uncalibrated := o.sonar.Evaluate(host, proxy, signal.LatencyMS, probe.DefaultMinSigmaMS)
 		if signal.ZScore == 0 {
-			signal.ZScore = o.sonar.ZScore(signal.LatencyMS, probe.DefaultMinSigmaMS)
+			signal.ZScore = z
 		}
-		o.sonar.Observe(signal.LatencyMS)
+		signal.Uncalibrated = uncalibrated
 	}
 	if !o.baselineSet && signal.Status > 0 {
 		o.baselineStatus = signal.Status
@@ -370,9 +388,25 @@ func (o *Orchestrator) ObserveResult(res *probe.Result) {
 	last := res.Responses[len(res.Responses)-1]
 	o.mu.Lock()
 	baselineStatus := o.baselineStatus
+	host := o.profile.Host
+	if host == "" {
+		host = hostFromAddr(o.profile.Addr)
+	}
 	o.mu.Unlock()
+	// A parser rejection anywhere in the paired exchange is the decisive
+	// verdict for this mutation. Taking only the final status would hide a
+	// 400 -> 200 shift and let the branch keep its posterior weight.
+	status := last.Status
+	for _, r := range res.Responses {
+		if r.Status == 400 {
+			status = 400
+			break
+		}
+	}
 	signal := probe.SignalQuality{
-		Status:      last.Status,
+		Status:      status,
+		Host:        host,
+		Proxy:       res.Attribution.Proxy,
 		LatencyMS:   float64(res.Duration.Microseconds()) / 1000,
 		NCD:         o.Distance([]byte(last.Raw)),
 		Entropy:     probe.NormalizedEntropy([]byte(last.Body)),
@@ -497,6 +531,18 @@ func (o *Orchestrator) LastAction() AttackAction {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.lastAction
+}
+
+// ClearLastAction marks an attempt that the FSM did not choose. An epsilon
+// explore roll has no FSM branch to close, so its result must not feed back
+// into the posterior through a stale action from the previous job.
+func (o *Orchestrator) ClearLastAction() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.lastAction = AttackAction{}
+	o.mu.Unlock()
 }
 
 // Finding returns a copy of the confirmed finding, if any.
@@ -893,12 +939,13 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 	next := StateAttack
 	reason := reward.Reason
 	phase := PhaseMutateFraming
+	var advanceErr error
 	if promote {
 		next = StateVerify
 		phase = PhaseVerifyVictim
 		reason = "FE_Closed_BE_Waiting confirmed by sonar"
 		o.mu.Lock()
-		advanceErr := o.advance(phase)
+		advanceErr = o.advance(phase)
 		o.failures = 0
 		o.finding = probe.Finding{
 			Kind:       "desync_confirmed",
@@ -906,9 +953,6 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 			Detail:     "FSM classified the exchange as frontend closed / backend waiting",
 		}
 		o.mu.Unlock()
-		if advanceErr != nil {
-			return advanceErr
-		}
 	} else {
 		o.mu.Lock()
 		o.failures++
@@ -927,8 +971,13 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 		}
 	}
 
+	proxy := signal.Proxy
+	if proxy == "" {
+		proxy = action.Proxy
+	}
 	feedback := OrchestratorEvent{
 		Host:             host,
+		Proxy:            proxy,
 		Probe:            action.Probe,
 		Attempt:          action.Attempt,
 		ChosenTLS:        action.TLSFingerprint,
@@ -943,6 +992,7 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 		NCD:              signal.NCD,
 		Entropy:          signal.Entropy,
 		ZScore:           signal.ZScore,
+		Uncalibrated:     signal.Uncalibrated,
 	}
 	o.transition(StateFeedback, feedback)
 	// Only the feedback line carries the reward. Reusing it on the following
@@ -956,7 +1006,9 @@ func (o *Orchestrator) RecordOutcome(action AttackAction, state probe.ParserStat
 	followup.Entropy = 0
 	followup.ZScore = 0
 	o.transition(next, followup)
-	return nil
+	// A failed phase advance is reported only after the feedback line is
+	// emitted: every completed branch must hand its scalars to the learner.
+	return advanceErr
 }
 
 func outcomeForSignal(state probe.ParserState, signal probe.SignalQuality) (OutcomeLabel, bool) {
