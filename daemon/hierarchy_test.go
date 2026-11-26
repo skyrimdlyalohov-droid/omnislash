@@ -122,6 +122,13 @@ func TestRewardCurrencyAndPhaseGating(t *testing.T) {
 	if RewardFor(probe.ParserEngineFault, strong).AlphaDelta != 0 {
 		t.Fatal("an engine fault must never move the posterior")
 	}
+	timing := RewardFor(probe.TimingDesync, probe.SignalQuality{ZScore: probe.SignalZThreshold + 0.5})
+	if timing.Value != 0.25 || timing.AlphaDelta != 0.25 || timing.Elite {
+		t.Fatalf("timing reward = %+v, want +0.25 / alpha+0.25 / not elite", timing)
+	}
+	if RewardFor(probe.TimingDesync, probe.SignalQuality{ZScore: 0}).Value != 0 {
+		t.Fatal("an uncalibrated timing verdict must not move the posterior")
+	}
 
 	var audit bytes.Buffer
 	orch := NewOrchestrator(&ExperienceProvider{Store: orchestratorTestStore()}, &audit)

@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"time"
 
@@ -164,11 +165,11 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 				}
 			}
 			_, resid := kalman.Update(float64(cleanTTFB.Microseconds()) / 1000.0)
-			cleanSonar.Observe(resid)
+			cleanSonar.ObserveSigned(resid)
 		}
 		if mutResp != nil {
 			_, resid := kalman.Update(float64(mutTTFB.Microseconds()) / 1000.0)
-			mutSonar.Observe(resid)
+			mutSonar.ObserveSigned(resid)
 			// Simple differential signal: status change or large TTFB residual gap.
 			if cleanResp != nil && cleanResp.Status != mutResp.Status {
 				e.addFinding(Finding{Kind: "differential_status", Confidence: ConfidenceMedium, Detail: fmt.Sprintf("mutation=%s clean=%d mutated=%d", mutationName, cleanResp.Status, mutResp.Status), Response: mutResp.Seq})
@@ -179,15 +180,31 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 		_ = mutation
 	}
 
-	if cleanSonar.Count() > 0 && mutSonar.Count() > 0 {
-		z := (mutSonar.Mean() - cleanSonar.Mean()) / mutSonar.StdDev(DefaultMinSigmaMS)
-		e.addFinding(Finding{Kind: "differential_ttfb", Confidence: ConfidenceLow,
-			Detail: fmt.Sprintf("clean_residual_ms=%.3f mutated_residual_ms=%.3f z=%.3f", cleanSonar.Mean(), mutSonar.Mean(), z)})
+	if z, detail, ok := timingDesyncFinding(&cleanSonar, &mutSonar); ok {
+		e.addFinding(Finding{Kind: "differential_ttfb", Confidence: ConfidenceLow, Detail: detail})
+		// A jitter-gated residual gap is a timing-only desync signal. It is
+		// recorded separately so the byte-level parser FSM can still win with a
+		// stronger verdict, but it is never silently discarded.
+		if math.Abs(z) >= SignalZThreshold {
+			e.addFinding(Finding{Kind: string(ParserTimingDesync), Confidence: ConfidenceMedium, Detail: detail})
+			e.res.TimingDivergence = string(ParserTimingDesync)
+		}
 	}
 	if len(e.res.Findings) == 0 {
 		e.addFinding(Finding{Kind: "differential_no_signal", Confidence: ConfidenceLow, Detail: "no status/neighbor shift detected"})
 	}
 	return e.finish(), nil
+}
+
+// timingDesyncFinding compares the clean and mutated Kalman residual streams.
+// A pair without valid samples on either side carries no timing evidence.
+func timingDesyncFinding(clean, mutated *Welford) (z float64, detail string, ok bool) {
+	if clean == nil || mutated == nil || clean.Count() == 0 || mutated.Count() == 0 {
+		return 0, "", false
+	}
+	z = (mutated.Mean() - clean.Mean()) / mutated.StdDev(DefaultMinSigmaMS)
+	detail = fmt.Sprintf("clean_residual_ms=%.3f mutated_residual_ms=%.3f z=%.3f", clean.Mean(), mutated.Mean(), z)
+	return z, detail, true
 }
 
 func buildCleanRequest(target Target) []byte {

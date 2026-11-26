@@ -110,6 +110,108 @@ func TestMutationConnEscalatesDesyncToFinding(t *testing.T) {
 	}
 }
 
+func TestRefusedMutationIsNotAParserDesync(t *testing.T) {
+	t.Setenv("OMNISLASH_PANIC_AUDIT", t.TempDir()+"/panic_audit.log")
+
+	conn := &mutationTestConn{replyConn: replyConn{}}
+	fsm := &ParserStateMachine{RequestHadTE: true}
+	mc := newMutationConn(conn, testMutator(MutationCaseMixing, nil), 2, fsm)
+	// A refused mutation leaves no bytes on the wire. The recorded fault must
+	// outrank an empty answer that would otherwise look like FE_Closed.
+	mc.fault = errors.New("probe: payload contains bare CR or LF")
+
+	res := &Result{}
+	if fault := mc.finish(res, nil); fault == nil {
+		t.Fatal("finish must report the refused mutation")
+	}
+	if res.ParserDivergence != string(EngineFault) {
+		t.Fatalf("parser_divergence = %q, want %q", res.ParserDivergence, EngineFault)
+	}
+}
+
+func TestMutationConnPassesThroughSplitTimingWrite(t *testing.T) {
+	t.Setenv("OMNISLASH_PANIC_AUDIT", t.TempDir()+"/panic_audit.log")
+
+	conn := &mutationTestConn{replyConn: replyConn{data: []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")}}
+	mc := newMutationConn(conn, testMutator(MutationCaseMixing, nil), 2, &ParserStateMachine{})
+	full := []byte("GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n")
+	split := len(full) - 1
+	if _, err := mc.Write(full[:split]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mc.Write(full[split:]); err != nil {
+		t.Fatal(err)
+	}
+	if string(conn.written) != string(full) {
+		t.Fatalf("split write was rewritten: %q", conn.written)
+	}
+
+	buf := make([]byte, 4096)
+	if _, err := mc.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	res := &Result{}
+	if fault := mc.finish(res, nil); fault != nil {
+		t.Fatalf("finish fault = %v", fault)
+	}
+	if res.ParserDivergence != string(SyncOK) {
+		t.Fatalf("parser_divergence = %q, want %q", res.ParserDivergence, SyncOK)
+	}
+}
+
+func TestMutationConnPreservesTimingDesync(t *testing.T) {
+	t.Setenv("OMNISLASH_PANIC_AUDIT", t.TempDir()+"/panic_audit.log")
+
+	conn := &mutationTestConn{replyConn: replyConn{data: []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")}}
+	mc := newMutationConn(conn, testMutator(MutationCaseMixing, nil), 2, &ParserStateMachine{})
+	if _, err := mc.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	if _, err := mc.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+
+	res := &Result{ParserDivergence: string(TimingDesync), TimingDivergence: string(TimingDesync)}
+	if fault := mc.finish(res, nil); fault != nil {
+		t.Fatalf("finish fault = %v", fault)
+	}
+	if res.ParserDivergence != string(TimingDesync) {
+		t.Fatalf("parser_divergence = %q, want %q", res.ParserDivergence, TimingDesync)
+	}
+}
+
+func TestStrongParserVerdictSurvivesFailedConnection(t *testing.T) {
+	t.Setenv("OMNISLASH_PANIC_AUDIT", t.TempDir()+"/panic_audit.log")
+
+	req := []byte("POST /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+	good := &mutationTestConn{replyConn: replyConn{data: []byte(nginxInvalidChunkResponse)}}
+	gmc := newMutationConn(good, testMutator(MutationCaseMixing, nil), 2, &ParserStateMachine{})
+	if _, err := gmc.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, maxMutationFSMBytes)
+	if _, err := gmc.Read(buf); err != nil && !strings.Contains(err.Error(), "reply exhausted") {
+		t.Fatal(err)
+	}
+	res := &Result{}
+	if fault := gmc.finish(res, nil); fault != nil {
+		t.Fatalf("first finish fault = %v", fault)
+	}
+	if res.ParserDivergence != string(FEClosedBEWaiting) {
+		t.Fatalf("first verdict = %q", res.ParserDivergence)
+	}
+
+	bad := &mutationTestConn{replyConn: replyConn{}}
+	bmc := newMutationConn(bad, testMutator(MutationCaseMixing, nil), 2, &ParserStateMachine{})
+	if fault := bmc.finish(res, nil); fault != nil {
+		t.Fatalf("second finish fault = %v", fault)
+	}
+	if res.ParserDivergence != string(FEClosedBEWaiting) {
+		t.Fatalf("aggregated verdict = %q, want %q", res.ParserDivergence, FEClosedBEWaiting)
+	}
+}
+
 func TestMutationConnNeverRewritesBinaryFrames(t *testing.T) {
 	conn := &mutationTestConn{replyConn: replyConn{data: []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")}}
 	mc := newMutationConn(conn, testMutator(MutationChunkExtensions, nil), 2, &ParserStateMachine{})
@@ -128,6 +230,7 @@ func TestParserStateStringValues(t *testing.T) {
 		FEClosedBEWaiting: "FE_Closed_BE_Waiting",
 		WAFBlocked:        "WAF_Blocked",
 		EngineFault:       "Engine_Fault",
+		TimingDesync:      "Timing_Desync",
 	}
 	for state, label := range want {
 		if string(state) != label {

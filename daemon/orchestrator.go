@@ -1024,6 +1024,10 @@ func outcomeForParserState(state probe.ParserState) (OutcomeLabel, bool) {
 		return OutcomeTargetResponse, true
 	case probe.WAFBlocked:
 		return OutcomeWAFBlocked, false
+	case probe.TimingDesync:
+		// Timing alone is not a confirmed queue desync: it trains the branch
+		// but never advances the FSM to VERIFY on its own.
+		return OutcomeTargetResponse, false
 	case probe.SyncOK:
 		return OutcomeTargetResponse, false
 	default:
@@ -1331,7 +1335,7 @@ func orchestratorProfile(j *JobConfig, tlsCandidates []string) TargetProfile {
 // is not a verdict and callers must skip feedback for it.
 func parserStateOf(value string) (probe.ParserState, bool) {
 	switch probe.ParserState(value) {
-	case probe.ParserSyncOK, probe.ParserFEClosedBEWaiting, probe.ParserWAFBlocked, probe.ParserEngineFault:
+	case probe.ParserSyncOK, probe.ParserFEClosedBEWaiting, probe.ParserWAFBlocked, probe.ParserEngineFault, probe.ParserTimingDesync:
 		return probe.ParserState(value), true
 	default:
 		return "", false

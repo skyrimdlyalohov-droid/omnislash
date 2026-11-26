@@ -19,6 +19,10 @@ const (
 	ParserFEClosedBEWaiting ParserState = "FE_Closed_BE_Waiting"
 	ParserWAFBlocked        ParserState = "WAF_Blocked"
 	ParserEngineFault       ParserState = "Engine_Fault"
+	// ParserTimingDesync is a timing-only verdict from differential pairs. It
+	// is deliberately weaker than a byte-level parser desync and never promotes
+	// a branch to CONFIRMED on its own.
+	ParserTimingDesync ParserState = "Timing_Desync"
 
 	// Short aliases used by callers and by the finding that escalates a
 	// confirmed desync.
@@ -26,6 +30,7 @@ const (
 	FEClosedBEWaiting = ParserFEClosedBEWaiting
 	WAFBlocked        = ParserWAFBlocked
 	EngineFault       = ParserEngineFault
+	TimingDesync      = ParserTimingDesync
 )
 
 const maxParserScanBytes = 4 << 20
@@ -42,8 +47,10 @@ type ParserStateMachine struct {
 }
 
 // AnalyzeDivergence returns one of SyncOK, FE_Closed_BE_Waiting, WAF_Blocked
-// or Engine_Fault. It never dials, never parses with net/http and never reads
-// beyond the bytes it was given.
+// or Engine_Fault. Timing_Desync is not produced here: it needs paired TTFB
+// evidence and is supplied by the differential-fuzz probe instead. The method
+// never dials, never parses with net/http and never reads beyond the bytes it
+// was given.
 func (m *ParserStateMachine) AnalyzeDivergence(rawResponse []byte, err error) ParserState {
 	if m == nil {
 		return ParserEngineFault

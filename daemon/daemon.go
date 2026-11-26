@@ -964,6 +964,14 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 		// A registered FSM verdict must never be lost between the runner and
 		// the audit line, even when the result came from a test executor.
 		rec.ParserDivergence = res.ParserDivergence
+		// A timing-only differential verdict is promoted only when the byte
+		// FSM has no stronger result. Keeping both in sync makes the FSM feed
+		// and the audit line agree on what was observed.
+		if res.TimingDivergence == string(probe.ParserTimingDesync) &&
+			(rec.ParserDivergence == "" || rec.ParserDivergence == string(probe.ParserSyncOK)) {
+			rec.ParserDivergence = res.TimingDivergence
+			res.ParserDivergence = rec.ParserDivergence
+		}
 		if res.ParserDivergence == string(probe.FEClosedBEWaiting) {
 			hasDesync := false
 			for _, f := range res.Findings {

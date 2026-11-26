@@ -71,6 +71,12 @@ func RewardFor(state probe.ParserState, signal probe.SignalQuality) Reward {
 		// signal informative but stop spending budget on the same mutation.
 		return Reward{Value: -0.1, BetaDelta: 0.1, Stop: true, Reason: "parser_reject"}
 	}
+	if state == probe.ParserTimingDesync {
+		if math.Abs(signal.ZScore) >= probe.SignalZThreshold {
+			return Reward{Value: 0.25, AlphaDelta: 0.25, Reason: "timing_desync"}
+		}
+		return Reward{Value: 0, Reason: "timing_noise"}
+	}
 	if quietRedirect(signal) {
 		// A clean 301/302 without a status shift carries no queue evidence.
 		return Reward{Value: -0.15, BetaDelta: 0.15, Reason: "redirect_no_shift"}

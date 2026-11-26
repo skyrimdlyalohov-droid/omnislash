@@ -527,6 +527,13 @@ func (c *mutationConn) Write(p []byte) (int, error) {
 	}
 	c.mu.Unlock()
 
+	// A timing probe releases the final LF in a separate write. The first
+	// fragment ends with a bare CR, which is not a complete HTTP payload and
+	// must never be rewritten: the second fragment still belongs to it.
+	if len(p) == 0 || p[len(p)-1] != '\n' || !validCRLF(p) {
+		return c.Conn.Write(p)
+	}
+
 	mutated, err := safeMutate(c.mut, p, c.seed)
 	if err != nil {
 		c.mu.Lock()
@@ -563,6 +570,26 @@ func (c *mutationConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// parserStateRank orders verdicts for multi-connection aggregation. A successful
+// or target-derived answer outranks a local fault from another socket; a timing
+// verdict outranks a plain SyncOK but never a byte-level parser state.
+func parserStateRank(state ParserState) int {
+	switch state {
+	case ParserFEClosedBEWaiting:
+		return 5
+	case ParserWAFBlocked:
+		return 4
+	case ParserTimingDesync:
+		return 3
+	case ParserSyncOK:
+		return 2
+	case ParserEngineFault:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // finish is called once per probe run. It stores the FSM verdict on Result and
 // escalates FE_Closed_BE_Waiting to a high-confidence desync finding.
 func (c *mutationConn) finish(res *Result, runErr error) error {
@@ -591,12 +618,23 @@ func (c *mutationConn) finish(res *Result, runErr error) error {
 	if observedErr == nil {
 		observedErr = readErr
 	}
+	// A refused mutation means no bytes reached the wire. An empty response in
+	// that case is a local correctness failure, never FE_Closed_BE_Waiting.
+	if fault != nil {
+		observedErr = errors.Join(observedErr, fault)
+	}
 	state, analyzeFault := safeAnalyze(&local, raw, observedErr)
 	if analyzeFault != nil {
 		fault = errors.Join(fault, analyzeFault)
 	}
 	if res != nil {
-		res.ParserDivergence = string(state)
+		// Multi-connection probes share one Result. A failed socket must not
+		// erase a real verdict observed on another connection: aggregate by
+		// evidence strength, with a local engine fault as the weakest state.
+		current := ParserState(res.ParserDivergence)
+		if res.ParserDivergence == "" || parserStateRank(state) > parserStateRank(current) {
+			res.ParserDivergence = string(state)
+		}
 		switch state {
 		case ParserFEClosedBEWaiting:
 			addFindingOnce(res, Finding{

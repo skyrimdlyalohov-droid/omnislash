@@ -93,6 +93,9 @@ type Result struct {
 	// ParserDivergence is the FSM verdict for the last exchange. It is copied
 	// into the daemon's JSONL record as "parser_divergence".
 	ParserDivergence string `json:"parser_divergence,omitempty"`
+	// TimingDivergence carries a timing-only verdict from paired TTFB samples.
+	// The daemon promotes it only when no stronger byte-level verdict exists.
+	TimingDivergence string `json:"timing_divergence,omitempty"`
 }
 
 // Burst describes how a batch of requests was emitted. A single-packet attack

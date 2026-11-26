@@ -24,9 +24,21 @@ type Welford struct {
 	m2   float64
 }
 
-// Observe folds one TTFB sample into the accumulator.
+// Observe folds one TTFB sample into the accumulator. Latencies cannot be
+// negative; a negative value is a local measurement fault, not target evidence.
 func (w *Welford) Observe(ms float64) {
-	if w == nil || math.IsNaN(ms) || math.IsInf(ms, 0) || ms < 0 {
+	w.observe(ms, false)
+}
+
+// ObserveSigned folds a signed deviation into the accumulator. Kalman residual
+// series are centered around zero, so negative residuals are valid samples and
+// must not be discarded as if they were negative latencies.
+func (w *Welford) ObserveSigned(ms float64) {
+	w.observe(ms, true)
+}
+
+func (w *Welford) observe(ms float64, signed bool) {
+	if w == nil || math.IsNaN(ms) || math.IsInf(ms, 0) || (ms < 0 && !signed) {
 		return
 	}
 	w.n++
