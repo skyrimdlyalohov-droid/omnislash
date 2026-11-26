@@ -1,81 +1,301 @@
 # Omnislash
 
-**Platform for controlled, verifiable HTTP desync research.**
+**Платформа для управляемых и проверяемых исследований HTTP-десинхронизации.**
 
-Omnislash is an AppSec research platform, not a stealth scanner. It gives a
-probe author a byte-exact, attributable socket: the proxy is pinned before the
-handshake, the ClientHello is explicit, and every response is recorded as
-evidence. The learning loop only reorders techniques an operator already
-declared.
+Omnislash — не «сканер уязвимостей» и не инструмент обхода WAF. Это транспорт
+и каркас экспериментов для AppSec-исследований: он даёт автору пробы байт-точный,
+атрибутированный сокет, а каждое наблюдение превращает в проверяемое доказательство.
+Цель — чтобы результат опыта можно было объяснить разбором HTTP, а не утечкой
+реального IP, детерминированным `ClientHello` на Go или молчаливой нормализацией
+запроса промежуточным прокси.
 
-The core is stdlib Go plus refraction-utls; the research loop is stdlib Python.
-There is no Docker, Node.js, npm or CDN dependency, and the learning loop never
-calls the network. The rules are in [MANIFESTO.md](MANIFESTO.md); invariants and
-negative tests are in [ARCHITECTURE.md](ARCHITECTURE.md).
+Ядро написано на стандартной библиотеке Go плюс `refraction-utls`, `rawhttp` и
+`x/net/http2`. Обучающий контур — на стандартной библиотеке Python. Нет Docker,
+Node.js, npm и CDN; обучающий контур вообще не обращается к сети. Правила
+описаны в [MANIFESTO.md](MANIFESTO.md), инварианты и отрицательные тесты — в
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Safety Gates
+---
 
-Read this before running anything. These are enforced controls, not advice.
+## 1. Что это такое
 
-1. **Authorized targets only.** Use your own lab instances. Examples use
-   `LAB-ID` placeholders — replace them with your lab ID, never with a public
-   hostname. OSINT modules are intelligence-only; they never auto-attack what
-   they find.
-2. **Fail-closed egress.** `allow_direct: false` by default and forbidden in
-   `trust_tier: strict`. A dead proxy fails the experiment; there is no silent
-   direct fallback.
-3. **Scope before dial.** An explicit scope file (`--scope-file`) or
-   `scope.allow_hosts` is mandatory for unattended runs. Hosts are resolved
-   locally, all addresses are checked, and a checked IP is pinned into CONNECT.
-   Out-of-scope targets get `403` without a dial.
-4. **The transport owns the socket.** A probe receives an already dialed
-   `net.Conn`. No `net.Dial`, no `http.Client`, no `net/http` request writer
-   inside `probe/`. One experiment uses one pinned session and one exit IP.
-5. **Evidence before verdicts.** `unverified` is a quarantine label. Only
-   cross-proxy-verified target responses can become executable strike jobs; two
-   independent attributed exits are required. WAF pages and parser rejections
-   are weak negative evidence; proxy failures do not train at all.
-6. **No evasion claims.** TLS fingerprint rotation exists for protocol
-   reproducibility across intermediaries, not anonymity. We do not build or
-   document WAF/IDS evasion.
-7. **Local-only control plane.** Gateway, stats, dashboard and the semantic
-   skeleton service bind to loopback. Audit lines carry attribution and
-   evidence, not credentials or secrets.
+Коротко: **omnislash владеет сокетом, пробы владеют логикой**.
 
-## Architecture
+- `Dialer` / `Session` выбирают один прокси **до** handshake и закрепляют его за
+  экспериментом на время TTL. Опыт = один выходной IP.
+- `probe/` получает уже установленный `net.Conn`, сам пишет байты через
+  `conn.Write` и сам читает ответ. Внутри проб нет `net.Dial`, `net/http` и
+  `http.Client`.
+- `omnislashd` планирует задания из JSON, выполняет попытки, пишет JSONL-аудит
+  и (опционально) передаёт наблюдения в обучающий контур.
+- `research/online_loop.py` читает аудит с сохранённого offset, обновляет веса и
+  публикует кандидатов. Он не придумывает новые приёмы: только переставляет
+  уже объявленные оператором варианты, мутации и длины.
+- Локальный шлюз `omnislash serve` поднимает loopback CONNECT-прокси и дашборд.
+  Он не является открытым прокси.
+
+Отсюда три обещания, на которых всё держится:
+
+1. **Байты на проводе == байты, которые собрала проба.**
+2. **Один опыт == один прокси == один атрибутированный выход.**
+3. **Вердикт слабее доказательства:** сначала сырой обмен, потом классификация.
+
+---
+
+## 2. Как это работает
 
 ```text
- target scope file / LAB-ID allowlist
-                 │
- proxy lists ──> scrape ──> admission (CONNECT + TLS + N-byte echo)
-                 │                     │
-                 └──────────────> verified pool ──> Dialer ──> Session (pinned)
-                                                                  │
-                                      utls handshake on the proxy-dialed conn
-                                                                  │
-                                raw net.Conn ──> probe/ (byte-exact writes)
-                                                                  │
-                                              JSONL audit ──> online loop
-                                                                  │
-                                          weights / hypotheses / candidates
-                                                                  │
-                                   two verified exits ──> strike job (optional)
+источники прокси
+      │
+      ▼
+scrape → admission (CONNECT + TLS + эхо N байт / проверка конфликтующего фрейминга)
+      │
+      ▼
+проверенный пул → Dialer → Session (один выход на TTL)
+                              │
+                     utls-handshake на уже
+                     установленном proxy-соединении
+                              │
+                     сырой net.Conn → probe/
+                              │
+                     JSONL-аудит + Attribution
+                              │
+                     online_loop.py → веса / кандидаты
+                              │
+             (опционально) top-level FSM → следующий выбор мутации
 ```
 
-The declared job is immutable: each attempt works on a copy. Learning may
-reorder variants, mutations and declared framing lengths; it cannot invent a
-probe, a payload or a finding.
+### 2.1. Транспорт
 
-## Quick start (no Docker)
+| Компонент | Что делает |
+|---|---|
+| `Pool` | Держит прокси, проверяет их доступность, применяет strategy и cooldown. |
+| `Dialer` | Создаёт `Session`, никогда не делает fallback на прямой dial. |
+| `Session` | Один выбранный прокси на TTL; после истечения — `ErrSessionExpired`. |
+| `Admission` | Отсекает прокси, которые буферизуют, переписывают фрейминг, роняют соединение или подменяют сертификат. |
+| `Scope` | Fail-closed allowlist; проверка до обращения к прокси, локальное разрешение имён. |
+| `UIOptions` / `Stats` | Локальные JSON-поверхности, дашборд и кнопки управления обучением. |
+
+Ключевые инварианты:
+
+- `allow_direct: false` по умолчанию; в `trust_tier: strict` прямой выход запрещён.
+- Прокси, который умер после CONNECT, даёт ошибку соединения, а не тихий прямой запрос.
+- Адреса из scope проверяются локально; приватные и metadata-адреса запрещены.
+- Проверенный IP закрепляется в CONNECT; `ProxyOf(conn)` возвращает метку прокси и после TLS-handshake.
+- Fingerprint-профили (`chrome_133`, `safari_ios`, `okhttp`, …) задаются явно; неизвестное имя — ошибка конфигурации, а не молчаливый fallback. Это контроль воспроизводимости, а не анонимность.
+
+### 2.2. Слой проб
+
+Проба получает `net.Conn`, поэтому она физически не может «половину запроса
+отправить с одного IP, а вторую — с другого». Библиотеки всё ещё делают тяжёлую
+работу, но не получают сокет: `rawhttp` рендерит строки запроса и дубли/
+обфускацию заголовков в `bytes.Buffer`, `x/net/http2` + `hpack` кодируют кадры H2.
+
+`Result` хранит доказательства, а не только verdict:
+
+| Поле | Смысл |
+|---|---|
+| `Attribution` | Метка прокси и проверенный exit IP, снятые с самого соединения. |
+| `Exchanges` | Каждая запись `conn.Write` с байтами. |
+| `Responses` | Статус/заголовки/тело и точные сырые байты ответа. |
+| `Payloads` | Отдельные запросы внутри burst. |
+| `Burst` | Сколько запросов/байт/записей и в каком режиме отправлено. |
+| `Findings` | Эвристики с явной уверенностью `low` / `medium` / `high`. |
+
+Основные модули:
+
+| Модуль | Назначение |
+|---|---|
+| `SmugglingProbe` | `cl.te`, `te.cl`, `te.te`, `h2.downgrade`; один вариант на соединение. |
+| `SmuggleChainProbe` | CL.TE-префикс на одном сокете, victim — на следующем (front-end закрывает клиентов, back-end-соединение остаётся отравленным). |
+| `DifferentialFuzzProbe` | Парные замеры clean/mutated с jitter-gate и TTFB-остатками. |
+| `RaceProbe` / `H2RaceProbe` | Синхронизация последнего байта / последнего кадра. |
+| `H2TunnelProbe` | CRLF в `:path`, туннелирование HTTP/1.1 через H2, проверка кэша обычным GET. |
+| `GadgetProbe`, `CachePoisonProbe` | Таблица известных расхождений парсеров и проверка отравления кэша. |
+| `RawReplayProbe` | Воспроизведение байт-точного payload из base64/hex. |
+| `WebSocketProbe` | Явный `ErrNotImplemented`: адаптировать handshake с чужим сокетом нельзя. |
+
+Для multimode-проб (например, `SmuggleChainProbe` и `DifferentialFuzzProbe`)
+`Runner` создаёт `ConnSource` из **одной** закреплённой сессии. Все сокеты
+эксперимента принадлежат одному прокси и одному exit IP.
+
+### 2.3. Мутатор: что он меняет и чего не делает
+
+Мутация — **аддитивный opt-in слой**, выключенный по умолчанию:
+
+```json
+"probe": {
+  "max_response_bytes": 2097152,
+  "read_timeout": "10s",
+  "race_read_timeout": "1500ms",
+  "mutation_enabled": true,
+  "mutation_mode": "header_folding"
+}
+```
+
+- Без `probe.mutation_enabled` путь остаётся байт-точным: `Runner.wrapMutation()`
+  возвращает `nil`, и проба пишет свои байты как есть.
+- Демон включает мутации только когда есть `Scope`. Отсутствие guard — отказ до
+  изменения первого байта (`ErrMutationScopeDenied`).
+- `PayloadMutator` меняет **только** значения заголовков или строки размера чанка.
+  Число и позиции всех `\r\n` сохраняются.
+- Базовый payload с «голым» `\r` или `\n` отклоняется: переписывать такой фрейминг
+  значило бы угадывать вместо измерения. Отказ мутации — `Engine_Fault`, но не FE.
+- Split-write TTFB-пробы (финальный LF отправляется отдельной записью) не
+  мутируются: первый фрагмент заканчивается голым CR и не является полным
+  HTTP-сообщением. Флаг `RequestHadTE` при этом сохраняется.
+- Scratch-буферы пула очищаются и возвращаются на каждой ветке; panic в hot path
+  превращается в `util.ErrPrecisionLost`.
+
+Доступные режимы:
+
+| Режим | Что делает |
+|---|---|
+| `header_folding` | OWS внутри CL/TE становится tab или двойной пробел. |
+| `case_mixing` | Случайный регистр имён CL/TE; первая буква переключается всегда. |
+| `chunk_extensions` | Хвостовой hex-параметр в строке размера чанка или в TE. |
+| `boundary_shift` | Направленное изменение CL на ±1 и параметр TE; знак берётся из reward. |
+| `elite_crossover` | Перенос фрейминговых значений из двух подтверждённых паттернов. |
+
+`boundary_shift` и `elite_crossover` выбираются FSM, а не собственным ротатором
+мутатора. Elite-пул хранит максимум два паттерна; мутатор только читает копии
+и никогда не запускает эволюционный цикл сам.
+
+### 2.4. Парсерный FSM и top-level FSM
+
+`ParserStateMachine` классифицирует **сырые** байты ответа с учётом того, был ли
+в запросе `Transfer-Encoding`. Он не использует `net/http` и не читает больше
+переданных байт.
+
+| Состояние | Что означает | Сила |
+|---|---|---|
+| `SyncOK` | Ответ соответствовал ожидаемому фреймингу. | Нейтральный факт. |
+| `FE_Closed_BE_Waiting` | Front-end закрыл соединение, пока back-end ждал тело. | Сильный байт-уровневый verdict. |
+| `WAF_Blocked` | 403/429 с сигнатурой WAF или чистый 429. | Слабое отрицание. |
+| `Timing_Desync` | Только парный TTFB-сигнал. | Слабый verdict, никогда не переводит в `CONFIRMED`. |
+| `Engine_Fault` | Локальный сбой, timeout, precision loss, паника FSM. | Не доказательство цели, не обучает. |
+
+Приоритет при агрегации нескольких соединений (одна попытка, общий `Result`):
+
+```text
+FE_Closed_BE_Waiting > WAF_Blocked > Timing_Desync > SyncOK > Engine_Fault
+```
+
+Это важно: неудачный сокет не стирает настоящий verdict, полученный на другом
+сокете, но и локальный сбой не может выдать себя за десинк.
+
+Верхний FSM включается только флагом:
 
 ```bash
-cp config.example.json config.json            # then narrow scope to your LAB-ID
-make build                                    # bin/omnislash
-make daemon-build                             # bin/omnislashd
-bash lab/e2e_smoke_test.sh                    # offline, loopback only
+./bin/omnislashd -config runs/<lab>/daemon.json -once -orchestrator
 ```
 
-A daemon job for an authorized lab instance:
+Без `-orchestrator` работает обычный аудит и обучающий контур; FSM не запускается.
+
+Strict-переходы:
+
+```text
+INIT → PROBE_BOUNDARY → MUTATE_FRAMING → VERIFY_VICTIM → CONFIRMED
+                                ↑                │
+                                └────неудача verify ─┘
+```
+
+- Переход вперёд без доказательства возвращает `ErrOrchestratorState`.
+- `Timing_Desync` не продвигает FSM в `VERIFY_VICTIM`.
+- `FE_Closed_BE_Waiting` продвигает ветку только при `SignalQuality.Strong()`.
+- Неудачная верификация — это разрешённый back edge в `MUTATE_FRAMING`, а не пропуск фазы.
+
+### 2.5. Дифференциальные замеры
+
+`DifferentialFuzzProbe`:
+
+1. Прогоняет jitter-gate (5 ping-замеров через ту же сессию). Если IQR выше
+   порога, попытка завершается с `jitter_gate_reject` и не даёт verdict.
+2. На каждую пару открывает **свежее соединение** через тот же `ConnSource`:
+   clean-запрос и мутированный запрос. Порядок пар перемешивается.
+3. Замеряет TTFB, прогоняет остатки через фильтр Калмана и накапливает
+   **знаковые** остатки в `Welford.ObserveSigned` (знак важен: «быстрее» и
+   «медленнее» — разные сигналы).
+4. Сравнивает clean-ответ с базовой линией по статусу и NCD; при структурном
+   сдвиге рано останавливается (`neighbor_shift`).
+5. Считает `z = (mean_mutated - mean_clean) / std_mutated` и при
+   `|z| >= SignalZThreshold` (2.0) добавляет `Timing_Desync`.
+
+Практический урок: в прогонах с raw mutation оставляли только
+`cl_te_duplicate` и `te_obfuscation`, чтобы не смешивать разные сигнатуры в
+одной паре. Пакет из десяти пар `200 → 501` с `z ≈ -5.5` — это сильный
+timing-сигнал, но **всё равно** не байт-уровневое подтверждение.
+
+### 2.6. Обучение и награда
+
+`RewardFor()` — единственная валюта между FSM, мутатором и learner:
+
+| Наблюдение | Reward | Эффект |
+|---|---|---|
+| `Engine_Fault` | 0, `Stop` | Исключается из обучения, proxy cooldown. |
+| `WAF_Blocked` | −0.5, β +0.5 | Слабое отрицание. |
+| Статус 400 | −0.1, β +0.1 | Парсер уже отверг синтаксис; бюджет тратить не стоит. |
+| `Timing_Desync`, `|Z| >= 2` | +0.25, α +0.25 | Слабое обучение, без продвижения. |
+| `Timing_Desync`, `|Z| < 2` | 0, `timing_noise` | Ничего не меняет. |
+| Тихий 301/302 без status shift | −0.15, β +0.15 | Очередь не сдвинулась. |
+| `FE_Closed_BE_Waiting` + strong signal | +2.0, α +2.0, `Elite` | Подтверждённая аномалия, продвигается в elite. |
+| `FE_Closed_BE_Waiting` + weak signal | −0.25, β +0.25, `Stop` | Ветка свернута. |
+
+Горячая ячейка posterior — `tech:<hash>|state:<PHASE>|family:<name>`. При
+наличии `BetaProvider` FSM делает один Thompson-sample по объявленным мутациям;
+нет ячейки — остаётся детерминированный ranking. Epsilon-greedy по умолчанию:
+`epsilon=0.12`, `min=0.02`, `decay=0.995`; один roll на попытку общий для всех
+этапов ранжирования, поэтому исследование не складывается в ~22%.
+
+Обучающий контур различает классы исходов:
+
+- `Proxy Failed` — не обучает и не становится кандидатом.
+- `WAF Blocked` / `Target Rejected` — слабая отрицательная улика (`strength=0.25`).
+- `Target Response` — полная улика только при атрибутированном, проверенном прокси.
+
+Кандидат становится исполняемым заданием только после подтверждённого сдвига,
+реального dial address и **двух независимых атрибутированных выходов**. Один и
+тот же exit не может подтвердить сам себя.
+
+---
+
+## 3. Что считать доказанным, а что — нет
+
+Это главный урок, собранный по итогам рабочих прогонов.
+
+1. **Повторы одного паттерна — не независимые подтверждения.** Шесть
+   `FE_Closed_BE_Waiting` подряд на одном CL.TE и трёх прокси — это один
+   паттерн с шестью записями, а не шесть находок. Для независимости нужны
+   разные атрибутированные exit-адреса и разные ветки доказательства.
+2. **Timing — улика, а не приговор.** `200 → 501` с отрицательным остатком
+   говорит «очередь сдвинулась», но не показывает, кто именно в цепочке разошёлся.
+   Такой verdict остаётся `timing_noise` / слабым сигналом, если нет
+   байт-уровневого FE-состояния.
+3. **`Engine_Fault` — это не FE.** Отказ мутатора, timeout, паника FSM или
+   обрыв локального соединения классифицируются как ошибка движка и уходят в
+   cooldown прокси, но не в finding.
+4. **403 нужно читать.** В `ban_statuses` 403 может быть WAF-вердиктом на
+   конкретном пути, а не баном прокси. Для тихой работы рекомендуется держать `[407, 429]`,
+   а 403 интерпретируют по сырому аудиту.
+5. **STOP-правило.** Появление `429`, `503` или повторного `403` в окне —
+   сигнал остановить прогон и вернуться к анализу, не «прокрутить ещё раз».
+6. **Финальная верификация — ручная.** Сгенерированный PoC проверяют реплеем в
+   локальном инструменте, не автоматической отправкой: smuggled-часть только
+   `GET`, без реальных токенов, с байт-точным `\r\n`, по два варианта на цель.
+    Вывод FSM остаётся гипотезой до этого ручного подтверждения.
+
+---
+
+## 4. Быстрый старт
+
+```bash
+cp config.example.json config.json       # сузить scope до своего LAB-ID
+make build                               # bin/omnislash
+make daemon-build                        # bin/omnislashd
+bash lab/e2e_smoke_test.sh               # офлайн, только loopback
+```
+
+Пример задания для авторизованной лаборатории:
 
 ```json
 {
@@ -97,144 +317,89 @@ A daemon job for an authorized lab instance:
 ./bin/omnislash serve -config config.json -proxies proxies.txt
 ```
 
-`serve` starts the loopback gateway (`127.0.0.1:3128`), the dashboard and stats
-(`127.0.0.1:9090`), health/scrape loops and (by default) the online learning
-worker. Without a verified proxy in the pool, a strict-config dial is refused;
-it does not leak your real IP.
+`serve` поднимает loopback gateway (`127.0.0.1:3128`), дашборд и stats
+(`127.0.0.1:9090`), health/scrape-циклы и онлайн-обучение. Без проверенного
+прокси strict-конфигурация отказывает в dial — реальный IP не утекает.
 
-## Surfaces
+> Важно: обычный HTTP-режим gateway парсит и пере-сериализует запросы, чтобы
+> видеть статусы. Когда важна байт-точность, используйте CONNECT или напрямую
+> `Dialer` / `Session`.
 
-| Surface | Use | Boundary |
+### Поверхности
+
+| Поверхность | Назначение | Граница |
 |---|---|---|
-| `Dialer` / `Session` | raw TCP/TLS from Go tools | session pins one proxy for its TTL; `ProxyOf(conn)` attributes the exit |
-| `probe/` | smuggling, H2 desync, differential fuzz, raw replay | receives `net.Conn`; writes bytes itself |
-| `omnislashd` | scheduled jobs, retries, JSONL audit | one attempt = one pinned session |
-| `omnislash serve` | local CONNECT gateway + dashboard | loopback only; fail-closed scope |
-| `research/online_loop.py` | stdlib streaming learner | tails audit from a persisted offset; no network |
-| `playbooks/` | curated priors with explicit provenance | priors never presented as observations |
+| `Dialer` / `Session` | Сырой TCP/TLS из Go-инструментов | Один прокси на сессию, `ProxyOf(conn)`. |
+| `probe/` | Смuggling, H2, differential fuzz, replay | Получает `net.Conn`, пишет байты сам. |
+| `omnislashd` | Задания, повторы, JSONL-аудит | Одна попытка = одна закреплённая сессия. |
+| `omnislash serve` | Локальный CONNECT-шлюз и дашборд | Только loopback, fail-closed scope. |
+| `research/online_loop.py` | Потоковый learner | Читает аудит с offset, без сети. |
+| `playbooks/` | Прайоры с provenance | Прайор не выдаётся за наблюдение. |
 
-## Transport controls
+### Ключи конфигурации
 
-| Config key | Meaning |
+| Ключ | Смысл |
 |---|---|
-| `trust_tier` | `strict` (full admission, direct forbidden) or `trusted` (owned pool) |
-| `allow_direct` | dangerous opt-in for a trusted pool; default `false` |
-| `strategy` | `round_robin`, `random`, `least_used`, `sticky` |
-| `scope.*` | fail-closed allowlist, private/metadata blocking, local DNS pinning |
-| `health.*`, `cooldown.*`, `http.ban_statuses` | liveness, exponential backoff, proxy bans |
-| `rate_limit.global_rps` | pool-wide cap so rotation cannot multiply request rate |
-| `safety.*` | stop statuses in a sliding window, hard request budget, cooldown |
-| `audit.path` | JSONL evidence log (query strings/userinfo stripped) |
-| `scraper.*` | sources, strict validation mode, hot-swap with a minimum pool size |
-| `gateway.listen`, `stats.listen` | loopback listeners; set to `""` to disable |
+| `trust_tier`, `allow_direct` | Полная адмиссия + запрет прямого выхода по умолчанию. |
+| `strategy` | `round_robin`, `random`, `least_used`, `sticky`, `thompson`, `latency_aware`. |
+| `scope.*` | Fail-closed allowlist, локальный DNS, запрет private/metadata. |
+| `health.*`, `cooldown.*`, `http.ban_statuses` | Живучесть пула и баны. |
+| `rate_limit.global_rps`, `per_host_min_interval` | Общий лимит и минимальный интервал между сокетами к хосту. |
+| `safety.*` | Stop-статусы в скользящем окне, бюджет, cooldown, deception filter. |
+| `audit.path` | JSONL-доказательства без query/userinfo/секретов. |
+| `scraper.*` | Источники, адмиссия, hot-swap с минимальным размером пула. |
+| `gateway.listen`, `stats.listen` | Loopback-слушатели; `""` отключает. |
+| `probe.mutation_enabled`, `probe.mutation_mode` | Opt-in raw-мутация с обязательным Scope. |
 
-`403` in `ban_statuses` can be a WAF verdict on a specific path rather than a
-proxy ban. Keep `[407, 429]` for quiet work and interpret `403` from the audit
-evidence instead.
-
-## TLS fingerprint rotation
-
-`tls_fingerprints` rotates a coherent ClientHello per `Session`:
-
-```json
-"tls_fingerprints": ["chrome_133", "safari_ios", "okhttp"]
-```
-
-- Defaults are Chrome 133 / iOS Safari / Android OkHttp. Unknown names are a
-  config error — there is no silent Chrome or Go fallback.
-- The handshake uses refraction-utls **on the connection the proxy already
-  dialed**. No utls dial, no direct egress; `ProxyOf(conn)` still reports the
-  pinned proxy after the handshake.
-- An explicit empty array disables fingerprinting and keeps `crypto/tls`.
-- SNI, ALPN and certificate verification come from the caller's `tls.Config`,
-  so a fingerprinted session has the same trust behavior as a stdlib one.
-- This is a reproducibility control. It does not make traffic anonymous.
-
-## Deception resistance
-
-`omnislash` does not bypass tarpits. It detects and quarantines them.
-
-```json
-"safety": {
-  "enabled": true,
-  "stop_statuses": [403, 429, 503],
-  "threshold": 5,
-  "window": "60s",
-  "cooldown": "10m",
-  "deception": {
-    "enabled": true,
-    "semantic_service": true,
-    "semantic_addr": "127.0.0.1:8000",
-    "baseline_samples": 2,
-    "ncd_tarpit": 0.25,
-    "ncd_structural": 0.6,
-    "repeat_status": 200,
-    "repeat_threshold": 8,
-    "repeat_window": "10s",
-    "action": "mark"
-  }
-}
-```
-
-- A baseline is calibrated **before the first probe**. Without a baseline the
-  filter does not guess.
-- The loopback semantic service reduces sampled bodies to value-free canonical
-  skeletons; NCD compares skeletons, not dynamic values. Identical bytes are
-  guarded explicitly, and an unavailable service is reported, not faked.
-- Repeated near-identical responses inside `repeat_window` trigger the action.
-  `mark` bans the target for the session (`target_ban_ttl`); it does **not** trip
-  the proxy circuit.
-- `cooldown` and `disable` are the other actions. All three keep the raw
-  exchange in the audit log so a human can review the verdict.
-
-## Self-learning and hard quarantine
-
-The daemon keeps an epsilon-greedy prior over declared variants, mutations and
-lengths. Defaults: `epsilon=0.12`, `epsilon_min=0.02`, `epsilon_decay=0.995`.
-Decay follows observed attempts, not wall clock. One roll is taken per attempt
-and shared by all ranking stages, so exploration stays near 12% instead of
-stacking to ~22%. Use `learning_enabled: false` to turn it off; learning never
-invents a technique or a verdict.
-
-Attempts are labelled `Proxy Failed`, `WAF Blocked`, `Target Rejected` and
-`Target Response`:
-
-| Class | Training effect |
-|---|---|
-| Proxy Failed | counted in its own class; **never** trains and never yields a candidate |
-| WAF Blocked | weak negative signal (`strength=0.25`) |
-| Target Rejected | weak negative signal (`strength=0.25`) |
-| Target Response | full evidence only when attributed to a verified proxy |
-
-The Python worker tails `audit.path` from a persisted byte offset, atomically
-updates `state/learned_weights.json` and publishes `state/jobs_online.json`.
-Holdout hosts are counted but never enter training cells. Unverified signals
-may nudge weights and land only in `candidates`; a `jobs` (strike) entry needs a
-confirmed queue shift, a real dial address and two independently attributed
-proxy exits. One audit line contributes at most one identity, so noise cannot
-confirm itself.
-
-The dashboard card **Online Feedback Loop** shows state, processed episodes,
-outcome counters and accuracy. `POST /api/learning/toggle` pauses/resumes the
-worker; `POST /api/learning/feedback` applies explicit ±2.0 labels. Calibration
-(`make calibrate`) is native: local simulations plus loopback proxy/backend
-pairs, with train/validation split by host or lab ID.
-
-## CLI and local API
+### CLI и локальный API
 
 ```text
 omnislash check|scrape|fetch|serve|healthcheck
-omnislashd -config <daemon.json> [-once] [-job NAME]
+omnislashd -config <daemon.json> [-once] [-job NAME] [-orchestrator] [-playbook FILE]
 ```
 
-`serve` and `omnislashd` expose loopback JSON surfaces: `/stats`, `/status`,
-`/healthz`, `/readyz`, `/experience`, `/api/dashboard`, `/api/learning/status`,
-`/api/learning/toggle`, `/api/learning/feedback`, `/api/run` and
-`/api/caido/push`. `/api/run` is fail-closed: scope must be enabled and the
-target must pass the same allowlist and local resolution checks as any other
-dial. Missing action backends return `501`, never a fake success.
+Слушатели `serve` / `omnislashd` открывают `/stats`, `/status`, `/healthz`,
+`/readyz`, `/experience`, `/api/dashboard`, `/api/learning/status`,
+`/api/learning/toggle`, `/api/learning/feedback`, `/api/run`, `/api/caido/push`.
+`/api/run` fail-closed: без scope и прохождения allowlist запрос не уйдёт.
+Отсутствующий backend выдаёт `501`, а не фейковый успех.
 
-## Verification
+---
+
+## 5. Почему это работает
+
+Механизм десинхронизации простой: два HTTP-уровня по-разному трактуют границу
+тела запроса. Один считает `Content-Length`, другой — `Transfer-Encoding`, и
+«лишние» байты остаются в буфере общего back-end-соединения. Следующий запрос
+попадает уже в другое состояние парсера.
+
+Чтобы это наблюдение было достоверным, нужно устранить все остальные причины
+«странного ответа»:
+
+- **Не дать библиотеке переписать запрос.** Поэтому пробы пишут сырые байты, а
+  `rawhttp` работает только как рендерер.
+- **Не дать прокси переписать фрейминг.** Поэтому admission в режиме `connect`
+  проверяет сертификат и долгоживущий туннель, а в режиме `http_parsing` —
+  точное число байт туда-обратно для запроса с конфликтующим фреймингом.
+  Отрицательные фикстуры (буферизация, реврайт, drop, MITM) отсекают прокси,
+  который умеет «похоже отвечать», но искажает байты.
+- **Не перемешать выходы.** Поэтому сессия закрепляет один прокси, а каждая
+  запись аудита хранит его метку и проверенный IP.
+- **Отделить WAF и шум от парсера.** Поэтому `WAF_Blocked`, `Timing_Desync`,
+  `Engine_Fault` и `FE_Closed_BE_Waiting` — разные классы с разной силой.
+- **Не дать обучению выдумывать приёмы.** Поэтому learner переставляет только
+  объявленные кандидаты, а исполняемое задание требует двух независимых exit-адресов.
+- **Не подтверждать на слабом сигнале.** Поэтому TTL-замеры проходят
+  jitter-gate, остатки знаковые, порог `|Z| >= 2`, а повышение фазы требует
+  `SignalQuality.Strong()`.
+
+Проще говоря: omnislash не «находит баг за вас». Он делает эксперимент
+воспроизводимым и честно отделяет «у цели разошлись парсеры» от «у нас дрогнул
+тайминг, упал прокси или сработал WAF».
+
+---
+
+## 6. Проверка
 
 ```bash
 go vet ./...
@@ -247,17 +412,22 @@ make release
 git diff --check
 ```
 
-The suite covers handshake rotation through one CONNECT proxy, exit attribution
-after TLS, dead-proxy silence, strict fingerprint parsing, baseline-before-probe,
-tarpit detection, epsilon roll sharing, outcome classification, proxy-failure
-exclusion, weak-signal scaling and the two-exit strike gate. All lab fixtures
-are loopback; no external network is needed for tests or calibration.
+Набор тестов покрывает ротацию handshake через один CONNECT-прокси, атрибуцию
+после TLS, тишину при мёртвом прокси, строгий парсер fingerprint, калибровку
+до первого зонда, обнаружение tarpit, общий epsilon roll, классификацию
+исходов, исключение proxy failure, слабые сигналы, знаковые остатки Welford,
+барьер двух выходов, fault-safe FSM и запрет пропуска фаз. Все лабораторные
+фикстуры — loopback; внешняя сеть тестам не нужна.
 
-## Further reading
+## Дополнительно
 
-- [MANIFESTO.md](MANIFESTO.md) — what this project is and will not be.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — invariants mapped to code and tests.
-- [lab/README.md](lab/README.md) — authorized local labs and smoke checks.
+- [MANIFESTO.md](MANIFESTO.md) — что проект делает и чего делать не будет.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — инварианты, сведённые к коду и тестам.
+- [probe/README.md](probe/README.md) — модули проб и их границы.
+- [examples/daemon/README.md](examples/daemon/README.md) — лабораторные конфигурации.
+- [playbooks/README.md](playbooks/README.md) — происхождение прайоров.
+- [lab/README.md](lab/README.md) — авторизованные локальные лаборатории.
 
-MIT licensed; see [LICENSE](LICENSE). Use only on systems you own or have
-written authorization to test.
+MIT; см. [LICENSE](LICENSE). Используйте только на системах, которыми вы
+управляете или на которые имеете письменное разрешение. Если scope не ваш —
+не запускайте.
