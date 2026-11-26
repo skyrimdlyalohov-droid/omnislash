@@ -3,6 +3,7 @@ package omnislash
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,9 @@ func scraperTestConfig(sources ...SourceConfig) Config {
 	cfg.Scraper.Enabled = true
 	cfg.Scraper.Sources = sources
 	cfg.Scraper.Validation.Enabled = false
+	// These tests exercise extraction/hot-swap only; the funnel has its own
+	// fixtures with real local CONNECT/SOCKS5 listeners.
+	cfg.Scraper.Prefilter.Enabled = false
 	cfg.Scraper.MinPoolSize = 1
 	cfg.Scraper.MaxCandidates = 100
 	cfg.Scraper.Concurrency = 2
@@ -146,6 +150,113 @@ func TestScraperHotSwapPreservesProxyState(t *testing.T) {
 	}
 	if pool.Stats().Proxies[0].Successes != 1 {
 		t.Fatal("success counter was reset by hot swap")
+	}
+}
+
+func TestScraperPrefilterDropsDeadProxiesBeforeValidation(t *testing.T) {
+	// The fast stage only needs a TCP target: no HTTP is sent through it.
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	go func() {
+		for {
+			conn, err := target.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Read(make([]byte, 1))
+			}(conn)
+		}
+	}()
+
+	live := startConnectProxy(t, "")
+	dead := "http://" + freeAddr(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "%s\n%s\n", live.URL(), dead)
+	}))
+	defer srv.Close()
+
+	cfg := scraperTestConfig(SourceConfig{URL: srv.URL, Type: "text", Scheme: "http"})
+	cfg.Scraper.Prefilter.Enabled = true
+	cfg.Scraper.Prefilter.Concurrency = 128
+	cfg.Scraper.Prefilter.Timeout = Duration(400 * time.Millisecond)
+	cfg.Scraper.Validation.Admission.EchoAddr = target.Addr().String()
+	pool, err := NewPool(&cfg, nil, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewScraper(pool, cfg.Scraper, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := s.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if stats.Prefiltered != 1 || stats.Accepted != 1 {
+		t.Fatalf("prefiltered=%d accepted=%d, want 1/1", stats.Prefiltered, stats.Accepted)
+	}
+	if stats.DurationMS <= 0 {
+		t.Fatalf("Refresh returned duration %v, want a measured value", stats.DurationMS)
+	}
+	if stats.Infantry+stats.Sniper != stats.Accepted {
+		t.Fatalf("tier counters infantry=%d sniper=%d, want %d accepted", stats.Infantry, stats.Sniper, stats.Accepted)
+	}
+	if pool.Len() != 1 || pool.Proxies()[0].Addr != live.addr {
+		t.Fatalf("pool did not keep only the live proxy: %+v", pool.Proxies())
+	}
+	if live.connects.Load() != 1 {
+		t.Fatalf("live CONNECT count = %d, want 1", live.connects.Load())
+	}
+}
+
+func TestCachedPoolDoesNotBlockOnStartupRefresh(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		<-release
+		_, _ = w.Write([]byte("1.2.3.4:8080"))
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	cfg := scraperTestConfig(SourceConfig{URL: srv.URL, Type: "text", Scheme: "http"})
+	cfg.Scraper.StartupWait = Duration(5 * time.Second)
+	cached := mustProxy(t, "http://127.0.0.1:3128")
+	pool, err := NewPool(&cfg, []*Proxy{cached}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewScraper(pool, cfg.Scraper, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx)
+		close(done)
+	}()
+	select {
+	case <-hit:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background startup refresh was not launched")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("cached startup blocked service on a slow source")
 	}
 }
 

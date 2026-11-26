@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -96,12 +97,22 @@ func utlsConfig(cfg *tls.Config, addr string) *utls.Config {
 	}
 }
 
-// dialTLSWithFingerprint wraps an already established, proxy-pinned connection.
-// It never opens a socket: the caller owns dialling, scope checks and egress
-// attribution. A failed handshake closes exactly that connection.
-func dialTLSWithFingerprint(ctx context.Context, raw net.Conn, addr string, cfg *tls.Config, id utls.ClientHelloID) (net.Conn, error) {
+// openTLSWithFingerprint wraps an already established, proxy-pinned connection
+// with uTLS and completes the handshake. It never opens a socket: the caller
+// owns dialling, scope checks and egress attribution. A failed handshake closes
+// exactly that connection.
+func openTLSWithFingerprint(ctx context.Context, raw net.Conn, addr string, cfg *tls.Config, id utls.ClientHelloID, handshakeTimeout time.Duration) (net.Conn, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("omnislash: fingerprinted TLS requires an existing connection")
+	}
+	// uTLS gets its own deadline: a tunnel that stalled during ClientHello must
+	// not be confused with a slow target response.
+	if handshakeTimeout > 0 {
+		deadline := time.Now().Add(handshakeTimeout)
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+		_ = raw.SetDeadline(deadline)
 	}
 	uc := utls.UClient(raw, utlsConfig(cfg, addr), id)
 	if err := uc.HandshakeContext(ctx); err != nil {
@@ -109,7 +120,38 @@ func dialTLSWithFingerprint(ctx context.Context, raw net.Conn, addr string, cfg 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("utls handshake with %s (%s): %w", addr, fingerprintName(id), err)
+		return nil, markProxyTransport(fmt.Errorf("utls handshake with %s (%s): %w", addr, fingerprintName(id), err))
 	}
+	_ = raw.SetDeadline(time.Time{})
 	return uc, nil
+}
+
+// dialTLSWithFingerprint is the session path: handshake, then the split TTFB
+// guard. Hedged dials use openTLSWithFingerprint directly so they can verify
+// the chain before handing the socket to a race winner.
+func dialTLSWithFingerprint(ctx context.Context, raw net.Conn, addr string, cfg *tls.Config, id utls.ClientHelloID, handshakeTimeout, ttfbTimeout time.Duration) (net.Conn, error) {
+	uc, err := openTLSWithFingerprint(ctx, raw, addr, cfg, id, handshakeTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return newTTFBConn(uc, ttfbTimeout), nil
+}
+
+// connVerifiedChains unwraps the tracked/TLS layers used by uTLS and stdlib
+// dials. uTLS exposes its own ConnectionState type, so both variants must be
+// recognised before a public proxy is allowed to win a hedged race.
+func connVerifiedChains(conn net.Conn) int {
+	if conn == nil {
+		return 0
+	}
+	switch c := conn.(type) {
+	case interface{ ConnectionState() tls.ConnectionState }:
+		return len(c.ConnectionState().VerifiedChains)
+	case interface{ ConnectionState() utls.ConnectionState }:
+		return len(c.ConnectionState().VerifiedChains)
+	}
+	if c, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		return connVerifiedChains(c.NetConn())
+	}
+	return 0
 }

@@ -10,10 +10,51 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// sensitiveHeaders are never sent through a public exit in the strict trust
+// tier. They are verbatim names: a client can send "cookie" or "COOKIE", and a
+// header map lookup in net/http is canonical but not guaranteed for raw writes.
+var sensitiveHeaders = [...]string{"Cookie", "Authorization", "X-Api-Key"}
+
+// rejectSensitiveHeaders fails closed before any dial. In strict tier the
+// operator has declared the pool public/untrusted, so credentials must not be
+// handed to it. Trusted pools keep the historical behaviour; manual Caido
+// sessions are outside this transport entirely.
+func hasSensitiveHeader(h http.Header) string {
+	for _, name := range sensitiveHeaders {
+		if h.Get(name) != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func rejectSensitiveHeaders(cfg Config, h http.Header) error {
+	if !strings.EqualFold(strings.TrimSpace(cfg.TrustTier), TrustTierStrict) {
+		return nil
+	}
+	if name := hasSensitiveHeader(h); name != "" {
+		return fmt.Errorf("%w: %s", ErrSensitiveHeaderBlocked, name)
+	}
+	return nil
+}
+
+// isIdempotentMethod restricts speculative dials to methods that are safe to
+// repeat. POST/PATCH are excluded even when they carry no credentials.
+func isIdempotentMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
 
 // RotatingTransport is an http.RoundTripper that assigns every request to a
 // proxy and therefore rotates the source IP. Each proxy gets its own
@@ -36,6 +77,9 @@ type RotatingTransport struct {
 	// Exceeding it is an error, never a truncated body: NCD and framing
 	// analysis must never see a response that was silently cut in half.
 	maxResponseBytes int64
+	// ttfbTimeout is the top-level first-byte budget. It is kept separately
+	// from HTTPConfig because TLS handshake and TTFB are distinct stages.
+	ttfbTimeout time.Duration
 }
 
 // NewRotatingTransport creates a transport for pool.
@@ -59,6 +103,7 @@ func NewRotatingTransport(pool *Pool, dialer *Dialer, cfg HTTPConfig, logger *sl
 		ban:              ban,
 		gen:              pool.Generation(),
 		maxResponseBytes: normalized.Probe.MaxResponseBytes,
+		ttfbTimeout:      normalized.TTFBTimeout.Std(),
 	}
 }
 
@@ -69,6 +114,10 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 	if req.URL == nil {
 		return nil, errors.New("omnislash: nil request URL")
+	}
+	if err := rejectSensitiveHeaders(t.pool.cfg, req.Header); err != nil {
+		t.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "sensitive_header_blocked"})
+		return nil, err
 	}
 	if df := t.pool.Deception(); df != nil && df.Enabled() {
 		if d, block := df.ShouldBlock(req.URL.Hostname(), req.URL.Path); block {
@@ -178,7 +227,20 @@ func (t *RotatingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return nil, rErr
 		}
 		start := t.pool.now()
-		resp, rtErr := t.transportFor(pr).RoundTrip(attemptReq)
+		var (
+			resp  *http.Response
+			rtErr error
+		)
+		// Speculation is restricted to idempotent, unauthenticated HTTPS through
+		// an Infantry exit. Sniper, credentials and plain HTTP stay on the
+		// deterministic per-proxy transport.
+		if t.dialer != nil && req.URL.Scheme == "https" &&
+			isIdempotentMethod(req.Method) && hasSensitiveHeader(req.Header) == "" &&
+			pr.Tier() == TierInfantry {
+			resp, rtErr = t.hedgedRoundTrip(ctx, attemptReq, pr, requestDialAddr(req.URL))
+		} else {
+			resp, rtErr = t.transportFor(pr).RoundTrip(attemptReq)
+		}
 		latency := t.pool.now().Sub(start)
 		if rtErr != nil {
 			lastErr = fmt.Errorf("%s: %w", pr.Label(), rtErr)
@@ -277,6 +339,7 @@ func (t *RotatingTransport) transportFor(pr *Proxy) *http.Transport {
 		ForceAttemptHTTP2:     false,
 		TLSClientConfig:       tlsCfg,
 		TLSHandshakeTimeout:   t.cfg.TLSHandshakeTimeout.Std(),
+		ResponseHeaderTimeout: t.ttfbTimeout,
 		MaxIdleConns:          t.cfg.MaxIdleConns,
 		MaxIdleConnsPerHost:   t.cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       t.cfg.IdleConnTimeout.Std(),
@@ -302,6 +365,64 @@ func (t *RotatingTransport) directTransport() *http.Transport {
 		IdleConnTimeout:     t.cfg.IdleConnTimeout.Std(),
 	}
 	return t.direct
+}
+
+// requestDialAddr returns the explicit host:port handed to a proxy. Relying on
+// net/http's implicit port would make scope checks and hedged dials see a
+// different address than the TLS SNI.
+func requestDialAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		if strings.EqualFold(u.Scheme, "https") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// hedgedRoundTrip runs one request over a pre-dialed, race-winning TLS
+// connection. The single-use http.Transport never reuses the socket, so a
+// speculative win cannot pollute the per-proxy keep-alive cache or report a
+// proxy that did not carry the request.
+func (t *RotatingTransport) hedgedRoundTrip(ctx context.Context, req *http.Request, pr *Proxy, addr string) (*http.Response, error) {
+	tlsCfg := &tls.Config{
+		ServerName:         req.URL.Hostname(),
+		InsecureSkipVerify: t.cfg.TLSSkipVerify,
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"http/1.1"},
+	}
+	conn, err := t.dialer.HedgedDialContext(ctx, pr, "tcp", addr, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	tr := &http.Transport{
+		// DialTLSContext returns the already handshaken socket. DisableKeepAlives
+		// keeps attribution exact: this connection belongs to this one request.
+		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+			var c net.Conn
+			once.Do(func() { c = conn })
+			if c == nil {
+				return nil, errors.New("omnislash: hedged connection was already handed out")
+			}
+			return c, nil
+		},
+		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     false,
+		TLSClientConfig:       tlsCfg,
+		TLSHandshakeTimeout:   t.cfg.TLSHandshakeTimeout.Std(),
+		ResponseHeaderTimeout: t.ttfbTimeout,
+		MaxIdleConns:          1,
+		MaxIdleConnsPerHost:   1,
+	}
+	defer tr.CloseIdleConnections()
+	resp, roundErr := tr.RoundTrip(req)
+	if roundErr != nil {
+		_ = conn.Close()
+	}
+	return resp, roundErr
 }
 
 // baselineDoRequest issues one control request for deception calibration. It

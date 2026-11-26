@@ -58,27 +58,34 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 // Config controls the proxy pool, dialer, HTTP transport, health checker,
 // local gateway and stats endpoint.
 type Config struct {
-	DefaultScheme      string          `json:"default_scheme"`
-	Strategy           string          `json:"strategy"`
-	TrustTier          string          `json:"trust_tier"`
-	AllowDirect        bool            `json:"allow_direct"`
-	StickyTTL          Duration        `json:"sticky_ttl"`
-	DialTimeout        Duration        `json:"dial_timeout"`
-	HandshakeTimeout   Duration        `json:"handshake_timeout"`
-	MaxDialAttempts    int             `json:"max_dial_attempts"`
-	ProxyTLSSkipVerify bool            `json:"proxy_tls_skip_verify"`
-	Cooldown           CooldownConfig  `json:"cooldown"`
-	Health             HealthConfig    `json:"health"`
-	HTTP               HTTPConfig      `json:"http"`
-	Probe              ProbeConfig     `json:"probe"`
-	Stats              StatsConfig     `json:"stats"`
-	Gateway            GatewayConfig   `json:"gateway"`
-	RateLimit          RateLimitConfig `json:"rate_limit"`
-	Safety             SafetyConfig    `json:"safety"`
-	Audit              AuditConfig     `json:"audit"`
-	Scope              ScopeConfig     `json:"scope"`
-	Scraper            ScraperConfig   `json:"scraper"`
-	LogLevel           string          `json:"log_level"`
+	DefaultScheme    string   `json:"default_scheme"`
+	Strategy         string   `json:"strategy"`
+	TrustTier        string   `json:"trust_tier"`
+	AllowDirect      bool     `json:"allow_direct"`
+	StickyTTL        Duration `json:"sticky_ttl"`
+	DialTimeout      Duration `json:"dial_timeout"`
+	HandshakeTimeout Duration `json:"handshake_timeout"`
+	// ProxyConnectTimeout bounds only the TCP dial to the upstream proxy.
+	// UTLSHandshakeTimeout bounds only the TLS handshake after the tunnel is
+	// established, and TTFBTimeout bounds the first byte from the target. They
+	// are independent so a slow proxy cannot consume the whole request budget.
+	ProxyConnectTimeout  Duration        `json:"proxy_connect_timeout"`
+	UTLSHandshakeTimeout Duration        `json:"utls_handshake_timeout"`
+	TTFBTimeout          Duration        `json:"ttfb_timeout"`
+	MaxDialAttempts      int             `json:"max_dial_attempts"`
+	ProxyTLSSkipVerify   bool            `json:"proxy_tls_skip_verify"`
+	Cooldown             CooldownConfig  `json:"cooldown"`
+	Health               HealthConfig    `json:"health"`
+	HTTP                 HTTPConfig      `json:"http"`
+	Probe                ProbeConfig     `json:"probe"`
+	Stats                StatsConfig     `json:"stats"`
+	Gateway              GatewayConfig   `json:"gateway"`
+	RateLimit            RateLimitConfig `json:"rate_limit"`
+	Safety               SafetyConfig    `json:"safety"`
+	Audit                AuditConfig     `json:"audit"`
+	Scope                ScopeConfig     `json:"scope"`
+	Scraper              ScraperConfig   `json:"scraper"`
+	LogLevel             string          `json:"log_level"`
 	// OnlineLearning starts the streaming feedback loop next to the control
 	// UI. Nil means enabled; set false to keep serve read-only.
 	OnlineLearning *bool `json:"online_learning,omitempty"`
@@ -168,6 +175,10 @@ type RateLimitConfig struct {
 	Burst       int     `json:"burst"`
 	GlobalRPS   float64 `json:"global_rps"`
 	GlobalBurst int     `json:"global_burst"`
+	// PerHostMinInterval is the minimum spacing between physical sockets to the
+	// same target host. Zero disables it. It is enforced on every dial,
+	// including hedged backups, retries and warmed tunnels.
+	PerHostMinInterval Duration `json:"per_host_min_interval,omitempty"`
 }
 
 // SafetyConfig stops all traffic when the target starts rejecting the scan.
@@ -309,9 +320,11 @@ type ValidationConfig struct {
 // in addition to egress-IP canaries for the strict trust tier.
 //
 // TLSCanaryURL is an HTTPS endpoint used to prove CONNECT, certificate
-// verification and a paused keep-alive connection. EchoAddr is a raw TCP echo
-// endpoint used for the N-bytes-out/N-bytes-back test. Empty values skip the
-// corresponding probe; the test suite supplies both with local fakes.
+// verification and a paused keep-alive connection. EchoAddr is an optional raw
+// TCP echo endpoint for the N-bytes-out/N-bytes-back test. When EchoAddr is
+// empty, the verified canary tunnel itself is used for a self-contained
+// http_parsing probe (pipelined Content-Length and chunked framing), so public
+// pools can still promote stable low-IQR exits to SniperTier.
 type AdmissionConfig struct {
 	Enabled      bool     `json:"enabled"`
 	TLSCanaryURL string   `json:"tls_canary_url"`
@@ -319,8 +332,21 @@ type AdmissionConfig struct {
 	Hold         Duration `json:"hold"`
 	EchoBytes    int      `json:"echo_bytes"`
 	Timeout      Duration `json:"timeout"`
+	// Samples is the number of byte-exact echo rounds used to admit a Sniper.
+	// Stable latency across them (IQR < 20ms) is what separates SniperTier from
+	// InfantryTier; a proxy that fails the echo rounds stays in Infantry.
+	Samples int `json:"samples"`
 	// TLSSkipVerify is only for trusted labs. Strict connect mode rejects it.
 	TLSSkipVerify bool `json:"tls_skip_verify"`
+}
+
+// PrefilterConfig controls the first stage of the scrape funnel. It only
+// proves that a candidate can complete a TCP connection and a CONNECT/SOCKS5
+// handshake; no TLS or target traffic is spent on dead public proxies.
+type PrefilterConfig struct {
+	Enabled     bool     `json:"enabled"`
+	Concurrency int      `json:"concurrency"`
+	Timeout     Duration `json:"timeout"`
 }
 
 // ScraperConfig repeatedly fetches free proxy lists, validates candidates and
@@ -338,6 +364,7 @@ type ScraperConfig struct {
 	MinPoolSize     int              `json:"min_pool_size"`
 	MaxBodyBytes    int64            `json:"max_body_bytes"`
 	UserAgent       string           `json:"user_agent,omitempty"`
+	Prefilter       PrefilterConfig  `json:"prefilter"`
 	Validation      ValidationConfig `json:"validation"`
 }
 
@@ -373,16 +400,19 @@ const defaultMobileUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac
 // DefaultConfig returns a ready-to-use configuration.
 func DefaultConfig() Config {
 	return Config{
-		DefaultScheme:      "socks5",
-		Strategy:           StrategyRoundRobin,
-		TrustTier:          TrustTierStrict,
-		AllowDirect:        false,
-		TLSFingerprints:    append([]string(nil), DefaultFingerprints...),
-		StickyTTL:          Duration(5 * time.Minute),
-		DialTimeout:        Duration(10 * time.Second),
-		HandshakeTimeout:   Duration(15 * time.Second),
-		MaxDialAttempts:    3,
-		ProxyTLSSkipVerify: false,
+		DefaultScheme:        "socks5",
+		Strategy:             StrategyRoundRobin,
+		TrustTier:            TrustTierStrict,
+		AllowDirect:          false,
+		TLSFingerprints:      append([]string(nil), DefaultFingerprints...),
+		StickyTTL:            Duration(5 * time.Minute),
+		DialTimeout:          Duration(10 * time.Second),
+		HandshakeTimeout:     Duration(15 * time.Second),
+		ProxyConnectTimeout:  Duration(1500 * time.Millisecond),
+		UTLSHandshakeTimeout: Duration(5 * time.Second),
+		TTFBTimeout:          Duration(5 * time.Second),
+		MaxDialAttempts:      3,
+		ProxyTLSSkipVerify:   false,
 		Cooldown: CooldownConfig{
 			Initial:                Duration(15 * time.Second),
 			Max:                    Duration(10 * time.Minute),
@@ -410,7 +440,7 @@ func DefaultConfig() Config {
 			MaxBodyBuffer:       4 << 20,
 		},
 		Probe: ProbeConfig{
-			MaxResponseBytes: 4 << 20,
+			MaxResponseBytes: 2 << 20,
 			ReadTimeout:      Duration(10 * time.Second),
 			RaceReadTimeout:  Duration(1500 * time.Millisecond),
 		},
@@ -465,6 +495,11 @@ func DefaultConfig() Config {
 			MinPoolSize:     1,
 			MaxBodyBytes:    4 << 20,
 			UserAgent:       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+			Prefilter: PrefilterConfig{
+				Enabled:     true,
+				Concurrency: 128,
+				Timeout:     Duration(1500 * time.Millisecond),
+			},
 			Validation: ValidationConfig{
 				Enabled: true,
 				Mode:    AdmissionModeConnect,
@@ -474,6 +509,7 @@ func DefaultConfig() Config {
 					Hold:         Duration(2 * time.Second),
 					EchoBytes:    256,
 					Timeout:      Duration(10 * time.Second),
+					Samples:      3,
 				},
 				CanaryURLs: []string{
 					"https://api.ipify.org",
@@ -538,6 +574,15 @@ func (c *Config) normalize() {
 	}
 	if c.HandshakeTimeout == 0 {
 		c.HandshakeTimeout = d.HandshakeTimeout
+	}
+	if c.ProxyConnectTimeout == 0 {
+		c.ProxyConnectTimeout = d.ProxyConnectTimeout
+	}
+	if c.UTLSHandshakeTimeout == 0 {
+		c.UTLSHandshakeTimeout = d.UTLSHandshakeTimeout
+	}
+	if c.TTFBTimeout == 0 {
+		c.TTFBTimeout = d.TTFBTimeout
 	}
 	if c.MaxDialAttempts == 0 {
 		c.MaxDialAttempts = d.MaxDialAttempts
@@ -707,6 +752,12 @@ func (c *Config) normalize() {
 	if c.Scraper.UserAgent == "" {
 		c.Scraper.UserAgent = d.Scraper.UserAgent
 	}
+	if c.Scraper.Prefilter.Concurrency == 0 {
+		c.Scraper.Prefilter.Concurrency = d.Scraper.Prefilter.Concurrency
+	}
+	if c.Scraper.Prefilter.Timeout == 0 {
+		c.Scraper.Prefilter.Timeout = d.Scraper.Prefilter.Timeout
+	}
 	if len(c.Scraper.Validation.CanaryURLs) == 0 {
 		c.Scraper.Validation.CanaryURLs = append([]string(nil), d.Scraper.Validation.CanaryURLs...)
 	}
@@ -721,6 +772,9 @@ func (c *Config) normalize() {
 	}
 	if c.Scraper.Validation.Admission.Timeout == 0 {
 		c.Scraper.Validation.Admission.Timeout = d.Scraper.Validation.Admission.Timeout
+	}
+	if c.Scraper.Validation.Admission.Samples == 0 {
+		c.Scraper.Validation.Admission.Samples = d.Scraper.Validation.Admission.Samples
 	}
 	if c.Scraper.Validation.Admission.TLSCanaryURL == "" {
 		c.Scraper.Validation.Admission.TLSCanaryURL = d.Scraper.Validation.Admission.TLSCanaryURL
@@ -808,6 +862,15 @@ func (c *Config) Validate() error {
 	if c.HandshakeTimeout <= 0 {
 		add("handshake_timeout must be > 0")
 	}
+	if c.ProxyConnectTimeout <= 0 {
+		add("proxy_connect_timeout must be > 0")
+	}
+	if c.UTLSHandshakeTimeout <= 0 {
+		add("utls_handshake_timeout must be > 0")
+	}
+	if c.TTFBTimeout <= 0 {
+		add("ttfb_timeout must be > 0")
+	}
 	if c.MaxDialAttempts < 1 {
 		add("max_dial_attempts must be >= 1")
 	}
@@ -872,6 +935,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimit.GlobalBurst < 0 {
 		add("rate_limit.global_burst must be >= 0")
+	}
+	if c.RateLimit.PerHostMinInterval < 0 {
+		add("rate_limit.per_host_min_interval must be >= 0")
 	}
 	for _, code := range c.Safety.StopStatuses {
 		if code < 100 || code > 599 {
@@ -1100,6 +1166,14 @@ func validateScraperConfig(c *Config) error {
 	if strings.TrimSpace(s.UserAgent) == "" {
 		add("user_agent must not be empty")
 	}
+	if s.Prefilter.Enabled {
+		if s.Prefilter.Concurrency < 1 || s.Prefilter.Concurrency > 150 {
+			add("prefilter.concurrency must be between 1 and 150")
+		}
+		if s.Prefilter.Timeout <= 0 {
+			add("prefilter.timeout must be > 0")
+		}
+	}
 
 	v := s.Validation
 	if v.Timeout <= 0 {
@@ -1120,6 +1194,9 @@ func validateScraperConfig(c *Config) error {
 		if v.Admission.EchoBytes < 1 || v.Admission.EchoBytes > 1<<20 {
 			add("validation.admission.echo_bytes must be between 1 and 1048576")
 		}
+		if v.Admission.Samples < 1 {
+			add("validation.admission.samples must be >= 1")
+		}
 		if v.Admission.TLSCanaryURL != "" {
 			u, err := url.Parse(strings.TrimSpace(v.Admission.TLSCanaryURL))
 			if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -1135,8 +1212,8 @@ func validateScraperConfig(c *Config) error {
 		if v.Admission.TLSCanaryURL == "" && v.Admission.EchoAddr == "" {
 			add("validation.admission needs tls_canary_url or echo_addr")
 		}
-		if v.Mode == AdmissionModeHTTPParsing && v.Admission.EchoAddr == "" {
-			add("validation.mode=http_parsing requires admission.echo_addr")
+		if v.Mode == AdmissionModeHTTPParsing && v.Admission.EchoAddr == "" && v.Admission.TLSCanaryURL == "" {
+			add("validation.mode=http_parsing requires admission.echo_addr or admission.tls_canary_url")
 		}
 		if v.Mode == AdmissionModeConnect && v.Admission.TLSCanaryURL == "" {
 			add("validation.mode=connect requires admission.tls_canary_url")

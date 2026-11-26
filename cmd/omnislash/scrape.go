@@ -87,9 +87,11 @@ func cmdScrape(args []string) error {
 			return err
 		}
 	} else {
+		fmt.Printf("Время: %.1f ms\n", stats.DurationMS)
 		fmt.Printf("Источников: %d, ошибок источников: %d\n", stats.Sources, stats.SourceErrors)
-		fmt.Printf("Кандидатов: %d, проверено: %d, принято: %d, отклонено: %d\n",
-			stats.Candidates, stats.Validated, stats.Accepted, stats.Rejected)
+		fmt.Printf("Кандидатов: %d, после prefilter: %d, проверено: %d, принято: %d, отклонено: %d\n",
+			stats.Candidates, stats.Prefiltered, stats.Validated, stats.Accepted, stats.Rejected)
+		fmt.Printf("Infantry: %d, Sniper: %d\n", stats.Infantry, stats.Sniper)
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "ПРОКСИ\tEGRESS\tПРОВЕРКА")
 		for _, ps := range pool.Stats().Proxies {

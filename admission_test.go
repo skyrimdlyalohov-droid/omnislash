@@ -170,6 +170,71 @@ func TestAdmissionEchoAcceptsTransparentTunnel(t *testing.T) {
 	}
 }
 
+// startMutatingEchoTarget is a raw TCP endpoint that corrupts one byte. It is
+// reached through an ordinary CONNECT proxy, so base admission succeeds while
+// the strict echo must fail.
+func startMutatingEchoTarget(t *testing.T, size int) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, size)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				buf[0] ^= 0x01
+				_, _ = c.Write(buf)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestAdmissionStrictEchoFailureKeepsInfantryTier(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "ok\n")
+	}))
+	defer srv.Close()
+	proxy := startConnectProxy(t, "")
+	echoAddr := startMutatingEchoTarget(t, 256)
+
+	cfg := validationTestConfig("", "")
+	cfg.Mode = AdmissionModeConnect
+	cfg.Admission = AdmissionConfig{
+		Enabled:      true,
+		TLSCanaryURL: srv.URL,
+		EchoAddr:     echoAddr,
+		EchoBytes:    256,
+		Samples:      3,
+		Timeout:      Duration(2 * time.Second),
+	}
+	v, err := NewValidator(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.admitRoot = certPoolFor(srv.Certificate())
+	pr := mustProxy(t, proxy.URL())
+	if err := v.admitTiered(context.Background(), pr); err != nil {
+		t.Fatalf("base admission passed but proxy was rejected: %v", err)
+	}
+	if got := pr.AdmissionMode(); got != AdmissionModeConnect {
+		t.Fatalf("admission mode = %q, want connect (no Sniper promotion)", got)
+	}
+	if got := pr.Tier(); got != TierInfantry {
+		t.Fatalf("tier = %q, want infantry after failed strict echo", got)
+	}
+}
+
 func TestAdmissionConnectVerifiesCertificateAndLongLivedTunnel(t *testing.T) {
 	var requests atomic.Int64
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -295,6 +360,84 @@ func TestTrustTierSwitchesAdmissionPolicy(t *testing.T) {
 	}
 	if err := trusted.admit(context.Background(), pr); err != nil {
 		t.Fatalf("trusted tier should skip admission: %v", err)
+	}
+}
+
+func TestAdmissionSelfContainedFramingPromotesSniperWithoutEcho(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodPost {
+			// Read the chunked body; a proxy that strips Transfer-Encoding
+			// desynchronises the pipeline and the second response is missing.
+			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<16))
+		}
+		_, _ = io.WriteString(w, "ok\n")
+	}))
+	defer srv.Close()
+	proxy := startConnectProxy(t, "")
+
+	cfg := validationTestConfig("", "")
+	cfg.Mode = AdmissionModeHTTPParsing
+	cfg.Admission = AdmissionConfig{
+		Enabled:      true,
+		TLSCanaryURL: srv.URL,
+		EchoAddr:     "", // no external echo server
+		EchoBytes:    128,
+		Samples:      3,
+		Timeout:      Duration(2 * time.Second),
+	}
+	v, err := NewValidator(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.admitRoot = certPoolFor(srv.Certificate())
+	// Deterministic round-trip clock: three identical low-IQR samples must
+	// exercise the real Sniper promotion gate, not a timing-dependent guess.
+	tick := time.Now()
+	v.now = func() time.Time { tick = tick.Add(time.Millisecond); return tick }
+
+	pr := mustProxy(t, proxy.URL())
+	if err := v.admitTiered(context.Background(), pr); err != nil {
+		t.Fatalf("self-contained http_parsing admission failed: %v", err)
+	}
+	if got := pr.AdmissionMode(); got != AdmissionModeHTTPParsing {
+		t.Fatalf("admission mode = %q, want http_parsing", got)
+	}
+	if got := pr.Tier(); got != TierSniper {
+		t.Fatalf("tier = %q, want sniper after stable framing rounds", got)
+	}
+	// One base CONNECT canary (2 requests) plus 3 framing rounds x 2 requests.
+	if got := requests.Load(); got != 8 {
+		t.Fatalf("canary requests = %d, want 8 (base + framing rounds)", got)
+	}
+}
+
+func TestAdmissionSelfContainedRejectsMITMBeforePromotion(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok\n")
+	}))
+	defer srv.Close()
+	mitm := startMITMProxy(t, srv.TLS.Certificates[0])
+
+	cfg := validationTestConfig("", "")
+	cfg.Mode = AdmissionModeHTTPParsing
+	cfg.Admission = AdmissionConfig{
+		Enabled:      true,
+		TLSCanaryURL: "https://example.com:443",
+		Samples:      1,
+		Timeout:      Duration(time.Second),
+	}
+	v, err := NewValidator(cfg, testLogger()) // no trust roots installed
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := mustProxy(t, mitm)
+	if err := v.admitTiered(context.Background(), pr); err == nil {
+		t.Fatal("MITM certificate was admitted to the pool")
+	}
+	if got := pr.Tier(); got != TierInfantry {
+		t.Fatalf("tier = %q, want infantry for rejected MITM proxy", got)
 	}
 }
 

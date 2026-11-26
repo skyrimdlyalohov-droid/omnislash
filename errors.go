@@ -53,4 +53,9 @@ var (
 	// ErrTargetCooling means the target produced a burst of block responses
 	// across independent proxies and is paused. Other targets remain eligible.
 	ErrTargetCooling = errors.New("omnislash: target cooling down")
+
+	// ErrSensitiveHeaderBlocked is returned in the strict trust tier when a
+	// request carries credentials. Public exits must never see cookies, bearer
+	// tokens or API keys; use trust_tier=trusted or a manual Caido session.
+	ErrSensitiveHeaderBlocked = errors.New("omnislash: sensitive header blocked in strict trust tier")
 )

@@ -250,6 +250,13 @@ func (g *Gateway) handleHTTP(ctx context.Context, conn net.Conn, req *http.Reque
 		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "absolute http:// URL required; use CONNECT for HTTPS")
 		return
 	}
+	// Public exits never receive session credentials. This is checked before
+	// scope, rate limiting or any dial so nothing downstream can leak them.
+	if err := rejectSensitiveHeaders(g.dialer.pool.cfg, req.Header); err != nil {
+		g.audit(AuditEvent{Kind: "http", Method: req.Method, Target: auditTarget(req.URL), Reason: "sensitive_header_blocked"})
+		writeHTTPError(conn, http.StatusForbidden, "Forbidden", err.Error())
+		return
+	}
 	target := req.URL.Host
 	if target == "" {
 		writeHTTPError(conn, http.StatusBadRequest, "Bad Request", "request target is missing")

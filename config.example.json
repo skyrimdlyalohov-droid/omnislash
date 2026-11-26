@@ -1,11 +1,14 @@
 {
   "default_scheme": "socks5",
-  "strategy": "round_robin",
+  "strategy": "thompson",
   "trust_tier": "strict",
   "allow_direct": false,
   "sticky_ttl": "5m",
   "dial_timeout": "10s",
   "handshake_timeout": "15s",
+  "proxy_connect_timeout": "1500ms",
+  "utls_handshake_timeout": "5s",
+  "ttfb_timeout": "5s",
   "max_dial_attempts": 3,
   "proxy_tls_skip_verify": false,
   "cooldown": {
@@ -37,7 +40,7 @@
     "tls_skip_verify": false
   },
   "probe": {
-    "max_response_bytes": 4194304,
+    "max_response_bytes": 2097152,
     "read_timeout": "10s",
     "race_read_timeout": "1500ms"
   },
@@ -53,7 +56,8 @@
     "per_proxy_rps": 0,
     "burst": 0,
     "global_rps": 4,
-    "global_burst": 1
+    "global_burst": 1,
+    "per_host_min_interval": "0s"
   },
   "safety": {
     "enabled": true,
@@ -115,6 +119,11 @@
     "min_pool_size": 1,
     "max_body_bytes": 4194304,
     "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "prefilter": {
+      "enabled": true,
+      "concurrency": 128,
+      "timeout": "1500ms"
+    },
     "sources": [
       {
         "name": "speedx-http",
@@ -145,6 +154,7 @@
         "hold": "2s",
         "echo_bytes": 256,
         "timeout": "10s",
+        "samples": 3,
         "tls_skip_verify": false
       },
       "canary_urls": [

@@ -34,6 +34,14 @@ type Runner struct {
 	// (ALPN, SNI, verification). Nil dials plaintext.
 	TLS *tls.Config
 
+	// Warmer is optional. When set, TLS probes may reuse a pre-warmed tunnel,
+	// but only one whose proxy matches the session's pinned exit.
+	Warmer *omnislash.TunnelWarmer
+
+	// ProxyRetries is the number of transparent retries after a proxy-only
+	// transport failure. Zero means two retries (three total attempts).
+	ProxyRetries int
+
 	// MaxResponseBytes bounds the bytes a probe may read from one connection.
 	// Exceeding it returns ErrResponseTooLarge; the response is never truncated
 	// and passed to NCD or framing analysis.
@@ -127,6 +135,49 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	retries := r.ProxyRetries
+	if retries == 0 {
+		retries = 2
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	var (
+		out    *Result
+		runErr error
+	)
+	for attempt := 0; attempt <= retries; attempt++ {
+		out, runErr = r.runOnce(ctx, target, p)
+		if runErr == nil {
+			return out, nil
+		}
+		if attempt == retries || ctx.Err() != nil {
+			break
+		}
+		// A proxy-only failure says nothing about the target. Retry with a
+		// freshly selected exit; a parsed response is never retried because it
+		// would double-count a WAF verdict as training evidence.
+		if !isRetryableProxyFailure(out, runErr) {
+			break
+		}
+	}
+	if errors.Is(runErr, util.ErrPrecisionLost) {
+		return out, fmt.Errorf("probe %s: %w", p.Name(), runErr)
+	}
+	return out, runErr
+}
+
+func isRetryableProxyFailure(res *Result, err error) bool {
+	if errors.Is(err, util.ErrPrecisionLost) || errors.Is(err, omnislash.ErrDeceptionUncertain) {
+		return false
+	}
+	if res != nil && len(res.Responses) > 0 {
+		return false
+	}
+	return omnislash.IsProxyTransportError(err)
+}
+
+func (r *Runner) runOnce(ctx context.Context, target Target, p Probe) (*Result, error) {
 	sink := &payloadSink{}
 	ctx = withPayloadSink(ctx, sink)
 
@@ -141,7 +192,7 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 			defer session.Close()
 			src := &sessionSource{
 				session: session,
-				tls:     r.TLS,
+				tls:     r.tlsConfigFor(target),
 				addr:    target.Addr,
 				race:    isRaceProbe(p),
 				runner:  r,
@@ -171,9 +222,6 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 		}
 		return runErr
 	})
-	if errors.Is(err, util.ErrPrecisionLost) {
-		return out, fmt.Errorf("probe %s: %w", p.Name(), err)
-	}
 	return out, err
 }
 
@@ -251,11 +299,44 @@ func (r *Runner) dial(ctx context.Context, target Target) (*omnislash.Session, n
 	return session, conn, nil
 }
 
+// tlsConfigFor keeps TLS bound to the original hostname even when the scope
+// pins CONNECT to a literal IP. ServerName drives both SNI and certificate
+// chain verification, so using the resolved address here would break IP SANs.
+func (r *Runner) tlsConfigFor(target Target) *tls.Config {
+	if r == nil || r.TLS == nil {
+		return nil
+	}
+	cfg := r.TLS.Clone()
+	if host := strings.TrimSpace(target.Host); host != "" && net.ParseIP(host) == nil {
+		cfg.ServerName = host
+	}
+	return cfg
+}
+
+// takeWarm reuses a warmed tunnel only when it belongs to this session's
+// pinned proxy. A tunnel from another exit would silently move the experiment
+// to a different IP, which is forbidden.
+func (r *Runner) takeWarm(ctx context.Context, session *omnislash.Session, target Target) (net.Conn, bool) {
+	if r == nil || r.Warmer == nil || r.TLS == nil || session == nil || session.Proxy() == nil {
+		return nil, false
+	}
+	// The warmer is keyed by the scope-checked host:port, not by the hostname:
+	// resolve_locally may pin CONNECT to an IP while TLS still uses target.Host.
+	addr := strings.TrimSpace(target.Addr)
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return nil, false
+	}
+	return r.Warmer.Take(ctx, addr, session.Proxy())
+}
+
 func (r *Runner) dialSession(ctx context.Context, session *omnislash.Session, target Target) (net.Conn, error) {
+	if conn, ok := r.takeWarm(ctx, session, target); ok {
+		return conn, nil
+	}
 	var conn net.Conn
 	var err error
-	if r.TLS != nil {
-		conn, err = session.DialTLSContext(ctx, "tcp", target.Addr, r.TLS)
+	if tlsCfg := r.tlsConfigFor(target); tlsCfg != nil {
+		conn, err = session.DialTLSContext(ctx, "tcp", target.Addr, tlsCfg)
 	} else {
 		conn, err = session.DialContext(ctx, "tcp", target.Addr)
 	}
@@ -317,6 +398,19 @@ type sessionSource struct {
 }
 
 func (s *sessionSource) Dial(ctx context.Context) (net.Conn, error) {
+	if conn, ok := s.runner.takeWarm(ctx, s.session, s.target); ok {
+		conn = s.runner.guardConn(conn, s.race)
+		if mc := s.runner.wrapMutation(s.ctx, s.target, conn); mc != nil {
+			conn = mc
+			s.mu.Lock()
+			s.mutation = append(s.mutation, mc)
+			s.mu.Unlock()
+		}
+		s.mu.Lock()
+		s.conn = append(s.conn, conn)
+		s.mu.Unlock()
+		return conn, nil
+	}
 	var conn net.Conn
 	var err error
 	if s.tls != nil {

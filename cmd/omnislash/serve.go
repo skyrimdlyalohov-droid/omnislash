@@ -91,6 +91,22 @@ func cmdServe(args []string) error {
 		}
 	}
 
+	// A cached proxies.txt makes the pool immediately usable. Startup checks
+	// then run in the background; without a cached pool they stay synchronous so
+	// the gateway never serves traffic before a verified exit exists.
+	warmStart := pool.Len() > 0
+	if warmStart {
+		logger.Info("cached proxy pool loaded; starting service without blocking on refresh",
+			"proxies", pool.Len())
+	}
+	runStartup := func(fn func()) {
+		if warmStart {
+			go fn()
+		} else {
+			fn()
+		}
+	}
+
 	var scraper *omnislash.Scraper
 	if cfg.Scraper.Enabled {
 		scraper, err = omnislash.NewScraper(pool, cfg.Scraper, logger)
@@ -98,20 +114,24 @@ func cmdServe(args []string) error {
 			return err
 		}
 		if cfg.Scraper.StartupRefresh {
-			sctx := ctx
-			cancel := func() {}
-			if wait := cfg.Scraper.StartupWait.Std(); wait > 0 {
-				sctx, cancel = context.WithTimeout(ctx, wait)
-			}
-			stats, scrapeErr := scraper.Refresh(sctx)
-			cancel()
-			if scrapeErr != nil {
-				logger.Warn("startup scrape failed", "error", scrapeErr)
-			} else {
-				logger.Info("startup scrape finished",
-					"verified", stats.Accepted, "candidates", stats.Candidates,
-					"sources", stats.Sources, "source_errors", stats.SourceErrors)
-			}
+			runStartup(func() {
+				sctx := ctx
+				cancel := func() {}
+				if wait := cfg.Scraper.StartupWait.Std(); wait > 0 {
+					sctx, cancel = context.WithTimeout(ctx, wait)
+				}
+				stats, scrapeErr := scraper.Refresh(sctx)
+				cancel()
+				if scrapeErr != nil {
+					logger.Warn("startup scrape failed", "error", scrapeErr)
+				} else {
+					logger.Info("startup scrape finished",
+						"verified", stats.Accepted, "candidates", stats.Candidates,
+						"prefiltered", stats.Prefiltered,
+						"infantry", stats.Infantry, "sniper", stats.Sniper,
+						"sources", stats.Sources, "source_errors", stats.SourceErrors)
+				}
+			})
 		}
 		go scraper.RunPeriodic(ctx)
 	}
@@ -122,18 +142,20 @@ func cmdServe(args []string) error {
 			return err
 		}
 		if cfg.Health.StartupCheck {
-			sctx := ctx
-			cancel := func() {}
-			if cfg.Health.StartupWait.Std() > 0 {
-				sctx, cancel = context.WithTimeout(ctx, cfg.Health.StartupWait.Std())
-			}
-			summary := checker.CheckAll(sctx)
-			cancel()
-			logger.Info("startup proxy check finished",
-				"checked", summary.Checked, "healthy", summary.Healthy, "failed", summary.Failed)
-			if summary.Healthy == 0 {
-				logger.Warn("no healthy proxies after startup check; gateway will return 502 until a proxy recovers")
-			}
+			runStartup(func() {
+				sctx := ctx
+				cancel := func() {}
+				if cfg.Health.StartupWait.Std() > 0 {
+					sctx, cancel = context.WithTimeout(ctx, cfg.Health.StartupWait.Std())
+				}
+				summary := checker.CheckAll(sctx)
+				cancel()
+				logger.Info("startup proxy check finished",
+					"checked", summary.Checked, "healthy", summary.Healthy, "failed", summary.Failed)
+				if summary.Healthy == 0 {
+					logger.Warn("no healthy proxies after startup check; gateway will return 502 until a proxy recovers")
+				}
+			})
 		}
 		go checker.RunPeriodic(ctx)
 	}

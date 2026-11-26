@@ -43,14 +43,29 @@ func dialThroughProxy(
 	base *net.Dialer,
 	p *Proxy,
 	target string,
-	handshakeTimeout time.Duration,
+	connectTimeout, handshakeTimeout time.Duration,
 	tlsSkipVerify bool,
 ) (net.Conn, error) {
-	conn, err := base.DialContext(ctx, "tcp", p.Addr)
+	// The TCP dial gets its own budget. A proxy that never accepts must not
+	// consume the larger handshake budget, and it must never block the fast
+	// pre-filter for the full validation timeout.
+	dialCtx := ctx
+	cancel := func() {}
+	if connectTimeout > 0 {
+		dialCtx, cancel = context.WithTimeout(ctx, connectTimeout)
+	}
+	conn, err := base.DialContext(dialCtx, "tcp", p.Addr)
+	cancel()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("dial proxy: %w", err)
 	}
 
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 10 * time.Second
+	}
 	deadline := time.Now().Add(handshakeTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d

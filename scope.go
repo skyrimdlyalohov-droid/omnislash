@@ -22,6 +22,16 @@ type scopeDNSEntry struct {
 	expires time.Time
 }
 
+// scopePinnedEntry remembers which approved hostname produced a literal IP
+// target. It lets a second scope check accept the already validated address
+// (no "target IP is not allowed" after resolve_locally) and lets TLS keep the
+// certificate identity of the original domain instead of the pinned IP.
+type scopePinnedEntry struct {
+	host    string
+	port    string
+	expires time.Time
+}
+
 // Scope is a fail-closed target allowlist. It is intentionally independent
 // from proxy health: health probes and scraper validation use raw proxy dials
 // and bypass the scope, while every application dial is checked.
@@ -36,9 +46,10 @@ type Scope struct {
 	resolver *net.Resolver
 	lookup   func(context.Context, string) ([]net.IP, error)
 
-	mu    sync.Mutex
-	cache map[string]scopeDNSEntry
-	now   func() time.Time
+	mu     sync.Mutex
+	cache  map[string]scopeDNSEntry
+	pinned map[string]scopePinnedEntry
+	now    func() time.Time
 }
 
 // metadataCIDRs are denied even when allow_private is enabled: reaching a cloud
@@ -68,6 +79,7 @@ func NewScope(cfg ScopeConfig) (*Scope, error) {
 		ports:    make(map[int]struct{}, len(cfg.AllowPorts)),
 		allPorts: len(cfg.AllowPorts) == 0,
 		cache:    make(map[string]scopeDNSEntry),
+		pinned:   make(map[string]scopePinnedEntry),
 		resolver: net.DefaultResolver,
 		now:      time.Now,
 	}
@@ -162,6 +174,13 @@ func (s *Scope) CheckTarget(ctx context.Context, target string) (string, error) 
 		if err := s.checkIP(ip); err != nil {
 			return "", fmt.Errorf("scope: target %s: %w", target, err)
 		}
+		// A literal produced by resolve_locally was already checked against
+		// allow_hosts/CIDRs together with its original hostname. Accept the
+		// same host:port on re-check; a different port still needs its own
+		// allow decision. Deny rules above always apply.
+		if s.pinnedTarget(target, portText) {
+			return target, nil
+		}
 		if !s.hostAllowed(host) && !s.cidrAllowed(ip) {
 			return "", fmt.Errorf("scope: target IP %s is not allowed", ip)
 		}
@@ -191,9 +210,56 @@ func (s *Scope) CheckTarget(ctx context.Context, target string) (string, error) 
 		}
 	}
 	if s.cfg.ResolveLocally {
-		return net.JoinHostPort(ips[0].String(), portText), nil
+		pinned := net.JoinHostPort(ips[0].String(), portText)
+		s.rememberPin(pinned, host, portText)
+		return pinned, nil
 	}
 	return target, nil
+}
+
+func (s *Scope) pinnedTarget(addr, port string) bool {
+	if s == nil || s.pinned == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pin, ok := s.pinned[strings.TrimSpace(addr)]
+	return ok && pin.port == port && s.now().Before(pin.expires)
+}
+
+func (s *Scope) rememberPin(addr, host, port string) {
+	if s == nil || s.pinned == nil {
+		return
+	}
+	ttl := s.cfg.DNSCacheTTL.Std()
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pinned) > 4096 {
+		clear(s.pinned)
+	}
+	s.pinned[strings.TrimSpace(addr)] = scopePinnedEntry{
+		host: normalizeScopeHost(host), port: port, expires: s.now().Add(ttl),
+	}
+}
+
+// OriginalHost returns the hostname that resolve_locally pinned to addr. TLS
+// must use it for SNI and certificate verification even though CONNECT uses
+// the literal IP returned by CheckTarget. An unknown or expired address yields
+// an empty string so callers can fall back to the address itself.
+func (s *Scope) OriginalHost(addr string) string {
+	if s == nil || s.pinned == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pin, ok := s.pinned[strings.TrimSpace(addr)]
+	if !ok || !s.now().Before(pin.expires) {
+		return ""
+	}
+	return pin.host
 }
 
 // Enabled reports whether target checks are active.

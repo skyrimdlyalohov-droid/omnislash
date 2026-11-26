@@ -86,6 +86,12 @@ func classifyOutcome(res *probe.Result, err error) OutcomeLabel {
 	if errors.Is(err, omnislash.ErrPrecisionLost) || errors.Is(err, omnislash.ErrDeceptionUncertain) {
 		return OutcomeEngineFault
 	}
+	// EOF, resets, CONNECT failures and timeouts happened before the target
+	// answered. They are proxy failures even if a caller attached a partial
+	// result, and must stay out of the learning path.
+	if omnislash.IsProxyTransportError(err) {
+		return OutcomeProxyFailed
+	}
 	if res == nil || len(res.Responses) == 0 {
 		return OutcomeProxyFailed
 	}

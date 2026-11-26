@@ -304,6 +304,37 @@ func (p *Proxy) markBan(now time.Time, reason string, cooldown time.Duration) {
 	}
 }
 
+// addLatencySample records one successful raw admission round. The samples feed
+// the IQR gate used by SniperTier; they are latency observations, not target
+// responses, so they never affect the WAF/learning outcome of a probe.
+func (p *Proxy) addLatencySample(latency time.Duration) {
+	if p == nil || latency <= 0 {
+		return
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.latency == 0 {
+		p.latency = latency
+	} else {
+		p.latency = time.Duration(float64(p.latency)*0.8 + float64(latency)*0.2)
+	}
+	p.latencySamples = append(p.latencySamples, latency)
+	if len(p.latencySamples) > maxLatencySamples {
+		p.latencySamples = p.latencySamples[len(p.latencySamples)-maxLatencySamples:]
+	}
+	p.p90Latency = percentileDuration(p.latencySamples, 0.90)
+	if !p.alive {
+		p.alive = true
+	}
+	if !p.checked {
+		p.checked = true
+	}
+	if p.lastChecked.IsZero() {
+		p.lastChecked = now
+	}
+}
+
 // setAdmissionMode records which admission suite this proxy passed.
 func (p *Proxy) setAdmissionMode(mode string) {
 	p.mu.Lock()
@@ -326,6 +357,20 @@ func (p *Proxy) P90Latency() time.Duration {
 		return p.p90Latency
 	}
 	return p.latency
+}
+
+// P75Latency returns the rolling 75th percentile latency. Hedged dials use it
+// as the moment to launch a backup exit.
+func (p *Proxy) P75Latency() time.Duration {
+	p.mu.Lock()
+	samples := append([]time.Duration(nil), p.latencySamples...)
+	fallback := p.latency
+	p.mu.Unlock()
+	if len(samples) == 0 {
+		return fallback
+	}
+	sortDurations(samples)
+	return percentileDuration(samples, 0.75)
 }
 
 // IQR returns the interquartile range of recent latency samples.

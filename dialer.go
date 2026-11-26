@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +59,7 @@ func NewDialer(pool *Pool, logger *slog.Logger) *Dialer {
 		base: &net.Dialer{
 			Timeout:   pool.cfg.DialTimeout.Std(),
 			KeepAlive: 30 * time.Second,
+			Control:   tuneDialSocket,
 		},
 	}
 	for _, name := range pool.cfg.TLSFingerprints {
@@ -163,7 +165,7 @@ func (d *Dialer) dialProxy(ctx context.Context, pr *Proxy, target string) (net.C
 		if ctx.Err() == nil {
 			pr.markFailure(d.pool.now(), err, d.pool.cfg.Cooldown)
 		}
-		return nil, fmt.Errorf("%s: %w", pr.Label(), err)
+		return nil, markProxyTransport(fmt.Errorf("%s: %w", pr.Label(), err))
 	}
 	pr.markSuccess(d.pool.now(), time.Since(start))
 	return conn, nil
@@ -173,6 +175,19 @@ func (d *Dialer) dialProxy(ctx context.Context, pr *Proxy, target string) (net.C
 // update health counters. It is used by the health checker, which scores the
 // full HTTP probe rather than just the TCP handshake.
 func (d *Dialer) dialProxyRaw(ctx context.Context, pr *Proxy, target string) (net.Conn, error) {
+	host, _, splitErr := net.SplitHostPort(target)
+	if splitErr != nil || host == "" {
+		host = target
+	}
+	// Charge the per-host interval to the original name even when the proxy
+	// CONNECT was pinned to a literal IP; otherwise rotating resolved IPs
+	// would bypass the spacing rule.
+	if original := d.pool.scope.OriginalHost(target); original != "" {
+		host = original
+	}
+	if err := d.pool.WaitHost(ctx, host); err != nil {
+		return nil, err
+	}
 	if err := pr.acquire(ctx); err != nil {
 		return nil, err
 	}
@@ -182,11 +197,16 @@ func (d *Dialer) dialProxyRaw(ctx context.Context, pr *Proxy, target string) (ne
 			handshake = cut
 		}
 	}
+	connect := d.pool.cfg.ProxyConnectTimeout.Std()
+	if connect <= 0 || connect > handshake {
+		connect = handshake
+	}
 	conn, err := dialThroughProxy(
 		ctx,
 		d.base,
 		pr,
 		target,
+		connect,
 		handshake,
 		d.pool.cfg.ProxyTLSSkipVerify,
 	)
@@ -231,9 +251,14 @@ func (d *Dialer) DialTLSContext(ctx context.Context, network, addr string, cfg *
 		cfg = cfg.Clone()
 	}
 	if cfg.ServerName == "" {
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
-			cfg.ServerName = host
+		cfg.ServerName = d.sniFor(addr)
+	}
+	if hs := d.pool.cfg.UTLSHandshakeTimeout.Std(); hs > 0 {
+		deadline := time.Now().Add(hs)
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
 		}
+		_ = raw.SetDeadline(deadline)
 	}
 	tc := tls.Client(raw, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {
@@ -241,9 +266,238 @@ func (d *Dialer) DialTLSContext(ctx context.Context, network, addr string, cfg *
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("tls handshake with %s: %w", addr, err)
+		return nil, markProxyTransport(fmt.Errorf("tls handshake with %s: %w", addr, err))
 	}
-	return tc, nil
+	_ = raw.SetDeadline(time.Time{})
+	return newTTFBConn(tc, d.pool.cfg.TTFBTimeout.Std()), nil
+}
+
+// sniFor resolves the TLS identity of addr. A scope-pinned IP maps back to the
+// hostname that was approved in allow_hosts; using the IP here would produce
+// "certificate is valid for <host>, not <IP>" (IP SANs) errors and leak the
+// resolved address as SNI.
+func (d *Dialer) sniFor(addr string) string {
+	if d == nil || d.pool == nil {
+		return addr
+	}
+	if original := d.pool.scope.OriginalHost(addr); original != "" {
+		return original
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
+		return host
+	}
+	return addr
+}
+
+// hedgedTLSConfig derives the TLS settings for a speculative dial. The SNI is
+// the original hostname even when CONNECT is pinned to a literal IP, and a
+// public pool never accepts an unverified certificate chain: callers cannot
+// disable verification for a proxy-backed request in the strict trust tier.
+func (d *Dialer) hedgedTLSConfig(sni string, cfg *tls.Config) *tls.Config {
+	out := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
+	if cfg != nil {
+		out = cfg.Clone()
+	}
+	if out.ServerName == "" {
+		out.ServerName = sni
+	}
+	if out.MinVersion < tls.VersionTLS12 {
+		out.MinVersion = tls.VersionTLS12
+	}
+	if len(out.NextProtos) == 0 {
+		out.NextProtos = []string{"http/1.1"}
+	}
+	if d != nil && d.pool != nil && strings.EqualFold(strings.TrimSpace(d.pool.cfg.TrustTier), TrustTierStrict) {
+		out.InsecureSkipVerify = false
+	}
+	return out
+}
+
+// dialHedgedTLS opens one proxy tunnel and completes a verified TLS handshake.
+// It is used for both the primary and the backup attempt; every connection here
+// is a distinct physical socket and has already been charged a global token.
+func (d *Dialer) dialHedgedTLS(ctx context.Context, pr *Proxy, target, sni string, cfg *tls.Config) (net.Conn, error) {
+	raw, err := d.dialProxy(ctx, pr, target)
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg := d.hedgedTLSConfig(sni, cfg)
+	hs := d.pool.cfg.UTLSHandshakeTimeout.Std()
+	var tc net.Conn
+	if len(d.fingerprints) > 0 {
+		// Speculative and warmed tunnels present the same browser/mobile
+		// ClientHello as a pinned session. The socket is already dialled
+		// through pr, so uTLS cannot change the exit path.
+		id := d.fingerprints[(d.fpSeq.Add(1)-1)%uint64(len(d.fingerprints))]
+		tc, err = openTLSWithFingerprint(ctx, raw, sni, tlsCfg, id, hs)
+	} else {
+		if hs > 0 {
+			deadline := time.Now().Add(hs)
+			if d0, ok := ctx.Deadline(); ok && d0.Before(deadline) {
+				deadline = d0
+			}
+			_ = raw.SetDeadline(deadline)
+		}
+		stdlib := tls.Client(raw, tlsCfg)
+		if err = stdlib.HandshakeContext(ctx); err == nil {
+			tc = stdlib
+		}
+	}
+	if err != nil {
+		_ = raw.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, markProxyTransport(fmt.Errorf("hedged tls handshake with %s: %w", sni, err))
+	}
+	if !tlsCfg.InsecureSkipVerify && connVerifiedChains(tc) == 0 {
+		_ = raw.Close()
+		return nil, markProxyTransport(fmt.Errorf("hedged tls with %s: target certificate chain was not verified", sni))
+	}
+	_ = raw.SetDeadline(time.Time{})
+	return newTTFBConn(tc, d.pool.cfg.TTFBTimeout.Std()), nil
+}
+
+type hedgeAttempt struct {
+	conn  net.Conn
+	proxy *Proxy
+	err   error
+}
+
+// HedgedDialContext races a second Infantry exit against a slow primary. The
+// primary has already been selected by the pool (Thompson Sampling when that
+// strategy is configured); the backup is selected here with the primary
+// excluded. A backup is launched only after P75(primary) elapses, clamped to
+// 150..600ms, and only when the global limiter has a token to spend. No token
+// means no hedge, never a queue jump.
+//
+// The first *verified* TLS handshake wins. The losing goroutine closes its own
+// net.Conn as soon as it observes that another attempt won; it is never handed
+// to a caller. Both sockets are accounted for by the shared limiter and by
+// per-host spacing. Sniper sessions and authenticated requests never hedge.
+func (d *Dialer) HedgedDialContext(ctx context.Context, primary *Proxy, network, addr string, cfg *tls.Config) (net.Conn, error) {
+	if d == nil || d.pool == nil {
+		return nil, errors.New("omnislash: hedged dial requires a dialer and pool")
+	}
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, fmt.Errorf("omnislash: unsupported network %q", network)
+	}
+	if d.pool.closed.Load() {
+		return nil, ErrPoolClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Check the scope first: the caller may pass a locally pinned IP. The
+	// original hostname is kept separately for SNI and certificate checks.
+	target, err := d.pool.scope.CheckTarget(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	sni := ""
+	if cfg != nil {
+		sni = cfg.ServerName
+	}
+	if sni == "" {
+		sni = d.sniFor(addr)
+	}
+	if primary == nil {
+		primary, err = d.pool.pick(nil, addr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// The primary consumes the application's normal token. WaitGlobal's marker
+	// prevents a second charge when the HTTP transport already waited.
+	ctx, err = d.pool.WaitGlobal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.pool.Allow(); err != nil {
+		return nil, err
+	}
+	if primary.Tier() != TierInfantry {
+		return d.dialHedgedTLS(ctx, primary, target, sni, cfg)
+	}
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan hedgeAttempt, 2)
+	var raceMu sync.Mutex
+	var winner net.Conn
+	claim := func(a hedgeAttempt) bool {
+		raceMu.Lock()
+		defer raceMu.Unlock()
+		if a.err == nil && winner == nil {
+			winner = a.conn
+			return true
+		}
+		return false
+	}
+	launch := func(pr *Proxy) {
+		go func() {
+			conn, dialErr := d.dialHedgedTLS(raceCtx, pr, target, sni, cfg)
+			won := false
+			defer func() {
+				// Loser: close immediately, never expose this socket upstream.
+				// The winner is handed to the caller and closed by them.
+				if conn != nil && !won {
+					_ = conn.Close()
+				}
+			}()
+			if dialErr == nil {
+				won = claim(hedgeAttempt{conn: conn, proxy: pr})
+			}
+			results <- hedgeAttempt{conn: conn, proxy: pr, err: dialErr}
+		}()
+	}
+	launch(primary)
+
+	delay := primary.P75Latency()
+	if delay < 150*time.Millisecond {
+		delay = 150 * time.Millisecond
+	}
+	if delay > 600*time.Millisecond {
+		delay = 600 * time.Millisecond
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	timerC := timer.C
+	backup := false
+	for {
+		select {
+		case res := <-results:
+			if res.err == nil {
+				return res.conn, nil
+			}
+			if backup {
+				return nil, res.err
+			}
+			// The primary died before the hedge window: no reason to spend a
+			// second token on a backup for a failure that was already final.
+			return nil, res.err
+		case <-timerC:
+			if backup {
+				continue
+			}
+			if !d.pool.TryGlobalToken() {
+				// Rate limit is tight: speculation is disabled for this race.
+				timerC = nil
+				continue
+			}
+			alt, pickErr := d.pool.pick(map[*Proxy]struct{}{primary: {}}, addr)
+			if pickErr != nil {
+				timerC = nil
+				continue
+			}
+			backup = true
+			launch(alt)
+		case <-raceCtx.Done():
+			return nil, raceCtx.Err()
+		}
+	}
 }
 
 func (d *Dialer) directDialContext(ctx context.Context, network, addr string) (net.Conn, error) {

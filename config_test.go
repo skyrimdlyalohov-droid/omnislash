@@ -29,7 +29,7 @@ func TestStrictConnectForbidsAdmissionSkipVerify(t *testing.T) {
 	}
 }
 
-func TestHTTPParsingAdmissionRequiresEcho(t *testing.T) {
+func TestHTTPParsingAdmissionAcceptsCanaryWithoutEcho(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Scraper.Enabled = true
 	cfg.Scraper.Sources = []SourceConfig{{URL: "https://example.com/list.txt", Type: "text"}}
@@ -37,8 +37,8 @@ func TestHTTPParsingAdmissionRequiresEcho(t *testing.T) {
 	cfg.Scraper.Validation.Admission.Enabled = true
 	cfg.Scraper.Validation.Admission.EchoAddr = ""
 	cfg.Scraper.Validation.Admission.TLSCanaryURL = "https://api.ipify.org"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires admission.echo_addr") {
-		t.Fatalf("http_parsing echo validation = %v", err)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("self-contained http_parsing config was rejected: %v", err)
 	}
 }
 

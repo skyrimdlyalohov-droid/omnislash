@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -868,6 +869,14 @@ func (d *Daemon) record(j *JobConfig, attempt int, res *probe.Result, err error,
 
 func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err error, success bool, roll explorationRoll) {
 	label := classifyOutcome(res, err)
+	// A broken exit is evidence about the proxy, never about the technique.
+	// It is written to the audit line but must not reach learning (FSM sonar,
+	// reward deltas, Python online loop or learned_weights.json).
+	proxyFailure := label == OutcomeProxyFailed || omnislash.IsProxyTransportError(err) ||
+		(res != nil && len(res.Responses) == 0 && err != nil)
+	if proxyFailure {
+		success = false
+	}
 	rec := Record{
 		Time:     d.now(),
 		Job:      j.Name,
@@ -920,7 +929,7 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 	// The orchestrator's sonar sees the same result the audit log records. No
 	// extra dial happens here: latency, NCD and entropy are derived from bytes
 	// already captured by the probe.
-	if d.orchestrator != nil {
+	if !proxyFailure && d.orchestrator != nil {
 		d.orchestrator.ObserveResult(res)
 	}
 	if d.audit != nil {
@@ -932,7 +941,7 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 		}
 	}
 	fedBack := false
-	if d.orchestrator != nil {
+	if !proxyFailure && d.orchestrator != nil {
 		state, ok := parserStateOf(rec.ParserDivergence)
 		if !ok && rec.Outcome == string(OutcomeEngineFault) {
 			state, ok = probe.ParserEngineFault, true
@@ -950,12 +959,15 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 			fedBack = true
 		}
 	}
-	if !fedBack && d.learning != nil && d.cfg.IsLearningEnabled() {
+	if !proxyFailure && !fedBack && d.learning != nil && d.cfg.IsLearningEnabled() {
 		d.learning.Observe(rec)
 	}
 	// Decay is driven by observed attempts, not by wall clock: a quiet lab does
-	// not keep exploring forever and a busy one settles faster.
-	d.observations.Add(1)
+	// not keep exploring forever and a busy one settles faster. Proxy failures
+	// are excluded so a dead public pool cannot rewrite learned weights.
+	if !proxyFailure {
+		d.observations.Add(1)
+	}
 	if d.log != nil {
 		d.log.Debug("probe outcome", "job", j.Name, "attempt", attempt,
 			"outcome", string(label), "trainable", label.Trainable(), "explore", roll.explore)
@@ -1172,6 +1184,9 @@ type RunnerSet struct {
 	H1     *probe.Runner
 	H2     *probe.Runner
 	dialer *omnislash.Dialer
+
+	warmMu sync.Mutex
+	warmer *omnislash.TunnelWarmer
 }
 
 // NewRunnerSet builds the three runners from one dialer.
@@ -1193,6 +1208,41 @@ func (s *RunnerSet) TargetCooling(host string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return s.dialer.TargetCooling(host)
+}
+
+// EnableTunnelWarmer opts TLS runners into a shared tunnel reserve for one
+// active target. addr must be host:port and sni must be the original hostname;
+// keeping them separate is what makes resolve_locally safe. The warmer is
+// stopped by cancelling ctx and its sockets are closed by CloseTunnelWarmer.
+func (s *RunnerSet) EnableTunnelWarmer(ctx context.Context, addr, sni string, tlsCfg *tls.Config) error {
+	if s == nil || s.dialer == nil || s.H1 == nil || s.H2 == nil {
+		return errors.New("daemon: runner set has no TLS runners")
+	}
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	if s.warmer == nil {
+		s.warmer = omnislash.NewTunnelWarmer(s.dialer, 0, 0)
+	}
+	s.warmer.SetTLSConfig(tlsCfg)
+	s.H1.Warmer = s.warmer
+	s.H2.Warmer = s.warmer
+	s.warmer.Start(ctx, addr, sni)
+	return nil
+}
+
+// CloseTunnelWarmer releases every warmed socket. Calling it is safe even when
+// warming was never enabled.
+func (s *RunnerSet) CloseTunnelWarmer() {
+	if s == nil {
+		return
+	}
+	s.warmMu.Lock()
+	w := s.warmer
+	s.warmer = nil
+	s.warmMu.Unlock()
+	if w != nil {
+		w.Close()
+	}
 }
 
 // SetLimits applies the transport config's probe section to every TLS mode.

@@ -45,6 +45,8 @@ type Pool struct {
 	scraperStats func() ScraperStats
 
 	globalLimiter *tokenBucket
+	hostMu        sync.Mutex
+	hostNext      map[string]time.Time
 	circuit       *CircuitBreaker
 	audit         *AuditLogger
 	deception     *DeceptionFilter
@@ -100,14 +102,15 @@ func NewPool(cfg *Config, proxies []*Proxy, logger *slog.Logger) (*Pool, error) 
 		return nil, err
 	}
 	p := &Pool{
-		cfg:     c,
-		proxies: proxies,
-		scope:   scope,
-		log:     logger,
-		sticky:  make(map[string]stickyEntry),
-		targets: make(map[string]*targetCooldownState),
-		audit:   audit,
-		now:     time.Now,
+		cfg:      c,
+		proxies:  proxies,
+		scope:    scope,
+		log:      logger,
+		sticky:   make(map[string]stickyEntry),
+		hostNext: make(map[string]time.Time),
+		targets:  make(map[string]*targetCooldownState),
+		audit:    audit,
+		now:      time.Now,
 	}
 	if c.RateLimit.GlobalRPS > 0 {
 		p.globalLimiter = newTokenBucket(c.RateLimit.GlobalRPS, c.RateLimit.GlobalBurst)
@@ -238,6 +241,64 @@ func (p *Pool) WaitGlobal(ctx context.Context) (context.Context, error) {
 }
 
 type globalWaitKey struct{}
+
+// WaitGlobalSocket always spends a fresh token, ignoring the nested-dial
+// marker. Hedged backups and warmed tunnels are separate physical sockets and
+// must be charged honestly against global_rps.
+func (p *Pool) WaitGlobalSocket(ctx context.Context) (context.Context, error) {
+	if p == nil || p.globalLimiter == nil {
+		return ctx, nil
+	}
+	if err := p.globalLimiter.wait(ctx); err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, globalWaitKey{}, true), nil
+}
+
+// TryGlobalToken spends a token for optional acceleration only when one is
+// immediately available. No token means no hedge, never a queue jump.
+func (p *Pool) TryGlobalToken() bool {
+	if p == nil || p.globalLimiter == nil {
+		return true
+	}
+	return p.globalLimiter.tryWait()
+}
+
+// WaitHost enforces rate_limit.per_host_min_interval between physical sockets
+// to the same target host. It is applied to primary, hedged, retried and warmed
+// dials alike.
+func (p *Pool) WaitHost(ctx context.Context, host string) error {
+	if p == nil || host == "" {
+		return nil
+	}
+	interval := p.cfg.RateLimit.PerHostMinInterval.Std()
+	if interval <= 0 {
+		return nil
+	}
+	for {
+		p.hostMu.Lock()
+		now := p.now()
+		next := p.hostNext[host]
+		if now.Before(next) {
+			wait := next.Sub(now)
+			p.hostMu.Unlock()
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		if len(p.hostNext) > 8192 {
+			clear(p.hostNext)
+		}
+		p.hostNext[host] = now.Add(interval)
+		p.hostMu.Unlock()
+		return nil
+	}
+}
 
 // Allow checks the safety breaker. It returns ErrCircuitOpen while traffic is
 // stopped.

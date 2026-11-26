@@ -93,6 +93,17 @@ func TestScopeResolveLocallyPinsAllowedAddress(t *testing.T) {
 	if got != "93.184.216.34:8443" {
 		t.Fatalf("got %q, want pinned address", got)
 	}
+	// The pinned literal is already approved: a second scope check must not
+	// fail with "target IP is not allowed", and TLS must recover the domain.
+	if got, err := s.CheckTarget(context.Background(), "93.184.216.34:8443"); err != nil || got != "93.184.216.34:8443" {
+		t.Fatalf("pinned IP re-check failed: got %q, err %v", got, err)
+	}
+	if host := s.OriginalHost("93.184.216.34:8443"); host != "pinned.example" {
+		t.Fatalf("OriginalHost = %q, want pinned.example", host)
+	}
+	if _, err := s.CheckTarget(context.Background(), "93.184.216.34:9443"); err == nil {
+		t.Fatal("pinned IP must not approve a different port")
+	}
 }
 
 func TestScopeRejectsHostnameResolvingToPrivate(t *testing.T) {

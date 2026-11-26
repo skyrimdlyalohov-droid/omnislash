@@ -40,6 +40,12 @@ type Validator struct {
 	rootCAs   *x509.CertPool
 	admitRoot *x509.CertPool
 
+	// Split deadlines copied from the pool config by NewScraper. Zero keeps the
+	// historical admission.Timeout behaviour for directly constructed validators.
+	connectTimeoutValue   time.Duration
+	handshakeTimeoutValue time.Duration
+	ttfbTimeoutValue      time.Duration
+
 	realMu     sync.Mutex
 	realIP     net.IP
 	realCached bool
@@ -89,6 +95,18 @@ func NewValidatorForTier(cfg ValidationConfig, tier string, logger *slog.Logger)
 		logger = slog.Default()
 	}
 	return &Validator{cfg: cfg, tier: tier, log: logger, profile: profile, now: time.Now}, nil
+}
+
+// SetTimeouts installs the split deadlines used by raw admission probes. It is
+// called by NewScraper with the pool config; zero values keep the.admission
+// fallback for standalone validators.
+func (v *Validator) SetTimeouts(connect, handshake, ttfb time.Duration) {
+	if v == nil {
+		return
+	}
+	v.connectTimeoutValue = connect
+	v.handshakeTimeoutValue = handshake
+	v.ttfbTimeoutValue = ttfb
 }
 
 // RealIP returns the scanner's real public address, either from the config or
@@ -209,11 +227,8 @@ func (v *Validator) attempt(ctx context.Context, pr *Proxy, realIP net.IP) (Vali
 			return res, fmt.Errorf("egress %s equals the scanner's real IP", egress)
 		}
 	}
-	if err := v.admit(ctx, pr); err != nil {
+	if err := v.admitTiered(ctx, pr); err != nil {
 		return res, err
-	}
-	if v.cfg.Admission.Enabled {
-		pr.setAdmissionMode(v.cfg.Mode)
 	}
 	res.EgressIP = egress.String()
 	res.Canaries = successes

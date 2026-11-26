@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -28,9 +30,12 @@ type ScraperStats struct {
 	Sources      int        `json:"sources"`
 	SourceErrors int        `json:"source_errors"`
 	Candidates   int        `json:"candidates"`
+	Prefiltered  int        `json:"prefiltered"`
 	Validated    int        `json:"validated"`
 	Accepted     int        `json:"accepted"`
 	Rejected     int        `json:"rejected"`
+	Infantry     int        `json:"infantry"`
+	Sniper       int        `json:"sniper"`
 	PoolSize     int        `json:"pool_size"`
 	LastError    string     `json:"last_error,omitempty"`
 }
@@ -82,6 +87,8 @@ func NewScraper(pool *Pool, cfg ScraperConfig, logger *slog.Logger) (*Scraper, e
 		if err != nil {
 			return nil, err
 		}
+		v.SetTimeouts(pool.cfg.ProxyConnectTimeout.Std(),
+			pool.cfg.UTLSHandshakeTimeout.Std(), pool.cfg.TTFBTimeout.Std())
 		s.validator = v
 	}
 	pool.SetScraperStats(s.Stats)
@@ -98,12 +105,12 @@ func (s *Scraper) Stats() ScraperStats {
 // Refresh downloads all sources, validates candidates and hot-swaps the pool.
 // The returned error describes a failed or discarded refresh; the previous pool
 // contents are left untouched in that case.
-func (s *Scraper) Refresh(ctx context.Context) (ScraperStats, error) {
+func (s *Scraper) Refresh(ctx context.Context) (st ScraperStats, refreshErr error) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 
 	started := s.now()
-	st := ScraperStats{
+	st = ScraperStats{
 		Running:   true,
 		StartedAt: &started,
 		Sources:   len(s.cfg.Sources),
@@ -116,6 +123,8 @@ func (s *Scraper) Refresh(ctx context.Context) (ScraperStats, error) {
 		st.FinishedAt = &finished
 		st.DurationMS = float64(finished.Sub(started).Microseconds()) / 1000
 		st.PoolSize = s.pool.Len()
+		st.Infantry = s.pool.InfantryCount()
+		st.Sniper = s.pool.SniperCount()
 		s.storeStats(st)
 	}()
 
@@ -131,6 +140,18 @@ func (s *Scraper) Refresh(ctx context.Context) (ScraperStats, error) {
 	if max := s.cfg.MaxCandidates; max > 0 && len(candidates) > max {
 		candidates = candidates[:max]
 		st.Candidates = len(candidates)
+	}
+
+	// Stage 1: cheap TCP + CONNECT/SOCKS5 handshake. Dead public proxies are
+	// discarded before any expensive TLS fingerprint or egress canary traffic.
+	if s.cfg.Prefilter.Enabled {
+		candidates = s.prefilter(ctx, candidates)
+		st.Prefiltered = len(candidates)
+		s.storeStats(st)
+	}
+	if ctx.Err() != nil {
+		st.LastError = ctx.Err().Error()
+		return st, ctx.Err()
 	}
 
 	if s.validator != nil && s.cfg.Validation.RequireDistinctFromRealIP {
@@ -169,20 +190,32 @@ func (s *Scraper) Refresh(ctx context.Context) (ScraperStats, error) {
 // ctx is canceled.
 func (s *Scraper) Run(ctx context.Context) {
 	if s.cfg.StartupRefresh {
-		rctx := ctx
-		cancel := func() {}
-		if wait := s.cfg.StartupWait.Std(); wait > 0 {
-			rctx, cancel = context.WithTimeout(ctx, wait)
-		}
-		st, err := s.Refresh(rctx)
-		cancel()
-		if err != nil {
-			s.log.Warn("startup scrape failed", "error", err)
+		if s.pool.Len() > 0 {
+			// A cached pool is already usable: refresh in the background so a
+			// slow public source never blocks service startup.
+			go s.startupRefresh(ctx)
 		} else {
-			s.log.Info("startup scrape finished", "verified", st.Accepted, "pool", st.PoolSize)
+			s.startupRefresh(ctx)
 		}
 	}
 	s.RunPeriodic(ctx)
+}
+
+func (s *Scraper) startupRefresh(ctx context.Context) {
+	rctx := ctx
+	cancel := func() {}
+	if wait := s.cfg.StartupWait.Std(); wait > 0 {
+		rctx, cancel = context.WithTimeout(ctx, wait)
+	}
+	st, err := s.Refresh(rctx)
+	cancel()
+	if err != nil {
+		s.log.Warn("startup scrape failed", "error", err)
+	} else {
+		s.log.Info("startup scrape finished",
+			"verified", st.Accepted, "prefiltered", st.Prefiltered,
+			"infantry", st.Infantry, "sniper", st.Sniper, "pool", st.PoolSize)
+	}
 }
 
 // RunPeriodic runs only periodic refreshes. Use it when the startup refresh was
@@ -386,6 +419,81 @@ func splitProxyCandidates(token string) []string {
 	return out
 }
 
+// prefilterTarget is a fixed, operator-configured canary used only for the
+// CONNECT/SOCKS5 handshake. No HTTP request is sent through it at this stage.
+func (s *Scraper) prefilterTarget() string {
+	ad := s.cfg.Validation.Admission
+	if addr := strings.TrimSpace(ad.EchoAddr); addr != "" {
+		return addr
+	}
+	if raw := strings.TrimSpace(ad.TLSCanaryURL); raw != "" {
+		if u, err := url.Parse(raw); err == nil && u.Host != "" {
+			if u.Port() == "" {
+				return net.JoinHostPort(u.Hostname(), "443")
+			}
+			return u.Host
+		}
+	}
+	return net.JoinHostPort("1.1.1.1", "443")
+}
+
+// prefilter is the fast first stage of the funnel. It uses 100-150 workers with
+// an independent per-candidate budget, so thousands of dead public proxies do
+// not stall the expensive validation stage.
+func (s *Scraper) prefilter(ctx context.Context, candidates []*Proxy) []*Proxy {
+	if len(candidates) == 0 {
+		return candidates
+	}
+	timeout := s.cfg.Prefilter.Timeout.Std()
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+	concurrency := s.cfg.Prefilter.Concurrency
+	if concurrency < 1 {
+		concurrency = 128
+	}
+	if concurrency > 150 {
+		concurrency = 150
+	}
+	target := s.prefilterTarget()
+	base := &net.Dialer{Timeout: timeout}
+	sem := make(chan struct{}, concurrency)
+	results := make([]bool, len(candidates))
+	var wg sync.WaitGroup
+	for i, pr := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(i int, pr *Proxy) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			pctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			conn, err := dialThroughProxy(pctx, base, pr, target, timeout, timeout, s.pool.cfg.ProxyTLSSkipVerify)
+			if err != nil {
+				s.log.Debug("proxy rejected by prefilter", "proxy", pr.Label(), "error", err)
+				return
+			}
+			_ = conn.Close()
+			results[i] = true
+		}(i, pr)
+	}
+	wg.Wait()
+	out := make([]*Proxy, 0, len(candidates))
+	for i, pr := range candidates {
+		if results[i] {
+			out = append(out, pr)
+		}
+	}
+	return out
+}
+
 func (s *Scraper) validateAll(ctx context.Context, candidates []*Proxy) ([]*Proxy, int) {
 	if s.validator == nil {
 		return candidates, 0
@@ -443,6 +551,7 @@ func (s *Scraper) validateAll(ctx context.Context, candidates []*Proxy) ([]*Prox
 			continue
 		}
 		r.pr.setEgress(r.res.EgressIP, r.res.Latency)
+		r.pr.markSuccess(s.now(), r.res.Latency)
 		accepted = append(accepted, r.pr)
 	}
 	return accepted, rejected
