@@ -148,6 +148,12 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 	)
 	for attempt := 0; attempt <= retries; attempt++ {
 		out, runErr = r.runOnce(ctx, target, p)
+		// A fingerprint that cannot negotiate h2 is a local precondition
+		// failure. Drop the baseline response so it cannot be mistaken for a
+		// verdict, then retry on a fresh session with the next fingerprint.
+		if errors.Is(runErr, ErrNoH2ALPN) {
+			out = nil
+		}
 		if runErr == nil {
 			return out, nil
 		}
@@ -157,7 +163,7 @@ func (r *Runner) Run(ctx context.Context, target Target, p Probe) (*Result, erro
 		// A proxy-only failure says nothing about the target. Retry with a
 		// freshly selected exit; a parsed response is never retried because it
 		// would double-count a WAF verdict as training evidence.
-		if !isRetryableProxyFailure(out, runErr) {
+		if !errors.Is(runErr, ErrNoH2ALPN) && !isRetryableProxyFailure(out, runErr) {
 			break
 		}
 	}
@@ -614,10 +620,8 @@ func (c *mutationConn) finish(res *Result, runErr error) error {
 func (c *mutationConn) NetConn() net.Conn { return c.Conn }
 func (c *mutationConn) Unwrap() net.Conn  { return c.Conn }
 func (c *mutationConn) ConnectionState() tls.ConnectionState {
-	if tc, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		return tc.ConnectionState()
-	}
-	return tls.ConnectionState{}
+	state, _ := omnislash.TLSState(c.Conn)
+	return state
 }
 
 func addFindingOnce(res *Result, f Finding) {

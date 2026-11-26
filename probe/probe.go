@@ -30,19 +30,10 @@ import (
 	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
-// tlsStateConn is the common surface of crypto/tls.Conn and utls.Conn. The
-// runner's guard wrapper exposes it too, so H2 probes still see the negotiated
-// ALPN after response limits are installed.
-type tlsStateConn interface {
-	ConnectionState() tls.ConnectionState
-}
-
+// connectionState normalises crypto/tls and uTLS state across the transport
+// wrappers, so H2 probes see the negotiated ALPN on fingerprinted sessions too.
 func connectionState(conn net.Conn) (tls.ConnectionState, bool) {
-	tc, ok := conn.(tlsStateConn)
-	if !ok {
-		return tls.ConnectionState{}, false
-	}
-	return tc.ConnectionState(), true
+	return omnislash.TLSState(conn)
 }
 
 // Probe is one attack module. Execute must use only the provided conn: no

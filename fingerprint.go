@@ -11,6 +11,48 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// TLSState returns the crypto/tls view of a connection's negotiated state.
+// uTLS defines its own ConnectionState type, so a plain assertion on
+// crypto/tls would miss every fingerprinted session and silently report an
+// empty ALPN to H2 probes. Wrappers are unwrapped until either state type is
+// found; a non-TLS connection reports false.
+func TLSState(conn net.Conn) (tls.ConnectionState, bool) {
+	for cur := conn; cur != nil; {
+		switch tc := cur.(type) {
+		case interface{ ConnectionState() tls.ConnectionState }:
+			return tc.ConnectionState(), true
+		case interface{ ConnectionState() utls.ConnectionState }:
+			return tlsStateFromUTLS(tc.ConnectionState()), true
+		}
+		switch u := cur.(type) {
+		case interface{ Unwrap() net.Conn }:
+			cur = u.Unwrap()
+		case interface{ NetConn() net.Conn }:
+			cur = u.NetConn()
+		default:
+			return tls.ConnectionState{}, false
+		}
+	}
+	return tls.ConnectionState{}, false
+}
+
+func tlsStateFromUTLS(s utls.ConnectionState) tls.ConnectionState {
+	return tls.ConnectionState{
+		Version:                     s.Version,
+		HandshakeComplete:           s.HandshakeComplete,
+		DidResume:                   s.DidResume,
+		CipherSuite:                 s.CipherSuite,
+		NegotiatedProtocol:          s.NegotiatedProtocol,
+		ServerName:                  s.ServerName,
+		PeerCertificates:            s.PeerCertificates,
+		VerifiedChains:              s.VerifiedChains,
+		SignedCertificateTimestamps: s.SignedCertificateTimestamps,
+		OCSPResponse:                s.OCSPResponse,
+		TLSUnique:                   s.TLSUnique,
+		ECHAccepted:                 s.ECHAccepted,
+	}
+}
+
 // TLSFingerprint profiles are used to make a pinned Session present a coherent
 // browser/mobile ClientHello. This is a correctness tool for protocol research
 // (a Go ClientHello changes how intermediaries parse the exchange), not an

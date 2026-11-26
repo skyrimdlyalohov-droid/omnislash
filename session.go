@@ -204,10 +204,8 @@ type warmedConn struct {
 func (c *warmedConn) Proxy() *Proxy     { return c.proxy }
 func (c *warmedConn) NetConn() net.Conn { return c.Conn }
 func (c *warmedConn) ConnectionState() tls.ConnectionState {
-	if tc, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		return tc.ConnectionState()
-	}
-	return tls.ConnectionState{}
+	state, _ := TLSState(c.Conn)
+	return state
 }
 func (c *warmedConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {

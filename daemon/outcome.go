@@ -83,7 +83,8 @@ func classifyOutcome(res *probe.Result, err error) OutcomeLabel {
 	// A recovered panic or a mandatory semantic failure is an engine fault,
 	// even if a partial response was parsed before the fault. It must never
 	// become WAF or target evidence.
-	if errors.Is(err, omnislash.ErrPrecisionLost) || errors.Is(err, omnislash.ErrDeceptionUncertain) {
+	if errors.Is(err, omnislash.ErrPrecisionLost) || errors.Is(err, omnislash.ErrDeceptionUncertain) ||
+		errors.Is(err, probe.ErrNoH2ALPN) {
 		return OutcomeEngineFault
 	}
 	// EOF, resets, CONNECT failures and timeouts happened before the target

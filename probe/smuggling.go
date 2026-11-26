@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -75,25 +76,30 @@ func (p *SmugglingProbe) Execute(ctx context.Context, target Target, conn net.Co
 	nonce := newNonce()
 	canaryPath := "/omnislash-" + nonce
 
-	// Control request: proves the connection works before any desync attempt.
-	baseline, err := render(requestSpec{
-		Method: "GET",
-		Path:   orPath(p.BaselinePath),
-		Headers: []rawhttp.Header{
-			{Key: "Host", Value: target.HostHeader()},
-			{Key: "User-Agent", Value: "omnislash-probe/1"},
-			{Key: "Connection", Value: "keep-alive"},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("probe: render baseline: %w", err)
-	}
-	if err := e.write(baseline); err != nil {
-		return e.finish(), fmt.Errorf("probe: baseline write: %w", err)
-	}
-	base, err := e.read()
-	if err != nil {
-		return e.finish(), fmt.Errorf("probe: baseline read: %w", err)
+	// An h2-negotiated socket speaks HTTP/2 frames, so an HTTP/1.1 control
+	// request would be rejected before the downgrade payload is even sent.
+	// ALPN is the precondition for that variant instead.
+	var base *Response
+	if variant != VariantH2Downgrade {
+		baseline, err := render(requestSpec{
+			Method: "GET",
+			Path:   orPath(p.BaselinePath),
+			Headers: []rawhttp.Header{
+				{Key: "Host", Value: target.HostHeader()},
+				{Key: "User-Agent", Value: "omnislash-probe/1"},
+				{Key: "Connection", Value: "keep-alive"},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("probe: render baseline: %w", err)
+		}
+		if err := e.write(baseline); err != nil {
+			return e.finish(), fmt.Errorf("probe: baseline write: %w", err)
+		}
+		base, err = e.read()
+		if err != nil {
+			return e.finish(), fmt.Errorf("probe: baseline read: %w", err)
+		}
 	}
 
 	if variant == VariantH2Downgrade {
@@ -112,6 +118,12 @@ func (p *SmugglingProbe) Execute(ctx context.Context, target Target, conn net.Co
 	probeResp, probeErr := e.read()
 	if probeErr != nil && !isTimeout(probeErr) && probeResp == nil {
 		return e.finish(), fmt.Errorf("probe: payload read: %w", probeErr)
+	}
+	if variant == VariantH2Downgrade {
+		// No victim stage: the only question is whether HTTP/1.1 bytes on an
+		// h2-negotiated connection produced an HTTP/1.1 response.
+		p.classify(e, variant, base, probeResp, nil, canaryPath, nonce)
+		return e.finish(), nil
 	}
 
 	// The victim is a valid request. If the stream desynced, its bytes are
@@ -154,11 +166,10 @@ func (p *SmugglingProbe) ExecuteMulti(ctx context.Context, target Target, source
 	nonce := newNonce()
 	canaryPath := "/omnislash-" + nonce
 
-	conn, err := source.Dial(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("probe: dial for baseline: %w", err)
-	}
-	e := newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
+	var conn net.Conn
+	var e *exec
+	var base *Response
+	var err error
 	// conn is reassigned for every stage and source.Dial can return a nil conn
 	// with an error. Closing the nil value in a deferred cleanup would panic
 	// and hide the real dial failure as a precision-loss engine fault.
@@ -168,34 +179,46 @@ func (p *SmugglingProbe) ExecuteMulti(ctx context.Context, target Target, source
 		}
 	}()
 
-	baseline, err := render(requestSpec{
-		Method: "GET",
-		Path:   orPath(p.BaselinePath),
-		Headers: []rawhttp.Header{
-			{Key: "Host", Value: target.HostHeader()},
-			{Key: "User-Agent", Value: "omnislash-probe/1"},
-			{Key: "Connection", Value: "keep-alive"},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("probe: render baseline: %w", err)
-	}
-	if err := e.write(baseline); err != nil {
-		return e.finish(), fmt.Errorf("probe: baseline write: %w", err)
-	}
-	base, err := e.read()
-	if err != nil {
-		return e.finish(), fmt.Errorf("probe: baseline read: %w", err)
+	if variant != VariantH2Downgrade {
+		conn, err = source.Dial(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("probe: dial for baseline: %w", err)
+		}
+		e = newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
+		baseline, err := render(requestSpec{
+			Method: "GET",
+			Path:   orPath(p.BaselinePath),
+			Headers: []rawhttp.Header{
+				{Key: "Host", Value: target.HostHeader()},
+				{Key: "User-Agent", Value: "omnislash-probe/1"},
+				{Key: "Connection", Value: "keep-alive"},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("probe: render baseline: %w", err)
+		}
+		if err := e.write(baseline); err != nil {
+			return e.finish(), fmt.Errorf("probe: baseline write: %w", err)
+		}
+		base, err = e.read()
+		if err != nil {
+			return e.finish(), fmt.Errorf("probe: baseline read: %w", err)
+		}
+		// The payload and the victim must not share the baseline socket: a
+		// server that answered with Connection: close has discarded it.
+		_ = conn.Close()
+		conn = nil
 	}
 
-	// The payload and the victim must not share the baseline socket: a server
-	// that answered with Connection: close has already discarded it.
-	_ = conn.Close()
 	conn, err = source.Dial(ctx)
 	if err != nil {
-		return e.finish(), fmt.Errorf("probe: dial for payload: %w", err)
+		return nil, fmt.Errorf("probe: dial for payload: %w", err)
 	}
-	e.attach(conn)
+	if e == nil {
+		e = newExec(ctx, p.Name(), target, conn, p.Timeout, p.MaxHeader, p.MaxBody)
+	} else {
+		e.attach(conn)
+	}
 	if variant == VariantH2Downgrade {
 		if err := checkH2Downgrade(conn); err != nil {
 			return e.finish(), err
@@ -212,6 +235,10 @@ func (p *SmugglingProbe) ExecuteMulti(ctx context.Context, target Target, source
 	probeResp, probeErr := e.read()
 	if probeErr != nil && !isTimeout(probeErr) && probeResp == nil {
 		return e.finish(), fmt.Errorf("probe: payload read: %w", probeErr)
+	}
+	if variant == VariantH2Downgrade {
+		p.classify(e, variant, base, probeResp, nil, canaryPath, nonce)
+		return e.finish(), nil
 	}
 
 	_ = conn.Close()
@@ -393,13 +420,18 @@ func isCorruptionStatus(code int) bool {
 	}
 }
 
+// ErrNoH2ALPN reports a local precondition failure: the pinned session's TLS
+// fingerprint did not negotiate h2, so the downgrade probe could not run. It is
+// never evidence about the target and is retried on a fresh session.
+var ErrNoH2ALPN = errors.New("probe: connection did not negotiate h2")
+
 func checkH2Downgrade(conn net.Conn) error {
 	state, ok := connectionState(conn)
 	if !ok {
-		return fmt.Errorf("probe: h2_downgrade requires a TLS connection")
+		return fmt.Errorf("%w: no TLS state", ErrNoH2ALPN)
 	}
 	if proto := state.NegotiatedProtocol; proto != "h2" {
-		return fmt.Errorf("probe: h2_downgrade requires an h2-negotiated connection, got %q", proto)
+		return fmt.Errorf("%w: got %q", ErrNoH2ALPN, proto)
 	}
 	return nil
 }

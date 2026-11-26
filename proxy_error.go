@@ -1,6 +1,7 @@
 package omnislash
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"strings"
@@ -118,3 +119,11 @@ func (c *ttfbConn) Read(p []byte) (int, error) {
 
 // NetConn lets ProxyOf and probe guards unwrap to the underlying connection.
 func (c *ttfbConn) NetConn() net.Conn { return c.Conn }
+
+// ConnectionState forwards the TLS state through the TTFB guard. Without it a
+// fingerprinted session reports an empty ALPN to H2 probes, so an actually
+// h2-negotiated connection is misclassified as a plain TLS connection.
+func (c *ttfbConn) ConnectionState() tls.ConnectionState {
+	state, _ := TLSState(c.Conn)
+	return state
+}

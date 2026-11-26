@@ -143,8 +143,6 @@ func (c *guardedConn) Unwrap() net.Conn { return c.Conn }
 // non-TLS connection reports the zero state, which fails the h2 check instead
 // of silently downgrading the probe.
 func (c *guardedConn) ConnectionState() tls.ConnectionState {
-	if tc, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		return tc.ConnectionState()
-	}
-	return tls.ConnectionState{}
+	state, _ := omnislash.TLSState(c.Conn)
+	return state
 }
