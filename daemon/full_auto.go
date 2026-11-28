@@ -560,7 +560,32 @@ func (run *fullAutoRun) attack(ctx context.Context) (FullAutoResult, error) {
 	if err != nil {
 		return run.result(run.stateForError(err), err.Error()), err
 	}
+
+	// Independent discovery: a target that only answers 301 or caches a
+	// reflected header never reaches a desync verdict. Standalone mode must
+	// therefore run before any chained gadget stage is considered.
+	if run.cfg.gadgetMode().Standalone() {
+		if gres, gerr := run.gadgetStage(ctx, run.cfg.gadgetMode(), action); gerr == nil {
+			if finding, ok := confirmedGadgetFinding(gres); ok {
+				return run.finishFinding(ctx, finding, gres, action)
+			}
+		} else if run.d.log != nil {
+			run.d.log.Warn("full-auto standalone gadget stage stopped", "target", run.target.Addr, "error", gerr)
+		}
+	}
 	if finding, ok := fullAutoFinding(res); ok {
+		// A confirmed desync unlocks the chained stage: the candidate headers
+		// are tested inside the already established request chain before the
+		// pipeline parks at AWAITING_HUMAN_VERIFICATION.
+		if run.cfg.gadgetAfterDesync() {
+			if gres, gerr := run.gadgetStage(ctx, probe.GadgetChained, action); gerr == nil {
+				if gadgetFinding, ok := confirmedGadgetFinding(gres); ok {
+					return run.finishFinding(ctx, gadgetFinding, gres, action)
+				}
+			} else if run.d.log != nil {
+				run.d.log.Warn("full-auto chained gadget stage stopped", "target", run.target.Addr, "error", gerr)
+			}
+		}
 		return run.finishFinding(ctx, finding, res, action)
 	}
 
@@ -582,10 +607,54 @@ func (run *fullAutoRun) attack(ctx context.Context) (FullAutoResult, error) {
 			return run.result(run.stateForError(err), err.Error()), err
 		}
 		if finding, ok := fullAutoFinding(res); ok {
+			if run.cfg.gadgetAfterDesync() {
+				if gres, gerr := run.gadgetStage(ctx, probe.GadgetChained, action); gerr == nil {
+					if gadgetFinding, ok := confirmedGadgetFinding(gres); ok {
+						return run.finishFinding(ctx, gadgetFinding, gres, action)
+					}
+				} else if run.d.log != nil {
+					run.d.log.Warn("full-auto chained gadget stage stopped", "target", run.target.Addr, "error", gerr)
+				}
+			}
 			return run.finishFinding(ctx, finding, res, action)
 		}
 	}
 	return run.result(StateFeedback, "no confirmed desync"), nil
+}
+
+// gadgetStage runs one binary-search gadget job through the same pinned
+// session and audit path as every other safe-pipeline probe.
+func (run *fullAutoRun) gadgetStage(ctx context.Context, mode probe.GadgetMode, action AttackAction) (*probe.Result, error) {
+	headers := append([]string(nil), run.cfg.GadgetHeaders...)
+	if len(headers) == 0 {
+		headers = append([]string(nil), probe.DefaultGadgetHeaders...)
+	}
+	p := &probe.GadgetProbe{
+		Mode:        mode,
+		Headers:     headers,
+		BatchSize:   run.cfg.GadgetBatchSize,
+		MaxRequests: run.cfg.GadgetMaxRequests,
+		Timeout:     run.cfg.Timeout.Std(),
+		Idle:        run.cfg.Idle.Std(),
+	}
+	return run.probe(ctx, "gadget", p, action)
+}
+
+// confirmedGadgetFinding prefers a verified cache entry over a plain
+// reflection, then the older high-confidence unkeyed-header verdict. Low and
+// medium findings are diagnostic only and never park the pipeline.
+func confirmedGadgetFinding(res *probe.Result) (probe.Finding, bool) {
+	if res == nil {
+		return probe.Finding{}, false
+	}
+	for _, kind := range []string{"cache_poisoned", "gadget_reflected", "unkeyed_header"} {
+		for _, f := range res.Findings {
+			if f.Kind == kind && f.Confidence == probe.ConfidenceHigh {
+				return f, true
+			}
+		}
+	}
+	return probe.Finding{}, false
 }
 
 func (run *fullAutoRun) probe(ctx context.Context, name string, p probe.Probe, action AttackAction) (*probe.Result, error) {
@@ -594,6 +663,7 @@ func (run *fullAutoRun) probe(ctx context.Context, name string, p probe.Probe, a
 	job := run.job(name, action)
 	success := err == nil && res != nil && len(res.Responses) > 0
 	run.d.recordAttempt(job, action.Attempt, res, err, success, explorationRoll{})
+	run.d.maybeAutoPushCaido(ctx, job, res)
 	run.writeEvent(run.eventFor(StateAttack, name, action, res, err))
 	if err != nil {
 		return res, err
@@ -671,6 +741,14 @@ func (run *fullAutoRun) job(name string, action AttackAction) *JobConfig {
 	if name == "differential-fuzz" {
 		j.Mutations = []string{action.Mutation}
 	}
+	if name == "gadget" {
+		j.GadgetMode = string(run.cfg.gadgetMode())
+		j.GadgetHeaders = append([]string(nil), run.cfg.GadgetHeaders...)
+		j.GadgetBatchSize = run.cfg.GadgetBatchSize
+		j.GadgetMaxRequests = run.cfg.GadgetMaxRequests
+	}
+	autoPush := run.cfg.AutoCaidoPush
+	j.AutoCaidoPush = &autoPush
 	return j
 }
 

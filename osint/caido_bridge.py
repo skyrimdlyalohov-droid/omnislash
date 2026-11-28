@@ -21,9 +21,14 @@ from caido_client import CaidoClient
 CONFIRMED_FINDINGS = {
     "smuggle_confirmed",
     "cache_poisoned",
+    "gadget_reflected",
+    "unkeyed_header",
     "h2_tunnel_confirmed",
     "race_confirmed",
     "desync_confirmed",
+    "universal_key_confirmed",
+    "upgrade_desync_confirmed",
+    "neighbor_shift",
 }
 
 
@@ -138,6 +143,18 @@ def build_replay_payload(record: Dict[str, Any], finding: Dict[str, Any]) -> Dic
     proxy = attr.get("proxy", "") if isinstance(attr, dict) else ""
     result = record.get("result") or {}
     responses = result.get("responses") or [] if isinstance(result, dict) else []
+    exchanges = (result.get("exchanges") or []) if isinstance(result, dict) else []
+    # Keep the byte-exact writes so a confirmed gadget can be replayed in Caido
+    # instead of being reduced to a response hint.
+    raw_exchange = []
+    for ex in exchanges[:16]:
+        if not isinstance(ex, dict):
+            continue
+        raw_exchange.append({
+            "seq": ex.get("seq"),
+            "raw": str(ex.get("raw", ""))[:4000],
+        })
+    raw_request_hint = raw_exchange[0]["raw"] if raw_exchange else ""
     raw_hint = ""
     if responses and isinstance(responses[0], dict):
         raw_hint = str(responses[0].get("raw", ""))[:4000]
@@ -156,6 +173,8 @@ def build_replay_payload(record: Dict[str, Any], finding: Dict[str, Any]) -> Dic
             "statuses": record.get("statuses", []),
         },
         "raw_response_hint": raw_hint,
+        "raw_request_hint": raw_request_hint,
+        "raw_exchange": raw_exchange,
         "minimal_artifact": finding.get("minimal_artifact"),
         "note": "Replay via Caido with same exit IP by setting gateway.proxy_pin_header to proxy_label.",
     }

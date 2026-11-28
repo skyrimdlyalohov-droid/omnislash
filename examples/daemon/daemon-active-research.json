@@ -1,0 +1,87 @@
+{
+  "omnislash_config": "config.active-research.json",
+  "proxies": "../../proxies_new.txt",
+  "log_file": "active-research.jsonl",
+  "poll_interval": "2s",
+  "concurrency": 2,
+  "exit_on_success": false,
+  "control_addr": "127.0.0.1:7778",
+  "learning_enabled": true,
+  "online_learning": false,
+  "full_auto": {
+    "enabled": true,
+    "endpoints": ["/"],
+    "tls": "h1",
+    "mutation_candidates": ["chunk_extensions", "boundary_shift"],
+    "gadget_mode": "standalone",
+    "gadget_headers": [
+      "X-Forwarded-Host",
+      "X-Forwarded-Proto",
+      "X-Forwarded-Server",
+      "X-Original-URL",
+      "X-Rewrite-URL",
+      "X-Host",
+      "Fastly-Host",
+      "Forwarded",
+      "X-Real-IP"
+    ],
+    "gadget_batch_size": 16,
+    "gadget_max_requests": 64,
+    "gadget_after_desync": true,
+    "auto_caido_push": true,
+    "pairs": 5,
+    "rate_limit": "1s",
+    "waf_cooldown": "5m",
+    "stop_statuses": [429, 503],
+    "block_statuses": [403],
+    "block_threshold": 2,
+    "timeout": "8s",
+    "idle": "2s"
+  },
+  "jobs": [
+    {
+      "name": "standalone-unkeyed-cache",
+      "target": {
+        "addr": "replace.with.authorized.example:443",
+        "host": "replace.with.authorized.example",
+        "path": "/"
+      },
+      "tls": "h1",
+      "probe": "gadget",
+      "gadget_mode": "standalone",
+      "gadget_headers": [
+        "X-Forwarded-Host",
+        "X-Original-URL",
+        "X-Rewrite-URL",
+        "X-Host",
+        "Fastly-Host",
+        "Forwarded"
+      ],
+      "gadget_batch_size": 16,
+      "gadget_max_requests": 64,
+      "auto_caido_push": true,
+      "attempts": 1,
+      "timeout": "8s",
+      "idle": "2s",
+      "interval": "30s"
+    },
+    {
+      "name": "chained-gadget-after-desync",
+      "target": {
+        "addr": "replace.with.authorized.example:443",
+        "host": "replace.with.authorized.example",
+        "path": "/"
+      },
+      "tls": "h1",
+      "probe": "gadget",
+      "gadget_mode": "chained",
+      "gadget_batch_size": 16,
+      "gadget_max_requests": 48,
+      "auto_caido_push": true,
+      "attempts": 1,
+      "timeout": "8s",
+      "idle": "2s",
+      "interval": "30s"
+    }
+  ]
+}

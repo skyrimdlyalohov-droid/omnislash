@@ -15,15 +15,27 @@ import (
 )
 
 type fullAutoExec struct {
-	mu          sync.Mutex
-	names       []string
-	reconStatus int
+	mu            sync.Mutex
+	names         []string
+	reconStatus   int
+	fuzzClean     bool
+	gadgetFinding *probe.Finding
 }
 
 func (f *fullAutoExec) Run(_ context.Context, target probe.Target, p probe.Probe, _ string) (*probe.Result, error) {
 	f.mu.Lock()
 	f.names = append(f.names, p.Name())
 	f.mu.Unlock()
+	if strings.HasPrefix(p.Name(), "gadget/") && f.gadgetFinding != nil {
+		return &probe.Result{
+			Probe:     p.Name(),
+			Target:    target.Addr,
+			Duration:  5 * time.Millisecond,
+			Findings:  []probe.Finding{*f.gadgetFinding},
+			Responses: []probe.Response{{Seq: 1, Status: 301, Body: "ok"}},
+			Exchanges: []probe.Exchange{{Seq: 1, Raw: "GET / HTTP/1.1\r\nHost: " + target.HostHeader() + "\r\n\r\n"}},
+		}, nil
+	}
 	switch p.Name() {
 	case "fullauto/recon":
 		status := f.reconStatus
@@ -41,15 +53,18 @@ func (f *fullAutoExec) Run(_ context.Context, target probe.Target, p probe.Probe
 		}, nil
 	case "differential-fuzz":
 		raw := "GET /?x=1 HTTP/1.1\r\nHost: lab.test\r\nTransfer-Encoding: chunked\r\n\r\n1;omnislash=1\r\nX\r\n0\r\n\r\n"
-		return &probe.Result{
-			Probe:            p.Name(),
-			Target:           target.Addr,
-			Duration:         5 * time.Millisecond,
-			ParserDivergence: string(probe.FEClosedBEWaiting),
-			Findings:         []probe.Finding{{Kind: "desync_confirmed", Confidence: probe.ConfidenceHigh, Detail: "test finding"}},
-			Responses:        []probe.Response{{Seq: 1, Status: 200, Body: "ok", Raw: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"}},
-			Exchanges:        []probe.Exchange{{Seq: 1, Raw: raw}},
-		}, nil
+		res := &probe.Result{
+			Probe:     p.Name(),
+			Target:    target.Addr,
+			Duration:  5 * time.Millisecond,
+			Responses: []probe.Response{{Seq: 1, Status: 200, Body: "ok", Raw: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"}},
+			Exchanges: []probe.Exchange{{Seq: 1, Raw: raw}},
+		}
+		if !f.fuzzClean {
+			res.ParserDivergence = string(probe.FEClosedBEWaiting)
+			res.Findings = []probe.Finding{{Kind: "desync_confirmed", Confidence: probe.ConfidenceHigh, Detail: "test finding"}}
+		}
+		return res, nil
 	default:
 		return nil, fmt.Errorf("unexpected probe %s", p.Name())
 	}
@@ -147,9 +162,9 @@ func TestFullAutoStopsOnFindingAndAwaitsHumanVerification(t *testing.T) {
 	}
 
 	calls := exec.calls()
-	want := []string{"fullauto/recon", "fullauto/recon", "fullauto/recon", "fullauto/recon", "differential-fuzz"}
+	want := []string{"fullauto/recon", "fullauto/recon", "fullauto/recon", "fullauto/recon", "differential-fuzz", "gadget/binary-search"}
 	if strings.Join(calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("probe calls = %v, want %v (two baseline GETs, two endpoint GETs, then differential-fuzz; smuggling must not run after a finding)", calls, want)
+		t.Fatalf("probe calls = %v, want %v (two baseline GETs, two endpoint GETs, differential-fuzz, then the chained gadget stage; smuggling must not run after a finding)", calls, want)
 	}
 
 	lines := strings.Split(strings.TrimSpace(audit.String()), "\n")
@@ -174,6 +189,38 @@ func TestFullAutoStopsOnFindingAndAwaitsHumanVerification(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("audit has no AWAITING_HUMAN_VERIFICATION line:\n%s", audit.String())
+	}
+}
+
+// TestFullAutoStandaloneGadgetStageRunsBeforeDesync proves mode B is reachable
+// on a live target that never produced a parser divergence.
+func TestFullAutoStandaloneGadgetStageRunsBeforeDesync(t *testing.T) {
+	exec := &fullAutoExec{
+		fuzzClean: true,
+		gadgetFinding: &probe.Finding{
+			Kind:       "cache_poisoned",
+			Confidence: probe.ConfidenceHigh,
+			Detail:     "canary retained on clean GET",
+		},
+	}
+	d, _, _ := fullAutoTestConfig(t, exec)
+	d.cfg.FullAuto.GadgetMode = "standalone"
+	d.cfg.FullAuto.GadgetHeaders = []string{"X-Original-URL"}
+
+	res, err := d.ExecuteSafePipeline(context.Background(), Target{Addr: "lab.test:443", Host: "lab.test", Path: "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.State != StateAwaitingHumanVerification || res.Finding == nil || res.Finding.Kind != "cache_poisoned" {
+		t.Fatalf("result = %+v, want a confirmed cache gadget", res)
+	}
+	calls := exec.calls()
+	joined := strings.Join(calls, ",")
+	if !strings.Contains(joined, "gadget/unkeyed-cache") {
+		t.Fatalf("standalone gadget stage was skipped: %v", calls)
+	}
+	if strings.Contains(joined, "smuggle") {
+		t.Fatalf("smuggling ran after a confirmed gadget: %v", calls)
 	}
 }
 

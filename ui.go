@@ -635,8 +635,12 @@ func uiAuditFindings(o UIOptions) []UIFinding {
 }
 
 var uiConfirmedKinds = map[string]bool{
-	"smuggle_confirmed":        true,
-	"cache_poisoned":           true,
+	"smuggle_confirmed": true,
+	"cache_poisoned":    true,
+	// Gadget discovery: a crypto canary echoed in Location/body or retained on
+	// a clean control GET is a confirmed unkeyed/cache gadget.
+	"gadget_reflected":         true,
+	"unkeyed_header":           true,
 	"h2_tunnel_confirmed":      true,
 	"race_confirmed":           true,
 	"desync_confirmed":         true,
@@ -818,6 +822,11 @@ func uiValidateCaidoURL(raw string) (string, error) {
 	}
 	return u.String(), nil
 }
+
+// CaidoPushURL validates the Caido endpoint used by both the dashboard's
+// /api/caido/push handler and the daemon's automatic finding export. Empty
+// input selects the local bridge at 127.0.0.1:8080.
+func CaidoPushURL(raw string) (string, error) { return uiValidateCaidoURL(raw) }
 
 func uiDefaultCaidoPush(o UIOptions) func(context.Context, []json.RawMessage, string, string) (int, error) {
 	return func(ctx context.Context, findings []json.RawMessage, target, pat string) (int, error) {

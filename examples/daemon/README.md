@@ -1,5 +1,49 @@
 # Daemon lab configs
 
+## Active research config (prepared, not authorized by default)
+
+- `config.active-research.json` — strict trust tier, proxy-only egress, a strict
+  allowlist placeholder, startup healthcheck/warmup, and explicit
+  `probe.mutation_modes` rotation through the opt-in rare framing families.
+- `daemon-active-research.json` — a standalone/unkeyed-cache gadget job, a
+  chained gadget job, and a `-full-auto` pipeline that runs standalone discovery
+  first and chained discovery after a confirmed desync. High-confidence gadget
+  verdicts are pushed to the local Caido bridge per job (`auto_caido_push`).
+
+Before this config is usable against a real target, the operator must replace
+every `replace.with.authorized.example` in `allow_hosts`, `target.addr` and
+`target.host` with an explicitly authorized host. The placeholder is deliberate:
+loading and validating the config never dials it.
+
+Prerequisites and stop conditions:
+
+1. Refresh the proxy list referenced by `proxies` (`../../proxies_new.txt`).
+   `omnislashd` runs `health.startup_check` and aborts before any probe when the
+   pool has no healthy exit. `startup_wait: "90s"` bounds the warmup.
+2. Keep `trust_tier: "strict"`, `allow_direct: false`, `allow_private: false`.
+   Mutations are fail-closed: without a loaded `Scope` the mutation pass is
+   removed instead of rewriting bytes for an unreviewed target.
+3. Gadget jobs use `timeout: "8s"`, `idle: "2s"` and `attempts: 1`. The
+   full-auto pipeline paces requests at `rate_limit: "1s"`, stops a target for
+   `waf_cooldown: "5m"` on 429/503, and needs two 403s to call a block.
+4. For automatic export, Caido must listen on `127.0.0.1:8080`; set `CAIDO_PAT`
+   and, if needed, `OMNISLASH_CAIDO_HOSTS`. `osint/caido_bridge.py` accepts
+   `gadget_reflected` / `unkeyed_header` and forwards the byte-exact
+   `raw_exchange` for replay. Push is off unless a job opts in.
+5. This directory is a preparation artifact. Do not start an external run
+   against a live domain without an explicit operator command; no commit or
+   push is part of this setup.
+
+After authorization, the safety-gated pipeline is started with:
+
+```bash
+# Only after the placeholders and proxy pool are replaced:
+# go run ./cmd/omnislashd -config examples/daemon/daemon-active-research.json -full-auto
+```
+
+Use `control_addr` (`127.0.0.1:7778`) to stop the run; `-full-auto` cannot be
+combined with `-once` or `-job`.
+
 ## Learning from audit logs
 
 The daemon re-reads its `log_file` at startup. Each record now carries a
@@ -125,9 +169,10 @@ socket.
 PortSwigger lab instances are disposable. If the host no longer responds,
 start a fresh instance of the same lab and update:
 
-- `allow_hosts` in the matching transport config (`config.lab.json` or
-  `config.cache-tunnel.json`);
+- `allow_hosts` in the matching transport config (`config.lab.json`,
+  `config.cache-tunnel.json` or `config.active-research.json`);
 - `target.addr` and `target.host` in the matching daemon config
-  (`daemon.json` or `daemon-cache-tunnel.json`).
+  (`daemon.json`, `daemon-cache-tunnel.json` or
+  `daemon-active-research.json`).
 
 Only run this against your own lab instance.

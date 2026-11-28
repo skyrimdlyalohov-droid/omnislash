@@ -240,7 +240,11 @@ type PayloadMutator struct {
 	Scope  ScopeGuard
 	Target string
 	Mode   MutationMode
-	Ctx    context.Context
+	// Modes is the explicit rotation set. When non-empty it takes precedence
+	// over Mode and over mutationModeOrder; this is how the opt-in rare framing
+	// families are activated without changing legacy auto behaviour.
+	Modes []MutationMode
+	Ctx   context.Context
 	// Fitness is the normalized reward supplied by the orchestrator's FSM.
 	// A negative value shifts a framing boundary down, a positive one up.
 	Fitness float64
@@ -291,7 +295,13 @@ func (m *PayloadMutator) Mutate(basePayload []byte, seed int64) ([]byte, error) 
 	buf = append(buf, basePayload...)
 	rng := rand.New(rand.NewSource(seed))
 	mode := m.Mode
-	if mode == MutationAuto {
+	if len(m.Modes) > 0 {
+		idx := seed % int64(len(m.Modes))
+		if idx < 0 {
+			idx = -idx
+		}
+		mode = m.Modes[idx]
+	} else if mode == MutationAuto {
 		idx := seed % int64(len(mutationModeOrder))
 		if idx < 0 {
 			idx = -idx

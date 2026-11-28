@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
 	"github.com/skyrimdlyalohov-droid/omnislash/daemon"
@@ -144,6 +145,32 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Warm the exit pool before any heavy probe. Without this sweep a stale
+	// proxy file turns the first gadget/differential job into an i/o timeout
+	// instead of a target response, and the run never reaches the targets.
+	if transport.Health.Enabled {
+		checker, err := omnislash.NewHealthChecker(pool, dialer, logger)
+		if err != nil {
+			return err
+		}
+		if transport.Health.StartupCheck {
+			sctx := ctx
+			cancel := func() {}
+			if wait := transport.Health.StartupWait.Std(); wait > 0 {
+				sctx, cancel = context.WithTimeout(ctx, wait)
+			}
+			summary := checker.CheckAll(sctx)
+			cancel()
+			logger.Info("startup proxy check finished",
+				"checked", summary.Checked, "healthy", summary.Healthy, "failed", summary.Failed,
+				"duration", summary.FinishedAt.Sub(summary.StartedAt).Round(time.Millisecond))
+			if len(proxies) > 0 && summary.Healthy == 0 {
+				return errors.New("omnislashd: no healthy proxies after startup check; refresh the pool before the active run")
+			}
+		}
+		go checker.RunPeriodic(ctx)
+	}
 
 	if transport.Safety.Deception.Enabled && transport.Safety.Deception.SemanticService {
 		semantic, err := omnislash.StartSemanticService(ctx, transport.Safety.Deception.SemanticAddr, ".", logger)

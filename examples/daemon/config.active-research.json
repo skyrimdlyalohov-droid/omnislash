@@ -1,0 +1,40 @@
+{
+  "trust_tier": "strict",
+  "allow_direct": false,
+  "default_scheme": "http",
+  "max_dial_attempts": 1,
+  "scope": {
+    "enabled": true,
+    "allow_hosts": ["replace.with.authorized.example"],
+    "allow_cidrs": [],
+    "allow_ports": [443],
+    "allow_private": false,
+    "deny_cidrs": [],
+    "resolve_locally": false,
+    "dns_cache_ttl": "5m",
+    "dns_timeout": "3s"
+  },
+  "health": {
+    "enabled": true,
+    "startup_check": true,
+    "startup_wait": "90s",
+    "interval": "60s",
+    "timeout": "8s",
+    "concurrency": 32,
+    "probe_url": "https://www.gstatic.com/generate_204",
+    "tls_skip_verify": false
+  },
+  "probe": {
+    "max_response_bytes": 524288,
+    "read_timeout": "8s",
+    "race_read_timeout": "1500ms",
+    "mutation_enabled": true,
+    "mutation_mode": "case_mixing",
+    "mutation_modes": [
+      "ows_before_colon",
+      "ows_in_value",
+      "conflicting_framing",
+      "chunk_boundary"
+    ]
+  }
+}

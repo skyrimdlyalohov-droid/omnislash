@@ -117,6 +117,20 @@ type FullAutoConfig struct {
 	Timeout omnislash.Duration `json:"timeout,omitempty"`
 	// Idle bounds the wait for late responses. Default 2s.
 	Idle omnislash.Duration `json:"idle,omitempty"`
+
+	// GadgetMode selects the discovery stage: "chained" (default) waits for a
+	// desync verdict; "standalone"/"unkeyed-cache" runs after recon on live
+	// targets and verifies canary reflection plus cache persistence.
+	GadgetMode        string   `json:"gadget_mode,omitempty"`
+	GadgetHeaders     []string `json:"gadget_headers,omitempty"`
+	GadgetBatchSize   int      `json:"gadget_batch_size,omitempty"`
+	GadgetMaxRequests int      `json:"gadget_max_requests,omitempty"`
+	// GadgetAfterDesync keeps the chained stage enabled in addition to the
+	// configured standalone stage. Nil means true.
+	GadgetAfterDesync *bool `json:"gadget_after_desync,omitempty"`
+	// AutoCaidoPush forwards high-confidence gadget findings to the local
+	// Caido bridge without an operator click. It is off by default.
+	AutoCaidoPush bool `json:"auto_caido_push,omitempty"`
 }
 
 // withDefaults fills the safety policy without mutating the caller's config.
@@ -173,6 +187,21 @@ func (c FullAutoConfig) withDefaults() FullAutoConfig {
 		c.Idle = omnislash.Duration(2 * time.Second)
 	}
 	return c
+}
+
+// gadgetMode is the discovery stage selected for the safe pipeline. Chained is
+// the default: no gadget bytes are sent until a desync verdict exists.
+func (c FullAutoConfig) gadgetMode() probe.GadgetMode {
+	if c.GadgetMode == "" {
+		return probe.GadgetChained
+	}
+	return probe.GadgetMode(c.GadgetMode)
+}
+
+// gadgetAfterDesync reports whether the chained stage runs after a confirmed
+// desync. It is on unless the operator explicitly disables it.
+func (c FullAutoConfig) gadgetAfterDesync() bool {
+	return c.GadgetAfterDesync == nil || *c.GadgetAfterDesync
 }
 
 // impactPath reports whether path is an escalation target. Comparison is
@@ -325,6 +354,17 @@ type JobConfig struct {
 	Hold             omnislash.Duration `json:"hold"`
 	NeighborShiftNCD float64            `json:"neighbor_shift_ncd"`
 
+	// Gadget discovery fields. An empty GadgetMode means chained: the job is
+	// only meaningful after FE_Closed_BE_Waiting. "standalone" and
+	// "unkeyed-cache" test live targets directly and verify cache persistence.
+	GadgetMode        string   `json:"gadget_mode,omitempty"`
+	GadgetHeaders     []string `json:"gadget_headers,omitempty"`
+	GadgetBatchSize   int      `json:"gadget_batch_size,omitempty"`
+	GadgetMaxRequests int      `json:"gadget_max_requests,omitempty"`
+	GadgetMaxAttempts int      `json:"gadget_max_attempts,omitempty"`
+	GadgetThreshold   float64  `json:"gadget_structural_threshold,omitempty"`
+	AutoCaidoPush     *bool    `json:"auto_caido_push,omitempty"`
+
 	// Raw replay / universal key fields.
 	RawPayloadB64 string `json:"raw_payload_b64"`
 	RawPayloadHex string `json:"raw_payload_hex"`
@@ -400,6 +440,9 @@ func (c *Config) Validate() error {
 	if c.PollInterval.Std() < 0 {
 		return fmt.Errorf("daemon: poll_interval must not be negative")
 	}
+	if !probe.GadgetMode(c.FullAuto.GadgetMode).Valid() {
+		return fmt.Errorf("daemon: full_auto.gadget_mode must be chained, standalone or unkeyed-cache")
+	}
 	if len(c.Jobs) == 0 {
 		return fmt.Errorf("daemon: at least one job is required")
 	}
@@ -422,9 +465,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("daemon: job %q: tls must be h1, h2 or none", j.Name)
 		}
 		switch j.Probe {
-		case "smuggle-chain", "smuggle", "race", "h2race", "h2-cl", "h2-tunnel", "differential-fuzz", "raw-replay", "upgrade-desync":
+		case "smuggle-chain", "smuggle", "race", "h2race", "h2-cl", "h2-tunnel", "differential-fuzz", "gadget", "raw-replay", "upgrade-desync":
 		default:
 			return fmt.Errorf("daemon: job %q: unsupported probe %q", j.Name, j.Probe)
+		}
+		if j.Probe == "gadget" && !probe.GadgetMode(j.GadgetMode).Valid() {
+			return fmt.Errorf("daemon: job %q: invalid gadget_mode %q", j.Name, j.GadgetMode)
 		}
 		if j.Attempts < 0 {
 			return fmt.Errorf("daemon: job %q: attempts must not be negative", j.Name)

@@ -33,6 +33,13 @@ func TestStructuralComparatorIgnoresDynamicValues(t *testing.T) {
 			wantSame:    true,
 		},
 		{
+			name:        "json random identifiers and signatures rotate",
+			contentType: "application/json",
+			base:        `{"uuid":"AAAAAAAA","state":"STATE_1","signature":"SIG_1","idempotency_key":"KEY_1","items":[{"name":"a"}]}`,
+			sample:      `{"uuid":"BBBBBBBB","state":"STATE_2","signature":"SIG_2","idempotency_key":"KEY_2","items":[{"name":"a"}]}`,
+			wantSame:    true,
+		},
+		{
 			name:        "html gains an element",
 			contentType: "text/html",
 			base:        `<html><body><form><input name="csrf" value="A"></form></body></html>`,

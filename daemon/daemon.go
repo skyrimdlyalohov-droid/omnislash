@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -246,11 +247,15 @@ func (d *Daemon) EnableFullAuto() error {
 	}
 	// The differential-fuzz probe builds its own GET-only mutation inside the
 	// probe. The runner-level pass would rewrite recon and smuggling bytes, so
-	// full-auto removes it: every non-fuzz request stays byte-exact.
+	// full-auto removes it by default: every non-fuzz request stays byte-exact.
+	// An explicit active-research config that names mutation modes opts back
+	// in; that is the only way rare framing rotations reach a full-auto run.
 	if setter, ok := d.exec.(interface {
 		SetMutationPolicy(*probe.MutationPolicy) error
 	}); ok {
-		if err := setter.SetMutationPolicy(nil); err != nil {
+		if d.ui.Config != nil && d.ui.Config.Probe.MutationEnabled && len(d.ui.Config.Probe.MutationModes) > 0 {
+			d.configureMutation()
+		} else if err := setter.SetMutationPolicy(nil); err != nil {
 			return fmt.Errorf("daemon: full-auto cannot disable runner mutation: %w", err)
 		}
 	}
@@ -290,16 +295,42 @@ func (d *Daemon) configureMutation() {
 	}
 	policy := (*probe.MutationPolicy)(nil)
 	if d.ui.Config != nil && d.ui.Scope != nil && d.ui.Config.Probe.MutationEnabled {
+		modes, err := configuredMutationModes(d.ui.Config.Probe.MutationModes)
+		if err != nil {
+			if d.log != nil {
+				d.log.Warn("mutation modes refused", "error", err)
+			}
+			return // fail closed: an unknown mode must not reach the wire
+		}
 		policy = &probe.MutationPolicy{
 			Enabled: true,
 			Scope:   d.ui.Scope,
 			Mode:    probe.MutationMode(d.ui.Config.Probe.MutationMode),
+			Modes:   modes,
 			Seed:    1, // stable across restarts: evidence stays reproducible
 		}
 	}
 	if err := setter.SetMutationPolicy(policy); err != nil && d.log != nil {
 		d.log.Warn("mutation policy refused", "error", err)
 	}
+}
+
+// configuredMutationModes maps the opt-in names from the transport config to
+// mutation modes. Unknown names are an error rather than a silent fallback to
+// auto rotation, so a typo in an active-research config cannot broaden scope.
+func configuredMutationModes(names []string) ([]probe.MutationMode, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	modes := make([]probe.MutationMode, 0, len(names))
+	for _, name := range names {
+		mode := mutationModeOf(name)
+		if mode == probe.MutationAuto {
+			return nil, fmt.Errorf("unknown mutation mode %q", name)
+		}
+		modes = append(modes, mode)
+	}
+	return modes, nil
 }
 
 // Run schedules jobs until ctx is cancelled or exit_on_success fires. A
@@ -707,6 +738,7 @@ func (d *Daemon) execute(ctx context.Context, j *JobConfig) Outcome {
 		res, err := d.exec.Run(ctx, target, p, attemptJob.tlsMode())
 		success := jobSucceeded(&attemptJob, res, err)
 		d.recordAttempt(&attemptJob, attempt, res, err, success, roll)
+		d.maybeAutoPushCaido(ctx, &attemptJob, res)
 		last, lastErr = res, err
 		if success {
 			d.log.Info("job succeeded", "job", j.Name, "attempt", attempt)
@@ -1103,6 +1135,92 @@ func (d *Daemon) recordAttempt(j *JobConfig, attempt int, res *probe.Result, err
 	}
 }
 
+// autoPushConfirmedKinds mirrors the dashboard's confirmed set. Only a
+// high-confidence byte-level verdict is exported automatically; diagnostic
+// findings stay in the audit log for manual review.
+var autoPushConfirmedKinds = map[string]bool{
+	"smuggle_confirmed":        true,
+	"cache_poisoned":           true,
+	"gadget_reflected":         true,
+	"unkeyed_header":           true,
+	"desync_confirmed":         true,
+	"h2_tunnel_confirmed":      true,
+	"race_confirmed":           true,
+	"universal_key_confirmed":  true,
+	"upgrade_desync_confirmed": true,
+	"neighbor_shift":           true,
+}
+
+// maybeAutoPushCaido forwards the confirmed finding and its raw Exchange to the
+// existing /api/caido/push client. It is a job-level opt-in so lab runs keep
+// their current silent behaviour.
+func (d *Daemon) maybeAutoPushCaido(ctx context.Context, j *JobConfig, res *probe.Result) {
+	if d == nil || j == nil || res == nil || j.AutoCaidoPush == nil || !*j.AutoCaidoPush {
+		return
+	}
+	push := d.ui.CaidoPush
+	if push == nil {
+		if d.log != nil {
+			d.log.Warn("caido auto-push requested but no Caido client is configured", "job", j.Name)
+		}
+		return
+	}
+	findings := make([]probe.Finding, 0, len(res.Findings))
+	for _, f := range res.Findings {
+		if !autoPushConfirmedKinds[f.Kind] || f.Confidence != probe.ConfidenceHigh {
+			continue
+		}
+		if strings.Contains(strings.ToLower(f.Detail), "unverified") {
+			continue
+		}
+		findings = append(findings, f)
+	}
+	if len(findings) == 0 {
+		return
+	}
+	statuses := make([]int, 0, len(res.Responses))
+	for _, r := range res.Responses {
+		statuses = append(statuses, r.Status)
+	}
+	line, err := json.Marshal(Record{
+		Time:     d.now(),
+		Job:      j.Name,
+		Target:   j.Target.Addr,
+		Probe:    j.Probe,
+		TLS:      j.tlsMode(),
+		Success:  true,
+		Findings: findings,
+		Statuses: statuses,
+		Outcome:  string(OutcomeTargetResponse),
+		Result:   res,
+	})
+	if err != nil {
+		if d.log != nil {
+			d.log.Warn("caido auto-push record failed", "job", j.Name, "error", err)
+		}
+		return
+	}
+	caidoURL, err := omnislash.CaidoPushURL(os.Getenv("CAIDO_URL"))
+	if err != nil {
+		if d.log != nil {
+			d.log.Warn("caido auto-push URL refused", "error", err)
+		}
+		return
+	}
+	pushCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	pushed, err := push(pushCtx, []json.RawMessage{line}, caidoURL, os.Getenv("CAIDO_PAT"))
+	if err != nil {
+		if d.log != nil {
+			d.log.Warn("caido auto-push failed", "job", j.Name, "error", err)
+		}
+		return
+	}
+	if d.log != nil {
+		d.log.Info("caido auto-push", "job", j.Name, "pushed", pushed, "findings", len(findings))
+	}
+}
+
 func buildProbe(j *JobConfig) (probe.Probe, error) {
 	timeout := j.Timeout.Std()
 	idle := j.Idle.Std()
@@ -1213,6 +1331,21 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 			Hold:             hold,
 			Timeout:          timeout,
 			NeighborShiftNCD: ncd,
+		}, nil
+	case "gadget":
+		headers := append([]string(nil), j.GadgetHeaders...)
+		if len(headers) == 0 {
+			headers = append([]string(nil), probe.DefaultGadgetHeaders...)
+		}
+		return &probe.GadgetProbe{
+			Mode:                probe.GadgetMode(j.GadgetMode),
+			Headers:             headers,
+			BatchSize:           j.GadgetBatchSize,
+			MaxRequests:         j.GadgetMaxRequests,
+			MaxAttempts:         j.GadgetMaxAttempts,
+			StructuralThreshold: j.GadgetThreshold,
+			Timeout:             timeout,
+			Idle:                idle,
 		}, nil
 	case "raw-replay":
 		return &probe.RawReplayProbe{

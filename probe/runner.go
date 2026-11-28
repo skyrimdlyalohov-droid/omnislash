@@ -65,7 +65,11 @@ type MutationPolicy struct {
 	Enabled bool
 	Scope   ScopeGuard
 	Mode    MutationMode
-	Seed    int64
+	// Modes rotates through an explicit set, one mode per write. It is the
+	// only way the opt-in rare framing families reach the runner; a nil or
+	// empty set preserves the legacy single-mode behaviour.
+	Modes []MutationMode
+	Seed  int64
 }
 
 // SetMutationPolicy installs or removes the mutation pass on every path this
@@ -482,6 +486,7 @@ func (r *Runner) wrapMutation(ctx context.Context, target Target, conn net.Conn)
 		Scope:  r.mutation.Scope,
 		Target: target.Addr,
 		Mode:   r.mutation.Mode,
+		Modes:  append([]MutationMode(nil), r.mutation.Modes...),
 		Ctx:    ctx,
 	}
 	return newMutationConn(conn, m, r.mutation.Seed, &ParserStateMachine{})
@@ -542,6 +547,11 @@ func (c *mutationConn) Write(p []byte) (int, error) {
 		}
 		c.mu.Unlock()
 		return 0, err
+	}
+	// Advance the per-session seed only for an explicit rotation. A single
+	// fixed mode keeps the byte-exact reproducibility the lab probes rely on.
+	if c.mut != nil && len(c.mut.Modes) > 1 {
+		c.seed++
 	}
 	return c.Conn.Write(mutated)
 }

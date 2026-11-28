@@ -36,6 +36,12 @@ var volatileJSONKeys = map[string]struct{}{
 	"timestamp": {}, "time": {}, "ts": {}, "nonce": {},
 	"request_id": {}, "requestid": {}, "session_id": {}, "sessionid": {},
 	"sid": {}, "trace_id": {}, "traceid": {}, "correlation_id": {},
+	// Random identifiers rotate on every response. They carry no page
+	// structure, so they must not move the SimHash between clean requests.
+	"uuid": {}, "guid": {}, "random": {}, "random_id": {}, "randomid": {},
+	"state": {}, "sig": {}, "signature": {}, "jsessionid": {}, "phpsessid": {},
+	"auth_token": {}, "authtoken": {}, "access_token": {}, "accesstoken": {},
+	"refresh_token": {}, "refreshtoken": {}, "idempotency_key": {},
 	"ad": {}, "ads": {}, "ad_id": {}, "adid": {}, "advert_id": {},
 	"expires": {}, "expiry": {}, "etag": {}, "cache_key": {}, "cachekey": {},
 	"bust": {}, "cb": {},

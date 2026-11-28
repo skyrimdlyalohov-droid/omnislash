@@ -14,6 +14,32 @@ import (
 	"github.com/skyrimdlyalohov-droid/omnislash"
 )
 
+// GadgetMode selects how gadget discovery is triggered and confirmed.
+type GadgetMode string
+
+const (
+	// GadgetChained is the default. The orchestrator invokes it only after a
+	// FE_Closed_BE_Waiting desync verdict and searches for gadgets inside the
+	// already established request chain.
+	GadgetChained GadgetMode = "chained"
+	// GadgetStandalone searches live targets directly and requires both
+	// canary reflection and cache persistence on a clean control GET.
+	GadgetStandalone GadgetMode = "standalone"
+	// GadgetUnkeyedCache is the explicit alias of GadgetStandalone.
+	GadgetUnkeyedCache GadgetMode = "unkeyed-cache"
+)
+
+// Standalone reports whether the mode probes live targets without a prior
+// desync verdict and requires canary reflection.
+func (m GadgetMode) Standalone() bool {
+	return m == GadgetStandalone || m == GadgetUnkeyedCache
+}
+
+// Valid reports whether the mode is one of the two supported discovery flows.
+func (m GadgetMode) Valid() bool {
+	return m == "" || m == GadgetChained || m.Standalone()
+}
+
 // DefaultGadgetHeaders is the built-in candidate set for group testing. These
 // are ordinary proxy/cache headers, not scanner signatures: their values are
 // fresh cryptographic canaries generated for each run.
@@ -29,6 +55,7 @@ var DefaultGadgetHeaders = []string{
 	"X-Original-URL",
 	"X-Rewrite-URL",
 	"X-Host",
+	"Fastly-Host",
 	"Forwarded",
 	"Via",
 	"Referer",
@@ -146,6 +173,9 @@ func (p *GadgetProbe) ExecuteMulti(ctx context.Context, target Target, source Co
 // Result keeps every wire write in Exchanges and every parsed response in
 // Responses, so a finding can be exported verbatim through /api/caido/push.
 func (p *GadgetProbe) search(ctx context.Context, target Target, source ConnSource, ownsConns bool) (*Result, error) {
+	if !p.Mode.Valid() {
+		return nil, fmt.Errorf("probe: unknown gadget mode %q", p.Mode)
+	}
 	candidates, err := p.headerCandidates()
 	if err != nil {
 		return nil, err
@@ -159,8 +189,16 @@ func (p *GadgetProbe) search(ctx context.Context, target Target, source ConnSour
 		_ = conn0.Close() // attribution only; the real exchanges get fresh conns
 	}
 
+	// In standalone mode the injected request and the control GET share one
+	// cache key: a unique cache-busted path. A clean GET to the original path
+	// would address a different key and could not prove persistence.
+	probePath := target.RequestPath()
+	if p.Mode.Standalone() {
+		probePath = AppendCacheBuster(probePath)
+	}
+
 	used := 0
-	baseline, err := p.exchange(ctx, target, source, e, ownsConns, p.baseHeaders(target, !ownsConns))
+	baseline, err := p.exchange(ctx, target, source, e, ownsConns, probePath, p.baseHeaders(target, !ownsConns))
 	used++
 	if err != nil && baseline == nil {
 		return e.finish(), err
@@ -188,7 +226,7 @@ func (p *GadgetProbe) search(ctx context.Context, target Target, source ConnSour
 			continue
 		}
 
-		resp, changed, detail, sendErr := p.testGroup(ctx, target, source, e, ownsConns, baseline, group)
+		resp, changed, detail, canaries, sendErr := p.testGroup(ctx, target, source, e, ownsConns, probePath, baseline, group)
 		used++
 		if sendErr != nil {
 			e.addFinding(Finding{Kind: "gadget_request_error", Confidence: ConfidenceLow, Detail: sendErr.Error()})
@@ -201,10 +239,43 @@ func (p *GadgetProbe) search(ctx context.Context, target Target, source ConnSour
 			e.addFinding(Finding{Kind: "gadget_stop", Confidence: ConfidenceHigh, Detail: reason, Response: resp.Seq})
 			return e.finish(), nil
 		}
+		if parserRejected(baseline.Status, resp.Status) {
+			// The target refused the syntax. Spending the rest of the pool on
+			// this signature would only produce more rejection bytes.
+			e.addFinding(Finding{Kind: FindingTargetRejected, Confidence: ConfidenceLow,
+				Detail: rejectionDetail("gadget", baseline.Status, resp.Status), Response: resp.Seq})
+			return e.finish(), nil
+		}
 		if !changed {
 			continue
 		}
 		if len(group) == 1 {
+			if p.Mode.Standalone() {
+				// A changed response is not enough on a live target: an
+				// intermediate hop may alter bytes without echoing our canary.
+				// Only Location/body reflection confirms a gadget here.
+				where := reflectionOf(resp, canaries)
+				if where == "" {
+					e.addFinding(Finding{
+						Kind:       "gadget_reflection_missing",
+						Confidence: ConfidenceLow,
+						Detail:     fmt.Sprintf("header %s changed the response (%s) without reflecting the canary", group[0], detail),
+						Response:   resp.Seq,
+					})
+					break
+				}
+				e.addFinding(Finding{
+					Kind:       "gadget_reflected",
+					Confidence: ConfidenceHigh,
+					Detail:     fmt.Sprintf("header %s: %s", group[0], where),
+					Response:   resp.Seq,
+				})
+				found = true
+				if p.verifyCache(ctx, target, source, e, ownsConns, probePath, baseline, resp, canaries) {
+					used++
+				}
+				break
+			}
 			e.addFinding(Finding{
 				Kind:       "unkeyed_header",
 				Confidence: ConfidenceHigh,
@@ -257,17 +328,17 @@ func (p *GadgetProbe) requestHeaders(target Target, names []string, reuse bool) 
 	return headers, canaries, nil
 }
 
-func (p *GadgetProbe) testGroup(ctx context.Context, target Target, source ConnSource, e *exec, ownsConns bool, baseline *Response, names []string) (*Response, bool, string, error) {
+func (p *GadgetProbe) testGroup(ctx context.Context, target Target, source ConnSource, e *exec, ownsConns bool, path string, baseline *Response, names []string) (*Response, bool, string, []string, error) {
 	var lastErr error
 	for attempt := 0; attempt < p.attempts(); attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, false, "", err
+			return nil, false, "", nil, err
 		}
 		headers, canaries, err := p.requestHeaders(target, names, !ownsConns)
 		if err != nil {
-			return nil, false, "", err
+			return nil, false, "", nil, err
 		}
-		resp, err := p.exchange(ctx, target, source, e, ownsConns, headers)
+		resp, err := p.exchange(ctx, target, source, e, ownsConns, path, headers)
 		if err != nil && resp == nil {
 			lastErr = err
 			continue
@@ -276,12 +347,12 @@ func (p *GadgetProbe) testGroup(ctx context.Context, target Target, source ConnS
 			continue
 		}
 		changed, detail := p.responseChanged(baseline, resp, canaries)
-		return resp, changed, detail, nil
+		return resp, changed, detail, canaries, nil
 	}
-	return nil, false, "", lastErr
+	return nil, false, "", nil, lastErr
 }
 
-func (p *GadgetProbe) exchange(ctx context.Context, target Target, source ConnSource, e *exec, ownsConns bool, headers []rawhttp.Header) (*Response, error) {
+func (p *GadgetProbe) exchange(ctx context.Context, target Target, source ConnSource, e *exec, ownsConns bool, path string, headers []rawhttp.Header) (*Response, error) {
 	conn, err := source.Dial(ctx)
 	if err != nil {
 		return nil, err
@@ -290,7 +361,7 @@ func (p *GadgetProbe) exchange(ctx context.Context, target Target, source ConnSo
 		defer conn.Close()
 	}
 	e.attach(conn)
-	payload, err := render(requestSpec{Method: "GET", Path: target.RequestPath(), Headers: headers})
+	payload, err := render(requestSpec{Method: "GET", Path: path, Headers: headers})
 	if err != nil {
 		return nil, fmt.Errorf("probe: render gadget batch: %w", err)
 	}
@@ -346,6 +417,91 @@ func (p *GadgetProbe) responseChanged(baseline, resp *Response, canaries []strin
 		return true, fmt.Sprintf("structural shift %.3f", distance)
 	}
 	return false, ""
+}
+
+// reflectionOf reports the first location where a canary was echoed. Only
+// Location and the body count as a reflecting gadget: other headers can be
+// harmless intermediate hops and must not be promoted to an unkeyed finding.
+func reflectionOf(resp *Response, canaries []string) string {
+	if resp == nil {
+		return ""
+	}
+	for _, header := range resp.Headers {
+		if !strings.EqualFold(header.Key, "Location") {
+			continue
+		}
+		for _, canary := range canaries {
+			if strings.Contains(header.Value, canary) {
+				return "canary reflected in Location header"
+			}
+		}
+	}
+	for _, canary := range canaries {
+		if strings.Contains(resp.Body, canary) {
+			return "canary reflected in response body"
+		}
+	}
+	return ""
+}
+
+// sameLocation compares Location values in order; an absent Location is not
+// equal to a present one.
+func sameLocation(a, b *Response) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	left, right := a.headerValues("Location"), b.headerValues("Location")
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// verifyCache follows a reflecting header with a clean GET on the same cache
+// key. It never adds mutated headers and always dials a fresh connection when
+// the caller owns conns, so a persisted poisoned entry is observed by a new
+// socket rather than by the request that created it.
+func (p *GadgetProbe) verifyCache(ctx context.Context, target Target, source ConnSource, e *exec, ownsConns bool, path string, baseline, reflected *Response, canaries []string) bool {
+	if used := len(e.res.Exchanges); used >= p.requestBudget() {
+		e.addFinding(Finding{Kind: "cache_check_skipped", Confidence: ConfidenceLow,
+			Detail: fmt.Sprintf("request budget %d exhausted before the clean control GET", p.requestBudget())})
+		return false
+	}
+	control, err := p.exchange(ctx, target, source, e, ownsConns, path, p.baseHeaders(target, false))
+	if err != nil && control == nil {
+		e.addFinding(Finding{Kind: "cache_check_error", Confidence: ConfidenceLow, Detail: err.Error()})
+		return true
+	}
+	if control == nil {
+		return true
+	}
+	if parserRejected(baseline.Status, control.Status) {
+		e.addFinding(Finding{Kind: FindingTargetRejected, Confidence: ConfidenceLow,
+			Detail: rejectionDetail("control GET", baseline.Status, control.Status), Response: control.Seq})
+		return true
+	}
+	where := reflectionOf(control, canaries)
+	poisoned := where != "" || (!sameLocation(control, baseline) && sameLocation(control, reflected))
+	if !poisoned {
+		e.addFinding(Finding{Kind: "cache_check_negative", Confidence: ConfidenceLow,
+			Detail: "clean control GET did not retain the reflected response", Response: control.Seq})
+		return true
+	}
+	if where == "" {
+		where = "poisoned Location persisted"
+	}
+	e.addFinding(Finding{
+		Kind:       "cache_poisoned",
+		Confidence: ConfidenceHigh,
+		Detail:     where + " on clean GET " + path,
+		Response:   control.Seq,
+	})
+	return true
 }
 
 // gadgetBlockState enforces the session STOP rules. A single 429/503 stops

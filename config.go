@@ -152,6 +152,10 @@ type ProbeConfig struct {
 	// refused (fail-closed).
 	MutationEnabled bool   `json:"mutation_enabled,omitempty"`
 	MutationMode    string `json:"mutation_mode,omitempty"`
+	// MutationModes rotates through an explicit list of grammar/framing modes
+	// for every write. It is empty by default; the rare parser-disagreement
+	// families from obfuscation/framing.go must be named here to be active.
+	MutationModes []string `json:"mutation_modes,omitempty"`
 }
 
 // StatsConfig controls the optional JSON stats HTTP endpoint.

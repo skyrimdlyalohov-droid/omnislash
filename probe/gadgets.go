@@ -95,6 +95,13 @@ type GadgetProbe struct {
 	MaxAttempts         int
 	StructuralThreshold float64
 
+	// Mode selects the trigger and the verification depth. The zero value is
+	// GadgetChained: the caller invokes the probe after FE_Closed_BE_Waiting.
+	// GadgetStandalone / GadgetUnkeyedCache test live targets directly, require
+	// canary reflection in Location/body, and follow a hit with a clean control
+	// GET through ConnSource to prove cache persistence.
+	Mode GadgetMode
+
 	// canaryReader is internal. Tests replace it to make canaries
 	// deterministic; production uses crypto/rand.Reader.
 	canaryReader io.Reader
@@ -102,6 +109,9 @@ type GadgetProbe struct {
 
 func (p *GadgetProbe) Name() string {
 	if p.batchMode() {
+		if p.Mode.Standalone() {
+			return "gadget/unkeyed-cache"
+		}
 		return "gadget/binary-search"
 	}
 	if p.Gadget.Name == "" {

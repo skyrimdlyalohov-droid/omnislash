@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,17 +21,29 @@ type gadgetMock struct {
 	requests atomic.Int32
 }
 
-func (m *gadgetMock) serve(conn net.Conn) {
-	defer conn.Close()
+type gadgetRequest struct {
+	path    string
+	headers map[string]string
+}
+
+// readGadgetRequest parses one HTTP/1.1 request from a loopback peer. It is
+// shared by every in-process mock so the tests cannot disagree about framing.
+func readGadgetRequest(conn net.Conn) (gadgetRequest, error) {
 	br := bufio.NewReader(conn)
-	if _, err := br.ReadString('\n'); err != nil { // request line
-		return
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return gadgetRequest{}, err
+	}
+	parts := strings.Fields(strings.TrimRight(line, "\r\n"))
+	path := "/"
+	if len(parts) > 1 {
+		path = parts[1]
 	}
 	headers := make(map[string]string)
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			return
+			return gadgetRequest{}, err
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
@@ -40,12 +54,57 @@ func (m *gadgetMock) serve(conn net.Conn) {
 			headers[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
 		}
 	}
+	drainGadgetBody(br, headers)
+	return gadgetRequest{path: path, headers: headers}, nil
+}
+
+// drainGadgetBody consumes the framed body with the same buffered reader so a
+// loopback peer never leaves the probe's single Write blocked on net.Pipe.
+func drainGadgetBody(br *bufio.Reader, headers map[string]string) {
+	if raw, ok := headers["content-length"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && n > 0 {
+			_, _ = io.ReadFull(br, make([]byte, n))
+		}
+		return
+	}
+	if te := strings.ToLower(headers["transfer-encoding"]); strings.Contains(te, "chunked") {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			sizeField := strings.TrimSpace(strings.SplitN(line, ";", 2)[0])
+			n, err := strconv.ParseInt(sizeField, 16, 64)
+			if err != nil || n < 0 {
+				return
+			}
+			if n == 0 {
+				for {
+					trailer, err := br.ReadString('\n')
+					if err != nil || strings.TrimRight(trailer, "\r\n") == "" {
+						return
+					}
+				}
+			}
+			if _, err := io.ReadFull(br, make([]byte, n+2)); err != nil { // chunk data + CRLF
+				return
+			}
+		}
+	}
+}
+
+func (m *gadgetMock) serve(conn net.Conn) {
+	defer conn.Close()
+	req, err := readGadgetRequest(conn)
+	if err != nil {
+		return
+	}
 	m.requests.Add(1)
 	if m.status != 0 {
 		writeGadgetResponse(conn, m.status, nil, "blocked")
 		return
 	}
-	if canary, ok := headers[strings.ToLower(m.trigger)]; ok && canary != "" {
+	if canary, ok := req.headers[strings.ToLower(m.trigger)]; ok && canary != "" {
 		writeGadgetResponse(conn, 301, map[string]string{
 			"Location": "https://redirect.test/landing",
 			"X-Echo":   canary,
@@ -67,8 +126,12 @@ func writeGadgetResponse(conn net.Conn, status int, extra map[string]string, bod
 	_, _ = conn.Write([]byte(out.String()))
 }
 
+// gadgetPeer is any in-process HTTP/1.1 mock. It keeps the pipe source shared
+// by chained, standalone and rejection tests without duplicating transport.
+type gadgetPeer interface{ serve(net.Conn) }
+
 type pipeGadgetSource struct {
-	mock *gadgetMock
+	mock gadgetPeer
 }
 
 func (s *pipeGadgetSource) Dial(context.Context) (net.Conn, error) {

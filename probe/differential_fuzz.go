@@ -157,6 +157,11 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 				baselineCleanBody = []byte(cleanResp.Body)
 				baselineCleanContentType = responseContentType(cleanResp)
 			} else {
+				if parserRejected(baselineCleanStatus, cleanResp.Status) {
+					e.addFinding(Finding{Kind: FindingTargetRejected, Confidence: ConfidenceLow,
+						Detail: rejectionDetail("clean", baselineCleanStatus, cleanResp.Status), Response: cleanResp.Seq})
+					return e.finish(), nil
+				}
 				shifted := cleanResp.Status != baselineCleanStatus
 				if !shifted && len(baselineCleanBody) > 0 {
 					// Structural tokens filter rotating CSRF/timestamp/ad values;
@@ -178,6 +183,14 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 		if mutResp != nil {
 			_, resid := kalman.Update(float64(mutTTFB.Microseconds()) / 1000.0)
 			mutSonar.ObserveSigned(resid)
+			if cleanResp != nil && parserRejected(cleanResp.Status, mutResp.Status) {
+				// A 200/301 turning into 400/501 is the parser refusing the
+				// syntax, not a desync. Stop this signature before the pool is
+				// consumed by more rejections.
+				e.addFinding(Finding{Kind: FindingTargetRejected, Confidence: ConfidenceLow,
+					Detail: rejectionDetail("mutation "+mutationName, cleanResp.Status, mutResp.Status), Response: mutResp.Seq})
+				return e.finish(), nil
+			}
 			// Simple differential signal: status change or large TTFB residual gap.
 			if cleanResp != nil && cleanResp.Status != mutResp.Status {
 				e.addFinding(Finding{Kind: "differential_status", Confidence: ConfidenceMedium, Detail: fmt.Sprintf("mutation=%s clean=%d mutated=%d", mutationName, cleanResp.Status, mutResp.Status), Response: mutResp.Seq})
