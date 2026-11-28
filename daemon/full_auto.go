@@ -550,12 +550,7 @@ func (run *fullAutoRun) attack(ctx context.Context) (FullAutoResult, error) {
 	if err != nil {
 		return run.result(StateBlocked, "orchestrator refused differential-fuzz: "+err.Error()), err
 	}
-	fuzz := &probe.DifferentialFuzzProbe{
-		Mutations: []string{action.Mutation},
-		TechStack: append([]string(nil), run.cfg.TechStack...),
-		Pairs:     run.cfg.Pairs,
-		Timeout:   run.cfg.Timeout.Std(),
-	}
+	fuzz := run.fuzzProbe(action)
 	res, err := run.probe(ctx, "differential-fuzz", fuzz, action)
 	if err != nil {
 		return run.result(run.stateForError(err), err.Error()), err
@@ -716,6 +711,19 @@ func (run *fullAutoRun) finishFinding(ctx context.Context, finding probe.Finding
 		}
 	}
 	return out, nil
+}
+
+// fuzzProbe is the single construction point for the full-auto differential
+// probe. Full-auto runs this probe directly rather than through the daemon job
+// builder, so every tuned knob must be copied here as well.
+func (run *fullAutoRun) fuzzProbe(action AttackAction) *probe.DifferentialFuzzProbe {
+	return &probe.DifferentialFuzzProbe{
+		Mutations:    []string{action.Mutation},
+		TechStack:    append([]string(nil), run.cfg.TechStack...),
+		Pairs:        run.cfg.Pairs,
+		JitterMaxIQR: run.cfg.JitterMaxIQR.Std(),
+		Timeout:      run.cfg.Timeout.Std(),
+	}
 }
 
 func (run *fullAutoRun) runOnce(ctx context.Context, target Target, p probe.Probe) (*probe.Result, error) {

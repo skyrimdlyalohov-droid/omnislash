@@ -118,6 +118,21 @@ func TestFullAutoJitterGateOverride(t *testing.T) {
 	}
 }
 
+func TestFullAutoFuzzProbeUsesConfiguredJitter(t *testing.T) {
+	run := &fullAutoRun{cfg: FullAutoConfig{
+		JitterMaxIQR: omnislash.Duration(250 * time.Millisecond),
+		Pairs:        5,
+		Timeout:      omnislash.Duration(8 * time.Second),
+	}}
+	p := run.fuzzProbe(AttackAction{Mutation: "case_mixing"})
+	if p.JitterMaxIQR != 250*time.Millisecond {
+		t.Fatalf("probe jitter = %s, want 250ms", p.JitterMaxIQR)
+	}
+	if p.Pairs != 5 || p.Timeout != 8*time.Second {
+		t.Fatalf("probe lost settings: %+v", p)
+	}
+}
+
 func TestMaybeAutoPushCaidoForwardsRawExchange(t *testing.T) {
 	t.Setenv("CAIDO_URL", "")
 	t.Setenv("CAIDO_PAT", "test-pat")
