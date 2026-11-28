@@ -326,6 +326,14 @@ func (m *PayloadMutator) Mutate(basePayload []byte, seed int64) ([]byte, error) 
 		// class, so the runner FSM records Engine_Fault instead of a verdict.
 		transformed, err := obfuscation.ApplyFramingMutationSeeded(buf, obfuscation.FramingMode(mode), seed)
 		if err != nil {
+			// A global rotation can select a framing-only mutation for a
+			// request without TE/CL/chunked bytes (for example a plain GET
+			// used by recon). That is a local precondition failure, never
+			// target evidence, so leave the bytes unchanged instead of
+			// failing the whole probe.
+			if errors.Is(err, obfuscation.ErrNoFramingHeader) {
+				break
+			}
 			return nil, err
 		}
 		buf = append(buf[:0], transformed...)

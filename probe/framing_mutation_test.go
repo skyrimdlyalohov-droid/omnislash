@@ -55,6 +55,21 @@ func TestRareFramingModesAreOptInAndScopeGated(t *testing.T) {
 	}
 }
 
+func TestRareFramingModesSkipRequestsWithoutFraming(t *testing.T) {
+	get := []byte("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+	for _, mode := range rareFramingModes {
+		t.Run(string(mode), func(t *testing.T) {
+			out, err := safeMutate(testMutator(mode, nil), get, 5)
+			if err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			if !bytes.Equal(out, get) {
+				t.Fatalf("payload = %q, want unchanged GET", out)
+			}
+		})
+	}
+}
+
 func TestRareFramingModesDoNotEnterAutoRotation(t *testing.T) {
 	seen := make(map[MutationMode]struct{}, len(mutationModeOrder))
 	for _, mode := range mutationModeOrder {
