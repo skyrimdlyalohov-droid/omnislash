@@ -25,6 +25,10 @@ type SmuggleChainProbe struct {
 	// chain; TE.CL plants a complete second request inside a chunked body.
 	Variant SmuggleVariant
 
+	// CarrierMethod is the method of the connection-planting request. Empty
+	// keeps the historical POST; full-auto sets GET for a read-only carrier.
+	CarrierMethod string
+
 	// VictimMethod defaults to POST: with the CL.TE prefix the back-end sees
 	// "G"+method, so POST becomes the GPOST marker.
 	VictimMethod string
@@ -57,6 +61,15 @@ type SmuggleChainProbe struct {
 
 func (p *SmuggleChainProbe) Name() string { return "smuggling/cl.te-chain" }
 
+// carrierMethod preserves the historical POST default while allowing the
+// full-auto pipeline to plant the prefix with a GET.
+func (p *SmuggleChainProbe) carrierMethod() string {
+	if m := strings.TrimSpace(p.CarrierMethod); m != "" {
+		return m
+	}
+	return "POST"
+}
+
 // Execute cannot run the chain: the technique needs a second connection by
 // definition. Runner detects MultiConnProbe and calls ExecuteMulti.
 func (p *SmuggleChainProbe) Execute(ctx context.Context, target Target, conn net.Conn) (*Result, error) {
@@ -84,7 +97,7 @@ func (p *SmuggleChainProbe) ExecuteMulti(ctx context.Context, target Target, sou
 	if variant == VariantTECL {
 		payload, err = p.buildTECL(target)
 	} else {
-		payload, err = (&SmugglingProbe{Variant: variant}).build(variant, target, "/")
+		payload, err = (&SmugglingProbe{Variant: variant, Method: p.carrierMethod()}).build(variant, target, "/")
 	}
 	if err != nil {
 		return nil, err
@@ -210,7 +223,7 @@ func (p *SmuggleChainProbe) buildTECL(target Target) ([]byte, error) {
 	}
 	chunk := strconv.FormatInt(int64(len(smuggled)), 16) + "\r\n" + string(smuggled) + "\r\n0\r\n\r\n"
 	outer, err := render(requestSpec{
-		Method: "POST",
+		Method: p.carrierMethod(),
 		Path:   target.RequestPath(),
 		Headers: []rawhttp.Header{
 			{Key: "Host", Value: target.HostHeader()},

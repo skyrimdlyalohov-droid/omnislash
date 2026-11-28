@@ -47,6 +47,8 @@ func run() error {
 		versionOut    = flag.Bool("version", false, "print version")
 		onlineFlag    = flag.String("online-learning", "", "override config online_learning (true|false)")
 		orchestrator  = flag.Bool("orchestrator", false, "enable the top-level Go FSM / Thompson orchestrator")
+		fullAuto      = flag.Bool("full-auto", false, "run the safety-gated recon -> learn -> controlled attack pipeline")
+		forceImpact   = flag.Bool("force-impact", false, "allow full-auto escalation to impact paths such as /pay or /admin")
 		playbookPaths []string
 	)
 	flag.Func("playbook", "curated playbook case JSON; seeds experience with a provenance-tagged prior (repeatable)", func(path string) error {
@@ -61,11 +63,23 @@ func run() error {
 	if *configPath == "" {
 		return errors.New("omnislashd: -config is required")
 	}
+	if *fullAuto && (*jobName != "" || *once) {
+		return errors.New("omnislashd: -full-auto cannot be combined with -job or -once")
+	}
+	if *forceImpact && !*fullAuto {
+		return errors.New("omnislashd: -force-impact requires -full-auto")
+	}
 
 	logger := newLogger(*logLevel)
 	cfg, err := daemon.LoadConfig(*configPath)
 	if err != nil {
 		return err
+	}
+	if *fullAuto {
+		cfg.FullAuto.Enabled = true
+	}
+	if *forceImpact {
+		cfg.FullAuto.ForceImpact = true
 	}
 	if value := strings.TrimSpace(*onlineFlag); value != "" {
 		enabled, err := strconv.ParseBool(value)
@@ -149,6 +163,18 @@ func run() error {
 		}
 	}
 
+	if *fullAuto {
+		if err := d.EnableFullAuto(); err != nil {
+			return err
+		}
+		results, err := d.RunFullAuto(ctx)
+		emitFullAuto(results)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
 	if *jobName != "" || *once {
 		var outcomes []daemon.Outcome
 		if *jobName != "" {
@@ -227,4 +253,12 @@ func emit(outcomes []daemon.Outcome) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+}
+
+// emitFullAuto prints the safe-pipeline verdicts. A result in
+// AWAITING_HUMAN_VERIFICATION is a stop condition, not an escalation.
+func emitFullAuto(results []daemon.FullAutoResult) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(results)
 }

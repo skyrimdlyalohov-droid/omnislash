@@ -41,6 +41,10 @@ const (
 type SmugglingProbe struct {
 	Variant SmuggleVariant
 
+	// Method is the carrier request method. Empty keeps the historical POST;
+	// full-auto sets GET so the probe never changes state on the target.
+	Method string
+
 	// Timeout bounds each read and write.
 	Timeout time.Duration
 	// Idle is how long to wait for late responses after the victim request.
@@ -59,6 +63,15 @@ func (p *SmugglingProbe) Name() string {
 		v = VariantCLTE
 	}
 	return "smuggling/" + string(v)
+}
+
+// carrierMethod preserves the historical POST default while allowing a
+// read-only GET carrier for the full-auto safe pipeline.
+func (p *SmugglingProbe) carrierMethod() string {
+	if m := strings.TrimSpace(p.Method); m != "" {
+		return m
+	}
+	return "POST"
 }
 
 // Execute writes the payload and a victim request, then classifies what came
@@ -277,7 +290,7 @@ func (p *SmugglingProbe) build(variant SmuggleVariant, target Target, canaryPath
 		// CL=6 covers "0\r\n\r\nG"; the TE side sees an empty chunked body and
 		// keeps the trailing "G", which prefixes the victim request line.
 		return render(requestSpec{
-			Method: "POST",
+			Method: p.carrierMethod(),
 			Path:   target.RequestPath(),
 			Headers: []rawhttp.Header{
 				{Key: "Host", Value: host},
@@ -295,7 +308,7 @@ func (p *SmugglingProbe) build(variant SmuggleVariant, target Target, canaryPath
 		// Only the first bytes of the body travel inside Content-Length; the TE
 		// side parses the chunk and returns to the request loop early.
 		return render(requestSpec{
-			Method: "POST",
+			Method: p.carrierMethod(),
 			Path:   target.RequestPath(),
 			Headers: []rawhttp.Header{
 				{Key: "Host", Value: host},
@@ -311,7 +324,7 @@ func (p *SmugglingProbe) build(variant SmuggleVariant, target Target, canaryPath
 		// Obfuscated and duplicated Transfer-Encoding. The exact bytes matter,
 		// which is why rawhttp renders the header list verbatim.
 		return render(requestSpec{
-			Method: "POST",
+			Method: p.carrierMethod(),
 			Path:   target.RequestPath(),
 			Headers: []rawhttp.Header{
 				{Key: "Host", Value: host},

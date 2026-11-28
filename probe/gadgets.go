@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -84,9 +85,25 @@ type GadgetProbe struct {
 	Idle      time.Duration
 	MaxHeader int64
 	MaxBody   int64
+
+	// Headers switches the probe to binary-search group testing. Each header
+	// receives a fresh crypto-random canary per request; the candidate set is
+	// bisected only when the response changes.
+	Headers             []string
+	BatchSize           int
+	MaxRequests         int
+	MaxAttempts         int
+	StructuralThreshold float64
+
+	// canaryReader is internal. Tests replace it to make canaries
+	// deterministic; production uses crypto/rand.Reader.
+	canaryReader io.Reader
 }
 
 func (p *GadgetProbe) Name() string {
+	if p.batchMode() {
+		return "gadget/binary-search"
+	}
 	if p.Gadget.Name == "" {
 		return "gadget/unnamed"
 	}
@@ -94,6 +111,13 @@ func (p *GadgetProbe) Name() string {
 }
 
 func (p *GadgetProbe) Execute(ctx context.Context, target Target, conn net.Conn) (*Result, error) {
+	if p.batchMode() {
+		return p.search(ctx, target, &fixedConnSource{conn: conn}, false)
+	}
+	return p.executeSingle(ctx, target, conn)
+}
+
+func (p *GadgetProbe) executeSingle(ctx context.Context, target Target, conn net.Conn) (*Result, error) {
 	if len(p.Gadget.Headers) == 0 {
 		return nil, fmt.Errorf("probe: gadget has no headers")
 	}

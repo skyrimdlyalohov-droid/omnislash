@@ -92,6 +92,7 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 	var cleanSonar, mutSonar Welford
 	var baselineCleanStatus int
 	var baselineCleanBody []byte
+	var baselineCleanContentType string
 	pairs := p.pairs()
 	hold := p.hold()
 	timeout := orDuration(p.Timeout, defaultTimeout)
@@ -154,10 +155,17 @@ func (p *DifferentialFuzzProbe) ExecuteMulti(ctx context.Context, target Target,
 			if i == 0 {
 				baselineCleanStatus = cleanResp.Status
 				baselineCleanBody = []byte(cleanResp.Body)
+				baselineCleanContentType = responseContentType(cleanResp)
 			} else {
 				shifted := cleanResp.Status != baselineCleanStatus
 				if !shifted && len(baselineCleanBody) > 0 {
-					shifted = omnislash.NormalizedCompressionDistance(baselineCleanBody, []byte(cleanResp.Body)) > p.neighborNCD()
+					// Structural tokens filter rotating CSRF/timestamp/ad values;
+					// plain text and non-HTTP bodies still use the raw NCD path.
+					if distance, ok := responseStructuralShift(baselineCleanBody, baselineCleanContentType, cleanResp); ok {
+						shifted = distance > p.neighborNCD()
+					} else {
+						shifted = omnislash.NormalizedCompressionDistance(baselineCleanBody, []byte(cleanResp.Body)) > p.neighborNCD()
+					}
 				}
 				if shifted {
 					e.addFinding(Finding{Kind: "neighbor_shift", Confidence: ConfidenceHigh, Detail: fmt.Sprintf("clean response shifted at pair %d: status %d->%d", i+1, baselineCleanStatus, cleanResp.Status), Response: cleanResp.Seq})
@@ -205,6 +213,34 @@ func timingDesyncFinding(clean, mutated *Welford) (z float64, detail string, ok 
 	z = (mutated.Mean() - clean.Mean()) / mutated.StdDev(DefaultMinSigmaMS)
 	detail = fmt.Sprintf("clean_residual_ms=%.3f mutated_residual_ms=%.3f z=%.3f", clean.Mean(), mutated.Mean(), z)
 	return z, detail, true
+}
+
+func responseContentType(resp *Response) string {
+	if resp == nil {
+		return ""
+	}
+	if values := resp.headerValues("Content-Type"); len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// responseStructuralShift reports a structural distance only when both bodies
+// have value-free tokens (HTML tags or JSON keys). A text/plain response has no
+// skeleton, so callers must fall back to raw NCD instead of inventing one.
+func responseStructuralShift(base []byte, baseContentType string, sample *Response) (float64, bool) {
+	if sample == nil {
+		return 0, false
+	}
+	baseProfile := omnislash.AnalyzeStructure(base, baseContentType)
+	if !baseProfile.HasTokens() {
+		return 0, false
+	}
+	sampleProfile := omnislash.AnalyzeStructure([]byte(sample.Body), responseContentType(sample))
+	if !sampleProfile.HasTokens() {
+		return 0, false
+	}
+	return omnislash.StructuralDistance(baseProfile, sampleProfile), true
 }
 
 func buildCleanRequest(target Target) []byte {

@@ -74,6 +74,13 @@ type BaselineProfile struct {
 	// Skeleton is the value-free canonical form used for NCD. It is empty
 	// when the loopback semantic service is unavailable or disabled.
 	Skeleton string `json:"-"`
+	// SemanticSkeleton records that Skeleton came from the semantic service,
+	// not from a raw body fallback. It keeps a missing sidecar from silently
+	// turning dynamic bytes into a "canonical" NCD baseline.
+	SemanticSkeleton bool `json:"-"`
+	// Structure is the local stdlib skeleton+SimHash profile. It works with
+	// the semantic service off, so dynamic values never enter NCD.
+	Structure StructuralProfile `json:"-"`
 }
 
 // DeceptionFilter detects synthetic/tarpit responses and quarantines unverified
@@ -196,15 +203,23 @@ const maxNCDBytes = 8 << 10
 // caller must fail closed: using raw bytes for NCD in that mode could let a
 // honeypot's dynamic body look like a legitimate response.
 func (f *DeceptionFilter) bodySkeleton(body []byte, contentType string) ([]byte, error) {
+	skeleton, _, err := f.bodySkeletonCanonical(body, contentType)
+	return skeleton, err
+}
+
+// bodySkeletonCanonical also reports whether the result is a real value-free
+// skeleton. The raw-body fallback is still returned for the tarpit heuristic,
+// but it must not be labelled as canonical evidence in an audit record.
+func (f *DeceptionFilter) bodySkeletonCanonical(body []byte, contentType string) ([]byte, bool, error) {
 	body = append([]byte(nil), body...)
 	if len(body) > maxNCDBytes {
 		body = body[:maxNCDBytes]
 	}
 	if f.semantic == nil {
 		if f.cfg.SemanticRequired {
-			return nil, fmt.Errorf("%w: semantic service is not configured", ErrDeceptionUncertain)
+			return nil, false, fmt.Errorf("%w: semantic service is not configured", ErrDeceptionUncertain)
 		}
-		return body, nil
+		return body, false, nil
 	}
 	skeleton, err := f.semantic.Skeleton(body, contentType)
 	if err != nil {
@@ -216,14 +231,14 @@ func (f *DeceptionFilter) bodySkeleton(body []byte, contentType string) ([]byte,
 			f.log.Warn("semantic skeleton unavailable", "addr", f.cfg.SemanticAddr, "required", f.cfg.SemanticRequired, "error", err)
 		}
 		if f.cfg.SemanticRequired {
-			return nil, fmt.Errorf("%w: %v", ErrDeceptionUncertain, err)
+			return nil, false, fmt.Errorf("%w: %v", ErrDeceptionUncertain, err)
 		}
-		return body, nil
+		return body, false, nil
 	}
 	if len(skeleton) > maxNCDBytes {
 		skeleton = skeleton[:maxNCDBytes]
 	}
-	return []byte(skeleton), nil
+	return []byte(skeleton), true, nil
 }
 
 // EnsureBaseline runs CalibrateBaseline once per host/prefix before the first
@@ -377,12 +392,17 @@ func (f *DeceptionFilter) CalibrateBaseline(ctx context.Context, baseURL, prefix
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, f.cfg.MaxBodySample))
 		_ = resp.Body.Close()
-		skeleton, skErr := f.bodySkeleton(body, resp.Header.Get("Content-Type"))
+		contentType := resp.Header.Get("Content-Type")
+		skeleton, canonical, skErr := f.bodySkeletonCanonical(body, contentType)
 		if skErr != nil {
 			return nil, skErr
 		}
-		if prof.Skeleton == "" && len(skeleton) > 0 {
+		if prof.Samples == 0 {
+			prof.Structure = AnalyzeStructure(body, contentType)
+		}
+		if canonical && prof.Skeleton == "" && len(skeleton) > 0 {
 			prof.Skeleton = string(skeleton)
+			prof.SemanticSkeleton = true
 		}
 		fp := fingerprintResponse(resp.StatusCode, body)
 		prof.Samples++
@@ -500,7 +520,7 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 		return d, nil
 	}
 	fp := fingerprintResponse(status, body)
-	skeleton, skErr := f.bodySkeleton(body, contentType)
+	skeleton, canonicalSkeleton, skErr := f.bodySkeletonCanonical(body, contentType)
 	if skErr != nil {
 		d := DeceptionDecision{Host: host, Prefix: prefix, Reason: skErr.Error(), Uncertain: true}
 		return d, skErr
@@ -525,14 +545,33 @@ func (f *DeceptionFilter) InspectResponseWithContentType(host, path string, stat
 		return d, nil
 	}
 	if base != nil && len(body) > 0 {
-		a, b := base.Sample, body
-		if base.Skeleton != "" {
-			a, b = []byte(base.Skeleton), skeleton
-		}
-		if len(a) > 0 && len(b) > 0 {
-			ncd := NormalizedCompressionDistance(a, b)
-			if ncd > f.cfg.NCDStructural && status == 200 && (fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 0) {
+		hints := fp.hasAdmin || fp.tokenCount > 0 || fp.endpointHints > 0
+		switch {
+		case base.SemanticSkeleton && canonicalSkeleton && base.Skeleton != "" && len(skeleton) > 0:
+			// The semantic service already removed values; keep its NCD as the
+			// evidence so the audit reason stays attributable to that service.
+			ncd := NormalizedCompressionDistance([]byte(base.Skeleton), skeleton)
+			if ncd > f.cfg.NCDStructural && status == 200 && hints {
 				d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "structural shift vs baseline (skeleton NCD)", Score: ncd}
+				f.flag(d)
+				return d, nil
+			}
+		case len(base.Structure.keys) > 0:
+			// Pure-Go path: SimHash + token skeleton let rotation noise pass
+			// while a new tag or JSON key still counts as a structural shift.
+			local := AnalyzeStructure(body, contentType)
+			if len(local.keys) > 0 {
+				distance := StructuralDistance(base.Structure, local)
+				if distance > f.cfg.NCDStructural && status == 200 && hints {
+					d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "structural shift vs baseline (local skeleton)", Score: distance}
+					f.flag(d)
+					return d, nil
+				}
+			}
+		default:
+			ncd := NormalizedCompressionDistance(base.Sample, body)
+			if ncd > f.cfg.NCDStructural && status == 200 && hints {
+				d := DeceptionDecision{Flagged: true, Kind: DeceptionSynthetic200, Host: host, Prefix: prefix, Reason: "structural shift vs baseline (raw NCD)", Score: ncd}
 				f.flag(d)
 				return d, nil
 			}

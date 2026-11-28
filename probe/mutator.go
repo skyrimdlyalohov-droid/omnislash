@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/skyrimdlyalohov-droid/omnislash/obfuscation"
 	"github.com/skyrimdlyalohov-droid/omnislash/util"
 
 	rawhttp "github.com/projectdiscovery/rawhttp/client"
@@ -60,6 +61,8 @@ func (m Mutator) Mutations() []Mutation {
 		{Name: "space_before_colon", Category: "separator", Description: "Header : value"},
 		{Name: "cl_te_duplicate", Category: "framing", Description: "duplicate CL and TE variations"},
 		{Name: "te_obfuscation", Category: "framing", Description: "Transfer-Encoding obfuscation"},
+		{Name: "chunk_extensions", Category: "framing", Description: "GET body with a chunk extension"},
+		{Name: "boundary_shift", Category: "framing", Description: "chunk boundary shifted by a leading CRLF"},
 	}
 }
 
@@ -107,6 +110,21 @@ func (m Mutator) Apply(name string, target Target) ([]byte, Mutation, error) {
 		mut = Mutation{Name: name, Category: "framing", Description: "TE obfuscation"}
 		body := "0\r\n\r\n"
 		raw := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: omnislash-probe/1\r\nContent-Length: 4\r\nTransfer-Encoding: xchunked\r\nConnection: keep-alive\r\n\r\n%s", spec.Path, target.HostHeader(), body)
+		return []byte(raw), mut, nil
+	case "chunk_extensions":
+		// GET keeps the differential pair read-only. The chunk extension is the
+		// variable: a front-end that ignores it and a back-end that parses it
+		// disagree about where the request body ends.
+		mut = Mutation{Name: name, Category: "framing", Description: "GET body with a chunk extension"}
+		body := "1;omnislash=1\r\nX\r\n0\r\n\r\n"
+		raw := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: omnislash-probe/1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n%s", spec.Path, target.HostHeader(), body)
+		return []byte(raw), mut, nil
+	case "boundary_shift":
+		// A leading CRLF before the terminal chunk shifts the parser boundary
+		// without changing the method or adding a state-changing request.
+		mut = Mutation{Name: name, Category: "framing", Description: "chunk boundary shifted by a leading CRLF"}
+		body := "\r\n0\r\n\r\n"
+		raw := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: omnislash-probe/1\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n%s", spec.Path, target.HostHeader(), body)
 		return []byte(raw), mut, nil
 	default:
 		return nil, mut, fmt.Errorf("unknown mutation %q", name)
@@ -175,6 +193,14 @@ const (
 	// mutationModeOrder so legacy differential-fuzz behaviour is unchanged.
 	MutationBoundaryShift  MutationMode = "boundary_shift"
 	MutationEliteCrossover MutationMode = "elite_crossover"
+
+	// Rare parser-disagreement patterns are opt-in. They are intentionally not
+	// in mutationModeOrder: adding them to MutationAuto would change every
+	// legacy differential-fuzz job without the operator asking for it.
+	MutationOWSBeforeColon     = MutationMode(obfuscation.FramingOWSBeforeColon)
+	MutationOWSInValue         = MutationMode(obfuscation.FramingOWSInValue)
+	MutationConflictingFraming = MutationMode(obfuscation.FramingConflictingHeaders)
+	MutationChunkBoundaryExt   = MutationMode(obfuscation.FramingChunkBoundary)
 )
 
 var mutationModeOrder = []MutationMode{
@@ -283,6 +309,16 @@ func (m *PayloadMutator) Mutate(basePayload []byte, seed int64) ([]byte, error) 
 		buf = shiftRequestBoundary(buf, rng, m.Fitness)
 	case MutationEliteCrossover:
 		buf = crossoverEliteFraming(buf, rng, m.Elite)
+	case MutationOWSBeforeColon, MutationOWSInValue,
+		MutationConflictingFraming, MutationChunkBoundaryExt:
+		// Byte-only generator in obfuscation/. It refuses malformed framing
+		// with util.ErrPrecisionLost; safeMutate turns panics into the same
+		// class, so the runner FSM records Engine_Fault instead of a verdict.
+		transformed, err := obfuscation.ApplyFramingMutationSeeded(buf, obfuscation.FramingMode(mode), seed)
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf[:0], transformed...)
 	default:
 		return nil, fmt.Errorf("probe: unknown mutation mode %q", mode)
 	}

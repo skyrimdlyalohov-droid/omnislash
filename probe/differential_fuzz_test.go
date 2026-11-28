@@ -6,6 +6,68 @@ import (
 	"testing"
 )
 
+func TestResponseStructuralShiftSuppressesDynamicTokens(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		base        string
+		sample      string
+		wantOK      bool
+		wantShift   bool
+	}{
+		{
+			name:        "json token and timestamp rotate",
+			contentType: "application/json",
+			base:        `{"admin_panel":true,"token":"AAAAAAAA","ts":1710000000,"items":[{"name":"a"}]}`,
+			sample:      `{"admin_panel":true,"token":"BBBBBBBB","ts":1719999999,"items":[{"name":"a"}]}`,
+			wantOK:      true,
+			wantShift:   false,
+		},
+		{
+			name:        "json gains a key",
+			contentType: "application/json",
+			base:        `{"admin_panel":true,"token":"AAAAAAAA","items":[{"name":"a"}]}`,
+			sample:      `{"admin_panel":true,"token":"BBBBBBBB","secret":"new","items":[{"name":"a"}]}`,
+			wantOK:      true,
+			wantShift:   true,
+		},
+		{
+			name:        "html csrf rotates",
+			contentType: "text/html",
+			base:        `<html><body><form><input name="csrf" value="AAAAAAAA"></form></body></html>`,
+			sample:      `<html><body><form><input name="csrf" value="BBBBBBBB"></form></body></html>`,
+			wantOK:      true,
+			wantShift:   false,
+		},
+		{
+			name:        "plain text has no skeleton",
+			contentType: "text/plain",
+			base:        `request 1710000000 accepted`,
+			sample:      `request 1719999999 accepted`,
+			wantOK:      false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &Response{
+				Body:    tc.sample,
+				Headers: []Header{{Key: "Content-Type", Value: tc.contentType}},
+			}
+			distance, ok := responseStructuralShift([]byte(tc.base), tc.contentType, resp)
+			if ok != tc.wantOK {
+				t.Fatalf("structural comparator available = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			shifted := distance > 0.15
+			if shifted != tc.wantShift {
+				t.Fatalf("distance = %.3f, shifted = %v, want %v", distance, shifted, tc.wantShift)
+			}
+		})
+	}
+}
+
 func TestObserveSignedKeepsNegativeResiduals(t *testing.T) {
 	var signed, latency Welford
 	signed.ObserveSigned(-2.5)

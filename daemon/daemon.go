@@ -100,6 +100,14 @@ type Daemon struct {
 	// redirect is built from ui by SetUI. It resolves root redirect stubs to
 	// the real application path before the byte-exact probes run.
 	redirect *redirectResolver
+
+	// fullAuto is the safety-gated -full-auto runtime. Nil until enabled.
+	fullAutoMu    sync.Mutex
+	fullAuto      *fullAutoRuntime
+	fullAutoScope FullAutoScope
+	// impact is the optional ImpactValidator. The safe pipeline calls it only
+	// when --force-impact was supplied; a finding never escalates on its own.
+	impact ImpactValidator
 }
 
 // New validates cfg and prepares the scheduler. audit may be nil.
@@ -220,6 +228,50 @@ func (d *Daemon) EnableOrchestrator() *Orchestrator {
 	o := NewOrchestrator(provider, d.audit)
 	d.SetOrchestrator(o)
 	return o
+}
+
+// EnableFullAuto turns on the safe pipeline and guarantees that the
+// self-learning FSM is attached. The flag is opt-in; without it the daemon's
+// existing per-job behavior is unchanged.
+func (d *Daemon) EnableFullAuto() error {
+	if d == nil {
+		return errors.New("daemon: nil receiver")
+	}
+	d.cfg.FullAuto.Enabled = true
+	if d.orchestrator == nil {
+		d.EnableOrchestrator()
+	}
+	if d.orchestrator == nil {
+		return errors.New("daemon: full-auto requires an orchestrator")
+	}
+	// The differential-fuzz probe builds its own GET-only mutation inside the
+	// probe. The runner-level pass would rewrite recon and smuggling bytes, so
+	// full-auto removes it: every non-fuzz request stays byte-exact.
+	if setter, ok := d.exec.(interface {
+		SetMutationPolicy(*probe.MutationPolicy) error
+	}); ok {
+		if err := setter.SetMutationPolicy(nil); err != nil {
+			return fmt.Errorf("daemon: full-auto cannot disable runner mutation: %w", err)
+		}
+	}
+	return nil
+}
+
+// SetImpactValidator installs the optional impact check. It is invoked only
+// when full_auto.force_impact is true; a confirmed finding is otherwise parked
+// at AWAITING_HUMAN_VERIFICATION and no escalation request is sent.
+func (d *Daemon) SetImpactValidator(v ImpactValidator) {
+	if d != nil {
+		d.impact = v
+	}
+}
+
+// SetFullAutoScope overrides the scope used by the safe pipeline. Production
+// uses the transport pool's scope; tests and embedders can supply a fake.
+func (d *Daemon) SetFullAutoScope(s FullAutoScope) {
+	if d != nil {
+		d.fullAutoScope = s
+	}
 }
 
 // configureMutation is the daemon-side integration point: the transport config
@@ -1058,6 +1110,7 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 	case "smuggle-chain":
 		return &probe.SmuggleChainProbe{
 			Variant:         probe.SmuggleVariant(j.Variant),
+			CarrierMethod:   j.Method,
 			VictimMethod:    j.VictimMethod,
 			VictimPath:      j.VictimPath,
 			SmuggledMethod:  j.SmuggledMethod,
@@ -1074,7 +1127,7 @@ func buildProbe(j *JobConfig) (probe.Probe, error) {
 		if variant == "" {
 			variant = probe.VariantCLTE
 		}
-		return &probe.SmugglingProbe{Variant: variant, Timeout: timeout, Idle: idle, BaselinePath: j.Path}, nil
+		return &probe.SmugglingProbe{Variant: variant, Method: j.Method, Timeout: timeout, Idle: idle, BaselinePath: j.Path}, nil
 	case "race":
 		return &probe.RaceProbe{
 			Count:     j.Count,

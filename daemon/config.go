@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/skyrimdlyalohov-droid/omnislash"
@@ -58,7 +59,153 @@ type Config struct {
 	// Relative paths are resolved against this config's directory.
 	OnlinePaths OnlineLearningPaths `json:"online_paths,omitempty"`
 
+	// FullAuto enables the safety-gated recon -> learning -> controlled attack
+	// pipeline. It is off unless -full-auto or full_auto.enabled is set.
+	FullAuto FullAutoConfig `json:"full_auto,omitempty"`
+
 	Jobs []JobConfig `json:"jobs"`
+}
+
+// FullAutoConfig is the -full-auto policy. Every default is deliberately
+// conservative: one request per second, GET carriers, a five-minute WAF
+// cooldown and a hard stop before any impact validation.
+type FullAutoConfig struct {
+	Enabled bool `json:"enabled"`
+	// Targets are host:port strings. Empty means "every configured job target".
+	Targets []string `json:"targets,omitempty"`
+	// Endpoints are recon/attack paths. Empty means ["/"].
+	Endpoints []string `json:"endpoints,omitempty"`
+	// TLS is the transport mode for the probe session: h1 (default), h2 or none.
+	TLS string `json:"tls,omitempty"`
+	// TLSCandidates are the fingerprints ranked by self-learning. The transport
+	// pins the actual ClientHello; the chosen label is audited.
+	TLSCandidates []string `json:"tls_candidates,omitempty"`
+	// MutationCandidates are grammar mutation names ranked by self-learning.
+	// The defaults are GET-only framing mutations.
+	MutationCandidates []string `json:"mutation_candidates,omitempty"`
+	TechStack          []string `json:"tech_stack,omitempty"`
+	// SmuggleVariants are the framing variants tried after differential-fuzz.
+	SmuggleVariants []string `json:"smuggle_variants,omitempty"`
+	// Pairs is the differential-fuzz pair count. Default 3.
+	Pairs int `json:"pairs,omitempty"`
+	// BaselineSamples is how many clean GETs calibrate the NCD baseline.
+	BaselineSamples int `json:"baseline_samples,omitempty"`
+	// RateLimit is the global probe interval. 0 means 1s; negative disables
+	// the limiter (lab/test only).
+	RateLimit omnislash.Duration `json:"rate_limit,omitempty"`
+	// WAFCooldown pauses a target after a stop status. Default 5m.
+	WAFCooldown omnislash.Duration `json:"waf_cooldown,omitempty"`
+	// StopStatuses trigger an immediate cooldown. Default [429, 503].
+	StopStatuses []int `json:"stop_statuses,omitempty"`
+	// BlockStatuses trigger a cooldown after BlockThreshold occurrences.
+	// Default [403] with threshold 1: the safe pipeline treats even one WAF
+	// rejection as a stop, which is stricter than "repeated 403".
+	BlockStatuses  []int `json:"block_statuses,omitempty"`
+	BlockThreshold int   `json:"block_threshold,omitempty"`
+	// ImpactPaths are escalation prefixes that require --force-impact.
+	// Default ["/pay", "/admin"].
+	ImpactPaths []string `json:"impact_paths,omitempty"`
+	// SafePOSTPaths lists the only paths where a POST carrier is allowed.
+	// Empty means GET-only.
+	SafePOSTPaths []string `json:"safe_post_paths,omitempty"`
+	// ForceImpact is the manual escalation flag. It is never set by default and
+	// must come from --force-impact.
+	ForceImpact bool `json:"force_impact,omitempty"`
+	// PoCDir receives raw PoC files. Default runs/full-auto/poc.
+	PoCDir string `json:"poc_dir,omitempty"`
+	// Timeout bounds each recon/attack request. Default 10s.
+	Timeout omnislash.Duration `json:"timeout,omitempty"`
+	// Idle bounds the wait for late responses. Default 2s.
+	Idle omnislash.Duration `json:"idle,omitempty"`
+}
+
+// withDefaults fills the safety policy without mutating the caller's config.
+func (c FullAutoConfig) withDefaults() FullAutoConfig {
+	if len(c.Endpoints) == 0 {
+		c.Endpoints = []string{"/"}
+	}
+	if c.TLS == "" {
+		c.TLS = "h1"
+	}
+	if len(c.TLSCandidates) == 0 {
+		c.TLSCandidates = []string{"chrome", "firefox"}
+	}
+	if len(c.MutationCandidates) == 0 {
+		c.MutationCandidates = []string{"chunk_extensions", "boundary_shift"}
+	}
+	if len(c.SmuggleVariants) == 0 {
+		c.SmuggleVariants = []string{string(probe.VariantCLTE)}
+	}
+	if c.Pairs <= 0 {
+		c.Pairs = 3
+	}
+	if c.BaselineSamples <= 0 {
+		c.BaselineSamples = 2
+	}
+	if c.RateLimit == 0 {
+		c.RateLimit = omnislash.Duration(time.Second)
+	}
+	if c.RateLimit < 0 {
+		c.RateLimit = 0
+	}
+	if c.WAFCooldown <= 0 {
+		c.WAFCooldown = omnislash.Duration(5 * time.Minute)
+	}
+	if len(c.StopStatuses) == 0 {
+		c.StopStatuses = []int{429, 503}
+	}
+	if len(c.BlockStatuses) == 0 {
+		c.BlockStatuses = []int{403}
+	}
+	if c.BlockThreshold <= 0 {
+		c.BlockThreshold = 1
+	}
+	if len(c.ImpactPaths) == 0 {
+		c.ImpactPaths = []string{"/pay", "/admin"}
+	}
+	if c.PoCDir == "" {
+		c.PoCDir = filepath.Join("runs", "full-auto", "poc")
+	}
+	if c.Timeout <= 0 {
+		c.Timeout = omnislash.Duration(10 * time.Second)
+	}
+	if c.Idle <= 0 {
+		c.Idle = omnislash.Duration(2 * time.Second)
+	}
+	return c
+}
+
+// impactPath reports whether path is an escalation target. Comparison is
+// case-insensitive and ignores the query string.
+func (c FullAutoConfig) impactPath(path string) bool {
+	p := strings.ToLower(strings.TrimSpace(path))
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	for _, prefix := range c.ImpactPaths {
+		prefix = strings.ToLower(strings.TrimSpace(prefix))
+		if prefix == "" {
+			continue
+		}
+		if p == prefix || strings.HasPrefix(p, strings.TrimRight(prefix, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// safePOST reports whether a POST carrier is allowed for path.
+func (c FullAutoConfig) safePOST(path string) bool {
+	p := path
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	for _, allowed := range c.SafePOSTPaths {
+		if strings.TrimSpace(allowed) == p {
+			return true
+		}
+	}
+	return false
 }
 
 // LearningPolicy is the exploration schedule for learned rankings.
@@ -221,6 +368,7 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.OnlinePaths.OffsetPath = resolvePath(base, cfg.OnlinePaths.OffsetPath)
 	cfg.OnlinePaths.StatusPath = resolvePath(base, cfg.OnlinePaths.StatusPath)
 	cfg.OnlinePaths.ControlPath = resolvePath(base, cfg.OnlinePaths.ControlPath)
+	cfg.FullAuto.PoCDir = resolvePath(base, cfg.FullAuto.PoCDir)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}

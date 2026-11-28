@@ -29,6 +29,16 @@ const (
 	StateFeedback OrchestratorState = "StateFeedback"
 	StateVerify   OrchestratorState = "StateVerify"
 	StateEscalate OrchestratorState = "StateEscalate"
+
+	// StateAwaitingHumanVerification is the full-auto safe gate. A confirmed
+	// desync is never escalated automatically: the pipeline parks here and the
+	// operator has to inspect the saved PoC before any impact validation.
+	StateAwaitingHumanVerification OrchestratorState = "AWAITING_HUMAN_VERIFICATION"
+	// StateCooldown means a WAF/rate-limit status paused the target. The FSM
+	// keeps the reason; no further probe is sent until the deadline expires.
+	StateCooldown OrchestratorState = "COOLDOWN"
+	// StateBlocked covers a scope, honeypot or impact-path refusal.
+	StateBlocked OrchestratorState = "BLOCKED"
 )
 
 var (
@@ -416,6 +426,23 @@ func (o *Orchestrator) ObserveResult(res *probe.Result) {
 	o.ObserveExchange(signal)
 }
 
+// SetBaseline installs the raw clean response used for per-attempt NCD. The
+// full-auto recon phase calls it after Calibrate; legacy callers keep the
+// semantic-only baseline path.
+func (o *Orchestrator) SetBaseline(raw []byte, status int) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.baseline = append([]byte(nil), raw...)
+	if len(o.baseline) > 64<<10 {
+		o.baseline = o.baseline[:64<<10]
+	}
+	o.baselineStatus = status
+	o.baselineSet = true
+	o.mu.Unlock()
+}
+
 // Distance computes NCD against the calibrated raw baseline. With no baseline
 // it returns 1: an uncalibrated attempt must never be promoted by NCD alone.
 func (o *Orchestrator) Distance(raw []byte) float64 {
@@ -521,6 +548,26 @@ func (o *Orchestrator) State() OrchestratorState {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.state
+}
+
+// AwaitHumanVerification parks a confirmed finding at the safe gate. It never
+// minimizes, validates impact or pushes an escalation artifact: the operator
+// must inspect the saved PoC first. The finding is recorded even when the
+// sonar was not strong enough to promote it inside RecordOutcome.
+func (o *Orchestrator) AwaitHumanVerification(host, reason string, finding probe.Finding) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	if o.finding.Kind == "" {
+		o.finding = finding
+	}
+	o.mu.Unlock()
+	o.transition(StateAwaitingHumanVerification, OrchestratorEvent{
+		Host:             host,
+		ParserDivergence: probe.FEClosedBEWaiting,
+		Reason:           reason,
+	})
 }
 
 // LastAction returns a copy of the most recent learned action.
@@ -804,6 +851,11 @@ func mutationModeOf(name string) probe.MutationMode {
 	switch probe.MutationMode(name) {
 	case probe.MutationHeaderFolding, probe.MutationChunkExtensions, probe.MutationCaseMixing,
 		probe.MutationBoundaryShift, probe.MutationEliteCrossover:
+		return probe.MutationMode(name)
+	// Rare framing modes are opt-in through config only; MutationAuto still
+	// never rotates into them.
+	case probe.MutationOWSBeforeColon, probe.MutationOWSInValue,
+		probe.MutationConflictingFraming, probe.MutationChunkBoundaryExt:
 		return probe.MutationMode(name)
 	default:
 		return probe.MutationAuto

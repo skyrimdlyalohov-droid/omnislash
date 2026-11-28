@@ -14,6 +14,22 @@ import (
 	"github.com/skyrimdlyalohov-droid/omnislash/probe"
 )
 
+func TestRareFramingModesRequireExplicitOptIn(t *testing.T) {
+	for _, mode := range []probe.MutationMode{
+		probe.MutationOWSBeforeColon,
+		probe.MutationOWSInValue,
+		probe.MutationConflictingFraming,
+		probe.MutationChunkBoundaryExt,
+	} {
+		if got := mutationModeOf(string(mode)); got != mode {
+			t.Fatalf("mutationModeOf(%q) = %q, want explicit opt-in", mode, got)
+		}
+	}
+	if got := mutationModeOf("unknown_mode"); got != probe.MutationAuto {
+		t.Fatalf("unknown mode = %q, want MutationAuto", got)
+	}
+}
+
 func orchestratorTestProfile() TargetProfile {
 	return TargetProfile{
 		Host:               "lab.test",
