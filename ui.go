@@ -343,6 +343,13 @@ func uiOnlineEnabled(o UIOptions) bool {
 	return ok && snapshot.State == "ACTIVE" && snapshot.Active
 }
 
+// NewCaidoPushClient returns the default loopback-only Caido bridge client with
+// all UIOptions defaults applied. CLI daemons use it when no custom client is
+// supplied, so a job-level auto_caido_push opt-in actually has a transport.
+func NewCaidoPushClient(opts UIOptions) func(context.Context, []json.RawMessage, string, string) (int, error) {
+	return opts.withDefaults(nil).CaidoPush
+}
+
 func (o UIOptions) withDefaults(pool *Pool) UIOptions {
 	if o.Pool == nil {
 		o.Pool = pool

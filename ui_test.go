@@ -698,6 +698,16 @@ func TestUIOnlineAuditEventReranksWithoutProcessRestart(t *testing.T) {
 	}, "paused stream status")
 }
 
+func TestNewCaidoPushClientInstallsDefault(t *testing.T) {
+	client := NewCaidoPushClient(UIOptions{})
+	if client == nil {
+		t.Fatal("default Caido client is nil")
+	}
+	if _, err := CaidoPushURL("http://127.0.0.1:8080/graphql"); err != nil {
+		t.Fatalf("default Caido URL must be accepted: %v", err)
+	}
+}
+
 func TestUIPoolSummaryCountsTiersWithoutChangingStatsSchema(t *testing.T) {
 	cfg := DefaultConfig()
 	proxy, err := NewProxy("http://127.0.0.1:18081", "http")

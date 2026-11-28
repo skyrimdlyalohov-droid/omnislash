@@ -126,6 +126,7 @@ func run() error {
 		Scope:      pool.Scope(),
 		ConfigPath: cfg.OmnislashConfig,
 	}
+	ui.CaidoPush = omnislash.NewCaidoPushClient(ui)
 	if cfg.LogFile != "" {
 		ui.AuditPaths = []string{cfg.LogFile}
 	}
