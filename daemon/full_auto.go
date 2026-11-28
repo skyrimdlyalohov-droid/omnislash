@@ -727,16 +727,17 @@ func (run *fullAutoRun) runOnce(ctx context.Context, target Target, p probe.Prob
 
 func (run *fullAutoRun) job(name string, action AttackAction) *JobConfig {
 	j := &JobConfig{
-		Name:      "full-auto/" + name,
-		Target:    TargetConfig{Addr: run.target.Addr, Host: run.target.Host, Path: run.target.Path},
-		Probe:     name,
-		TLS:       run.cfg.TLS,
-		Variant:   action.Variant,
-		Method:    "GET",
-		Timeout:   run.cfg.Timeout,
-		Idle:      run.cfg.Idle,
-		TechStack: append([]string(nil), run.cfg.TechStack...),
-		Pairs:     run.cfg.Pairs,
+		Name:         "full-auto/" + name,
+		Target:       TargetConfig{Addr: run.target.Addr, Host: run.target.Host, Path: run.target.Path},
+		Probe:        name,
+		TLS:          run.cfg.TLS,
+		Variant:      action.Variant,
+		Method:       "GET",
+		Timeout:      run.cfg.Timeout,
+		Idle:         run.cfg.Idle,
+		TechStack:    append([]string(nil), run.cfg.TechStack...),
+		Pairs:        run.cfg.Pairs,
+		JitterMaxIQR: run.cfg.JitterMaxIQR,
 	}
 	if name == "differential-fuzz" {
 		j.Mutations = []string{action.Mutation}

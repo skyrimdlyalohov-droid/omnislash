@@ -117,6 +117,9 @@ type FullAutoConfig struct {
 	Timeout omnislash.Duration `json:"timeout,omitempty"`
 	// Idle bounds the wait for late responses. Default 2s.
 	Idle omnislash.Duration `json:"idle,omitempty"`
+	// JitterMaxIQR bounds the differential-fuzz jitter gate. The probe default
+	// is 25ms; noisy public proxy pools need an explicitly looser value.
+	JitterMaxIQR omnislash.Duration `json:"jitter_max_iqr,omitempty"`
 
 	// GadgetMode selects the discovery stage: "chained" (default) waits for a
 	// desync verdict; "standalone"/"unkeyed-cache" runs after recon on live
@@ -185,6 +188,9 @@ func (c FullAutoConfig) withDefaults() FullAutoConfig {
 	}
 	if c.Idle <= 0 {
 		c.Idle = omnislash.Duration(2 * time.Second)
+	}
+	if c.JitterMaxIQR <= 0 {
+		c.JitterMaxIQR = omnislash.Duration(25 * time.Millisecond)
 	}
 	return c
 }

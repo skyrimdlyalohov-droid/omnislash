@@ -105,6 +105,19 @@ func TestActiveResearchConfigsLoadWithoutDialing(t *testing.T) {
 	}
 }
 
+func TestFullAutoJitterGateOverride(t *testing.T) {
+	var cfg FullAutoConfig
+	if err := json.Unmarshal([]byte(`{"jitter_max_iqr":"250ms"}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.withDefaults().JitterMaxIQR; got != omnislash.Duration(250*time.Millisecond) {
+		t.Fatalf("jitter override = %s, want 250ms", got)
+	}
+	if got := (FullAutoConfig{}).withDefaults().JitterMaxIQR; got != omnislash.Duration(25*time.Millisecond) {
+		t.Fatalf("jitter default = %s, want 25ms", got)
+	}
+}
+
 func TestMaybeAutoPushCaidoForwardsRawExchange(t *testing.T) {
 	t.Setenv("CAIDO_URL", "")
 	t.Setenv("CAIDO_PAT", "test-pat")
